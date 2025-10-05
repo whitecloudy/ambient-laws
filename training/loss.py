@@ -35,7 +35,7 @@ class EDMLoss:
 
     def __call__(self, net, images, labels=None, current_sigma=0.0, augment_pipe=None):
 
-        net._set_static_graph()
+        # net._set_static_graph()
         current_sigma = current_sigma.unsqueeze(1).unsqueeze(1).unsqueeze(1)
 
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
@@ -88,6 +88,6 @@ class EDMLoss:
             consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
             consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
             loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
-        return loss, x0_pred
+        return loss, x0_pred, sigma
 
 #----------------------------------------------------------------------------

@@ -23,6 +23,109 @@ from torch_utils import misc
 import ambient_utils
 import wandb
 
+
+def save_images_with_sigmas(images, image_path, sigmas=None, num_rows=None, num_cols=None, save_wandb=False, down_factor=None, wandb_down_factor=None):
+    import math
+    import PIL
+    import PIL.Image
+    from PIL import ImageDraw, ImageFont
+
+
+    def find_closest_factors(number):
+        sqrt_number = int(math.sqrt(number))
+        
+        n = sqrt_number
+        m = number // n
+        
+        while n * m != number:
+            n += 1
+            m = number // n
+
+        return m, n
+
+    if num_rows is None and num_cols is None:
+        num_rows = int(np.sqrt(images.shape[0]))    
+        num_cols = int(np.ceil(images.shape[0] / num_rows))
+    elif num_rows is None and num_cols is not None:
+        num_rows = int(np.ceil(images.shape[0] / num_cols))
+    elif num_rows is not None and num_cols is None:
+        num_cols = int(np.ceil(images.shape[0] / num_rows))
+    
+    if num_rows * num_cols != images.shape[0]:
+        num_rows, num_cols = find_closest_factors(images.shape[0])
+    
+    image_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+    image_size = images.shape[-2]
+    
+    # --- 텍스트 추가를 위한 로직 시작 ---
+
+    has_text = sigmas is not None
+    if has_text:
+        # 텍스트 개수가 이미지 개수와 맞는지 확인
+        assert len(sigmas) == images.shape[0], "texts 배열의 길이는 이미지의 개수와 같아야 합니다."
+        sigmas = sigmas.cpu().squeeze().numpy()
+        # 텍스트를 표시할 추가 공간 정의
+        text_area_width = 40  # 텍스트를 위한 가로 공간 (픽셀)
+        text_padding = 5      # 이미지와 텍스트 사이의 여백
+        font_size = 20         # 폰트 크기
+        
+        font = ImageFont.load_default()
+            
+        cell_width = image_size + text_area_width
+    else:
+        cell_width = image_size
+
+
+    grid_image = PIL.Image.new('RGB', (num_cols * cell_width, num_rows * image_size), 'white')
+    draw = ImageDraw.Draw(grid_image)
+
+    # 각 위치에 이미지와 텍스트 배치
+    for i in range(num_rows):
+        for j in range(num_cols):
+            index = i * num_cols + j
+            if index >= images.shape[0]:
+                continue
+            
+            # 원본 이미지
+            img = PIL.Image.fromarray(image_np[index])
+            
+            # 이미지를 붙여넣을 위치 계산
+            paste_x = j * cell_width
+            paste_y = i * image_size
+            
+            # 캔버스에 이미지 붙여넣기
+            grid_image.paste(img, (paste_x, paste_y))
+            
+            # 텍스트가 있는 경우, 이미지 오른쪽에 텍스트 그리기
+            if has_text:
+                text_to_draw = f"{sigmas[index]:.2f}" # 소수점 2자리까지 표시
+                
+                # 텍스트 높이를 계산하여 세로 중앙에 위치시키기
+                text_box = draw.textbbox((0, 0), text_to_draw, font=font)
+                text_height = text_box[3] - text_box[1]
+                
+                text_x = paste_x + image_size + text_padding
+                text_y = paste_y + (image_size - text_height) / 2
+                
+                draw.text((text_x, text_y), text_to_draw, fill="black", font=font)
+    
+    # --- 텍스트 추가 로직 종료 ---
+
+    if down_factor is not None:
+        grid_image = grid_image.resize((grid_image.size[0] // down_factor, grid_image.size[1] // down_factor))
+    
+    grid_image.save(image_path)
+
+    if save_wandb:
+        import wandb
+
+    if save_wandb and wandb.run is not None:
+        if wandb_down_factor is not None:
+            # resize for speed
+            grid_image = grid_image.resize((grid_image.size[0] // wandb_down_factor, grid_image.size[1] // wandb_down_factor))
+        wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(grid_image)})
+
+
 #----------------------------------------------------------------------------
 
 
@@ -70,7 +173,7 @@ def training_loop(
 
     # Load dataset.
     dist.print0('Loading dataset...')
-    dataset_obj = ambient_utils.dataset_utils.ImageFolderDataset(**dataset_kwargs)
+    dataset_obj = ambient_utils.dataset_utils.GaussianNoiseAdditiveCorruptedImageFolderDataset(**dataset_kwargs)
     # random indices for dataset visualization
     indices = [476716, 801177, 208667, 84697, 708005, 481119, 882784, 314948, 241315, 900832, 937237, 522057, 844026, 1021191, 789191, 668501]
     indices = [index % len(dataset_obj) for index in indices]
@@ -113,7 +216,7 @@ def training_loop(
         del data # conserve memory
     if resume_state_dump:
         dist.print0(f'Loading training state from "{resume_state_dump}"...')
-        data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
+        data = torch.load(resume_state_dump, map_location=torch.device('cpu'), weights_only=False)
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
         del data # conserve memory
@@ -138,11 +241,12 @@ def training_loop(
                 images = dataset_item["image"].to(device)                
                 labels = dataset_item["label"].to(device)
                 current_sigma = dataset_item["sigma"].to(device)
-                loss, x0_pred = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe)
+                loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe)
 
                 # every 500 steps save the images
                 if cur_tick % 500 == 0 and dist.get_rank() == 0:
-                    ambient_utils.save_images(x0_pred, os.path.join(run_dir, f"images_{cur_tick}.png"), save_wandb=True)
+                    # ambient_utils.save_images(x0_pred, os.path.join(run_dir, f"images_{cur_tick}.png"), save_wandb=True)
+                    save_images_with_sigmas(x0_pred, os.path.join(run_dir, f"images_{cur_tick}.png"), sigmas=sigma, save_wandb=True)
                 
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()

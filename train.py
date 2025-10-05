@@ -129,7 +129,7 @@ def main(**kwargs):
 
     # Validate dataset options.
     try:
-        dataset_obj = ambient_utils.dataset_utils.ImageFolderDataset(**c.dataset_kwargs)
+        dataset_obj = ambient_utils.dataset_utils.GaussianNoiseAdditiveCorruptedImageFolderDataset(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
         c.dataset_kwargs.dataset_keep_percentage = opts.dataset_keep_percentage
         c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
