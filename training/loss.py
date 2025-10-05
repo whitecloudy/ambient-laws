@@ -41,7 +41,7 @@ class EDMLoss:
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()        
-        sigma = torch.clamp(sigma, min=current_sigma)
+        sigma = torch.clamp(sigma, min=current_sigma*1.005)
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         
         # add additional noise to reach the level sigma
