@@ -54,7 +54,7 @@ class EDMLoss:
         # loss weight depends on sigma
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         loss = weight * ((D_yn - y) ** 2)
-
+        return_sigma = sigma
     
         # consistency loss
         if self.consistency_coeff > 0:
@@ -88,6 +88,6 @@ class EDMLoss:
             consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
             consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
             loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
-        return loss, x0_pred, sigma
+        return loss, x0_pred, return_sigma
 
 #----------------------------------------------------------------------------

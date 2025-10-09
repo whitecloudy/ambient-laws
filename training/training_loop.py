@@ -62,7 +62,8 @@ def save_images_with_sigmas(images, image_path, sigmas=None, num_rows=None, num_
     has_text = sigmas is not None
     if has_text:
         # 텍스트 개수가 이미지 개수와 맞는지 확인
-        assert len(sigmas) == images.shape[0], "texts 배열의 길이는 이미지의 개수와 같아야 합니다."
+        assert len(sigmas) == images.shape[0], "sigma 배열의 길이는 이미지의 개수와 같아야 합니다. sigma : {}, images : {}".format(len(sigmas), images.shape[0])
+        # sigmas가 tensor인 경우 numpy로 변환
         sigmas = sigmas.cpu().squeeze().numpy()
         # 텍스트를 표시할 추가 공간 정의
         text_area_width = 40  # 텍스트를 위한 가로 공간 (픽셀)
