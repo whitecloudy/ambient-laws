@@ -150,12 +150,25 @@ def main(**kwargs):
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
+    
+    # Select batch size per GPU.
+    batch_gpu = opts.batch_gpu
+    batch_size = opts.batch
+    batch_gpu_total = batch_size // dist.get_world_size()
+    if batch_gpu is None or batch_gpu > batch_gpu_total:
+        batch_gpu = batch_gpu_total
+    num_accumulation_rounds = batch_gpu_total // batch_gpu
+    assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size()
 
+    consistency_batch_size_per_gpu_total = opts.consistency_batch_size // dist.get_world_size()
+    if num_accumulation_rounds > 1:
+        consistency_batch_size_per_gpu = consistency_batch_size_per_gpu_total // num_accumulation_rounds
+    assert opts.consistency_batch_size == consistency_batch_size_per_gpu * dist.get_world_size() * num_accumulation_rounds
 
     assert opts.precond == 'edm'
     c.network_kwargs.class_name = 'training.networks.EDMPrecond'
     c.loss_kwargs.class_name = 'training.loss.EDMLoss'
-    c.loss_kwargs.update(consistency_batch_size_per_gpu=opts.consistency_batch_size // dist.get_world_size())
+    c.loss_kwargs.update(consistency_batch_size_per_gpu=consistency_batch_size_per_gpu)
     # whether to use weight for the consistency terms
     c.loss_kwargs.update(with_weight=opts.with_weight)
     # whether to use gradient for the consistency terms
