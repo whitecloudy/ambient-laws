@@ -161,8 +161,7 @@ def main(**kwargs):
     assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size()
 
     consistency_batch_size_per_gpu_total = opts.consistency_batch_size // dist.get_world_size()
-    if num_accumulation_rounds > 1:
-        consistency_batch_size_per_gpu = consistency_batch_size_per_gpu_total // num_accumulation_rounds
+    consistency_batch_size_per_gpu = consistency_batch_size_per_gpu_total // num_accumulation_rounds
     assert opts.consistency_batch_size == consistency_batch_size_per_gpu * dist.get_world_size() * num_accumulation_rounds
 
     assert opts.precond == 'edm'
