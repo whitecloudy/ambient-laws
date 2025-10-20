@@ -175,12 +175,6 @@ def training_loop(
     # Load dataset.
     dist.print0('Loading dataset...')
     dataset_obj = ambient_utils.dataset_utils.GaussianNoiseAdditiveCorruptedImageFolderDataset(**dataset_kwargs)
-    # random indices for dataset visualization
-    indices = [476716, 801177, 208667, 84697, 708005, 481119, 882784, 314948, 241315, 900832, 937237, 522057, 844026, 1021191, 789191, 668501]
-    indices = [index % len(dataset_obj) for index in indices]
-    images_to_save = [torch.tensor(dataset_obj[i]['image']) for i in indices]
-    if dist.get_rank() == 0:
-        ambient_utils.save_images(torch.stack(images_to_save), os.path.join(run_dir, "dataset.png"), save_wandb=True)
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
 
@@ -243,11 +237,6 @@ def training_loop(
                 labels = dataset_item["label"].to(device)
                 current_sigma = dataset_item["sigma"].to(device)
                 loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe)
-
-                # every 500 steps save the images
-                if cur_tick % 500 == 0 and dist.get_rank() == 0:
-                    # ambient_utils.save_images(x0_pred, os.path.join(run_dir, f"images_{cur_tick}.png"), save_wandb=True)
-                    save_images_with_sigmas(x0_pred, os.path.join(run_dir, f"images_{cur_tick}.png"), sigmas=sigma, save_wandb=True)
                 
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
