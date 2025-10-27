@@ -248,3 +248,107 @@ class ImageFolderDataset(Dataset):
         return labels
 
 #----------------------------------------------------------------------------
+
+
+import ambient_utils
+
+class RfDataset(ambient_utils.dataset_utils.Dataset):
+    def __init__(self, 
+                 path,                   # Path to files.
+                 resolution      = None, # Ensure specific resolution, None = highest available.
+                 must_contain    = None, # Require filenames to contain this substring.
+                 must_not_contain = None, # Require filenames to NOT contain this substring.
+                 sigma: float = 0.1,     # ensured minimum currption sigma
+                 corruption_probability_per_image: float = 0.5, 
+                 corruption_probability_per_pixel: float = 1.0,
+                 utilize_remaining_frame = False,
+                 view_as_complex = False,
+                 **super_kwargs):
+        self.corruption_probability_per_image = corruption_probability_per_image
+        self.corruption_probability_per_pixel = corruption_probability_per_pixel
+        self.minimum_sigma = sigma
+
+        self._path = path
+        if isinstance(self._path, list):
+            self._all_fnames = self._path
+        elif os.path.isdir(self._path):
+            self._all_fnames = {os.path.join(self._path, os.path.relpath(os.path.join(root, fname), start=self._path)) for root, _dirs, files in os.walk(self._path) for fname in files}
+        else:
+            raise IOError('Path must point to a directory or list of file paths')
+        
+        self._prefix_fname = set([fname.replace('.csi.npy', '').replace('.noise.npy', '') for fname in self._all_fnames])
+        
+        if must_contain is not None:
+            self._prefix_fname = {fname for fname in self._prefix_fname if must_contain in fname}
+        
+        if must_not_contain is not None:
+            self._prefix_fname = {fname for fname in self._prefix_fname if must_not_contain not in fname}
+
+        self._prefix_fname = sorted(list(self._prefix_fname))
+
+        self._resolution = resolution
+
+        if type(self._resolution) is tuple or type(self._resolution) is list:
+            self._frame_resolution = self._resolution[0]
+            self._ant_resolution = self._resolution[1]
+        elif type(self._resolution) is int:
+            self._frame_resolution = self._resolution
+            self._ant_resolution = self._resolution
+        else:
+            assert False, "resolution must be int or tuple/list of int"
+            
+        # data shape = (frame, user, antenna, channel)
+        self._csi_raw_data_list = [np.load(fprefix+'.csi.npy', mmap_mode='r') for fprefix in self._prefix_fname]
+        self._noise_raw_data_list = [np.load(fprefix+'.noise.npy', mmap_mode='r') for fprefix in self._prefix_fname]
+        # print(self._csi_raw_data_list[0].shape)
+        
+        self.each_data_idx = []
+
+        for idx, csi_data in enumerate(self._csi_raw_data_list):
+            frame_shape = csi_data.shape[0]
+            user_shape = csi_data.shape[1]
+            ant_shape = csi_data.shape[2]
+
+            assert csi_data.shape[:-1] == self._noise_raw_data_list[idx].shape, f"CSI and noise data shape mismatch for prefix {self._prefix_fname[idx]}"
+            assert ant_shape % self._ant_resolution == 0, f"Antenna dimension {ant_shape} is not divisible by ant_resolution {self._ant_resolution}"
+
+            for fidx in range(0, frame_shape, self._frame_resolution):
+                if fidx + self._frame_resolution > frame_shape:
+                    if utilize_remaining_frame:
+                        fidx = frame_shape - self._frame_resolution
+                    else:
+                        continue
+
+                for uidx in range(0, user_shape):
+                    for aidx in range(0, ant_shape, self._ant_resolution):
+                        self.each_data_idx.append((idx, fidx, uidx, aidx))
+
+        self._view_as_complex = view_as_complex
+
+        name = os.path.splitext(os.path.basename(self._path))[0]
+        super().__init__(name=name, **super_kwargs)
+
+    def __len__(self):
+        return len(self.each_data_idx)
+
+    def __getitem__(self, idx):
+        idx_tuple = self.each_data_idx[idx]
+        csi_data = self._csi_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
+                                                         idx_tuple[2],
+                                                         idx_tuple[3]: idx_tuple[3]+self._ant_resolution]
+        noise_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
+                                                             idx_tuple[2],
+                                                             idx_tuple[3]: idx_tuple[3]+self._ant_resolution]        
+
+        if not self._view_as_complex:
+            csi_data = np.expand_dims(np.array(csi_data), -1)
+            noise_data = np.expand_dims(np.array(noise_data), -1)
+
+            csi_data = csi_data.view(np.float64)
+            noise_data = noise_data.view(np.float64)
+
+        return csi_data, noise_data
+
+
+if __name__ == "__main__":
+    pass
