@@ -22,6 +22,7 @@ from torch_utils import training_stats
 from torch_utils import misc
 import ambient_utils
 import wandb
+import tempfile
 
 
 def save_images_with_sigmas(images, image_path, sigmas=None, num_rows=None, num_cols=None, save_wandb=False, down_factor=None, wandb_down_factor=None):
@@ -183,7 +184,15 @@ def training_loop(
         ambient_utils.save_images(torch.stack(images_to_save), os.path.join(run_dir, "dataset.png"), save_wandb=True)
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
-
+    
+    # Initialize temporary directory for training state dumps
+    if dist.get_rank() == 0:
+        run_dir_name = os.path.basename(os.path.normpath(run_dir))
+        temp_dir = tempfile.TemporaryDirectory(prefix=run_dir_name+'_')
+        temp_dir_path = temp_dir.name
+        latest_saved_kimg = None
+        dist.print0(f'Temporary directory for training state dumps: {temp_dir_path}')
+    
     # Construct network.
     dist.print0('Constructing network...')
     interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
@@ -323,6 +332,19 @@ def training_loop(
             for key, value in training_stats.default_collector.as_dict().items():
                 wandb.log({key: value}, step=cur_tick * snapshot_ticks)
             stats_jsonl.flush()
+
+            # Save a copy of the training state dump to the temporary directory
+            if latest_saved_kimg is not None:   # remove the previous dump
+                os.remove(os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')) 
+                os.remove(os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl'))
+
+            # save the new dump
+            torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(temp_dir_path, f'training-state-{cur_nimg//1000:06d}.pt'))
+            data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            with open(os.path.join(temp_dir_path, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
+                pickle.dump(data, f)
+            
+            latest_saved_kimg = cur_nimg
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
         # Update state.
@@ -333,6 +355,7 @@ def training_loop(
         if done:
             break
 
+    temp_dir.cleanup()  # Remove temporary directory for training state dumps on normal completion
     # Done.
     dist.print0()
     dist.print0('Exiting...')
