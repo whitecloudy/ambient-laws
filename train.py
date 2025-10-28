@@ -132,7 +132,7 @@ def main(**kwargs):
         dataset_obj = ambient_utils.dataset_utils.GaussianNoiseAdditiveCorruptedImageFolderDataset(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
         c.dataset_kwargs.dataset_keep_percentage = opts.dataset_keep_percentage
-        c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
+        c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution  TODO: check we need resolution for rf
         c.dataset_kwargs.max_size = int(len(dataset_obj) * opts.dataset_keep_percentage)
         if opts.cond and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True requires labels specified in dataset.json')
