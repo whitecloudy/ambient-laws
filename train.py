@@ -273,6 +273,8 @@ def main(**kwargs):
     # Train.
     training_loop.training_loop(**c)
 
+    dist.destroy_process_group()
+
 #----------------------------------------------------------------------------
 
 if __name__ == "__main__":
