@@ -17,7 +17,7 @@ dependencies:
   - pip:
     - imageio-ffmpeg>=0.4.3
     - pyspng
-    - git+https://github.com/giannisdaras/ambient_utils
+    - git+https://github.com/whitecloudy/ambient-utils
     - importlib_metadata
     - torchvision
     - wandb
