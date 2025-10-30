@@ -57,3 +57,6 @@ def print0(*args, **kwargs):
         print(*args, **kwargs)
 
 #----------------------------------------------------------------------------
+
+def destroy_process_group():
+    torch.distributed.destroy_process_group()
