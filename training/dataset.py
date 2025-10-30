@@ -252,20 +252,18 @@ class ImageFolderDataset(Dataset):
 
 import ambient_utils
 
-class RfDataset(ambient_utils.dataset_utils.Dataset):
+class renewRfDataset(ambient_utils.dataset_utils.Dataset):
     def __init__(self, 
                  path,                   # Path to files.
                  resolution      = None, # Ensure specific resolution, None = highest available.
                  must_contain    = None, # Require filenames to contain this substring.
                  must_not_contain = None, # Require filenames to NOT contain this substring.
                  sigma: float = 0.1,     # ensured minimum currption sigma
-                 corruption_probability_per_image: float = 0.5, 
-                 corruption_probability_per_pixel: float = 1.0,
                  utilize_remaining_frame = False,
                  view_as_complex = False,
+                 complex_merge_axis = None | int,
+                 transpose = None | tuple,
                  **super_kwargs):
-        self.corruption_probability_per_image = corruption_probability_per_image
-        self.corruption_probability_per_pixel = corruption_probability_per_pixel
         self.minimum_sigma = sigma
 
         self._path = path
@@ -324,6 +322,8 @@ class RfDataset(ambient_utils.dataset_utils.Dataset):
                         self.each_data_idx.append((idx, fidx, uidx, aidx))
 
         self._view_as_complex = view_as_complex
+        self._complex_merge_axis = complex_merge_axis
+        self._transpose = transpose
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         super().__init__(name=name, **super_kwargs)
@@ -339,6 +339,13 @@ class RfDataset(ambient_utils.dataset_utils.Dataset):
         noise_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
                                                              idx_tuple[2],
                                                              idx_tuple[3]: idx_tuple[3]+self._ant_resolution]        
+        # csi_data : (frame, user, antenna, channel)
+        # noise_data : (frame, user, antenna)
+
+        if self._transpose is not None:
+            assert noise_data.ndim == len(self._transpose), "noise_data ndim and transpose length mismatch"
+            csi_data = np.transpose(csi_data, self._transpose + (3,))
+            noise_data = np.transpose(noise_data, self._transpose)
 
         if not self._view_as_complex:
             csi_data = np.expand_dims(np.array(csi_data), -1)
@@ -347,8 +354,16 @@ class RfDataset(ambient_utils.dataset_utils.Dataset):
             csi_data = csi_data.view(np.float64)
             noise_data = noise_data.view(np.float64)
 
-        return csi_data, noise_data
+            if self._complex_merge_axis is not None:
+                csi_data = np.concatenate((np.take(csi_data, 0, axis=-1),
+                                           np.take(csi_data, 1, axis=-1)), axis=self._complex_merge_axis)
+                noise_data = np.concatenate((np.take(noise_data, 0, axis=-1),
+                                             np.take(noise_data, 1, axis=-1)), axis=self._complex_merge_axis)
+        elif self._complex_merge_axis is not None:
+            import warnings
+            warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
 
+        return csi_data, noise_data
 
 if __name__ == "__main__":
     pass
