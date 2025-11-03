@@ -261,11 +261,16 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
                  sigma: float = 0.1,     # ensured minimum currption sigma
                  utilize_remaining_frame = False,
                  view_as_complex = False,
-                 complex_merge_axis = None | int,
-                 transpose = None | tuple,
+                 complex_merge_axis = 0,
+                 transpose = None,
+                 noise_mean_flag = True,
+                 corruption_probability_per_image = 0.0,
+                 corruption_probability_per_pixel = 1.0,
+                 image_corruption_seed = 112154,
+                 image_noise_seed = 445481,
                  **super_kwargs):
         self.minimum_sigma = sigma
-
+        self._noise_mean_flag = noise_mean_flag
         self._path = path
         if isinstance(self._path, list):
             self._all_fnames = self._path
@@ -284,14 +289,14 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
 
         self._prefix_fname = sorted(list(self._prefix_fname))
 
-        self._resolution = resolution
-
-        if type(self._resolution) is tuple or type(self._resolution) is list:
-            self._frame_resolution = self._resolution[0]
-            self._ant_resolution = self._resolution[1]
-        elif type(self._resolution) is int:
-            self._frame_resolution = self._resolution
-            self._ant_resolution = self._resolution
+        if type(resolution) is tuple or type(resolution) is list:
+            self._frame_resolution = resolution[0]
+            self._ant_resolution = resolution[1]
+            self._channel_resolution = resolution[2] if len(resolution) > 2 else None
+        elif type(resolution) is int:
+            self._frame_resolution = resolution
+            self._ant_resolution = resolution
+            self._channel_resolution = None
         else:
             assert False, "resolution must be int or tuple/list of int"
             
@@ -306,6 +311,12 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
             frame_shape = csi_data.shape[0]
             user_shape = csi_data.shape[1]
             ant_shape = csi_data.shape[2]
+            channel_shape = csi_data.shape[3]
+
+            if self._channel_resolution is None:
+                self._channel_resolution = channel_shape
+            else:
+                assert self._channel_resolution == channel_shape, f"Channel dimension mismatch for prefix {self._prefix_fname[idx]}"
 
             assert csi_data.shape[:-1] == self._noise_raw_data_list[idx].shape, f"CSI and noise data shape mismatch for prefix {self._prefix_fname[idx]}"
             assert ant_shape % self._ant_resolution == 0, f"Antenna dimension {ant_shape} is not divisible by ant_resolution {self._ant_resolution}"
@@ -323,10 +334,27 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
 
         self._view_as_complex = view_as_complex
         self._complex_merge_axis = complex_merge_axis
-        self._transpose = transpose
+        self._transpose = tuple(transpose) if transpose is not None else None
 
         name = os.path.splitext(os.path.basename(self._path))[0]
-        super().__init__(name=name, **super_kwargs)
+        single_csi_shape = [self._frame_resolution, self._ant_resolution, self._channel_resolution]
+        if self._transpose is not None:
+            actual_csi_shape = [single_csi_shape[ax] for ax in self._transpose] + [single_csi_shape[2]]
+        else:
+            actual_csi_shape = single_csi_shape
+
+        if not self._view_as_complex:
+            if self._complex_merge_axis is not None:
+                actual_csi_shape[self._complex_merge_axis] *= 2
+        elif self._complex_merge_axis is not None:
+            import warnings
+            warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
+
+        self.image_actual_shape = actual_csi_shape
+        raw_shape = [len(self.each_data_idx)] + actual_csi_shape
+
+        self._resolution = raw_shape[-2:]
+        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
 
     def __len__(self):
         return len(self.each_data_idx)
@@ -339,31 +367,76 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
         noise_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
                                                              idx_tuple[2],
                                                              idx_tuple[3]: idx_tuple[3]+self._ant_resolution]        
-        # csi_data : (frame, user, antenna, channel)
-        # noise_data : (frame, user, antenna)
+        # csi_data : (frame, antenna, channel) - complex
+        # noise_data : (frame, antenna) - float
 
         if self._transpose is not None:
             assert noise_data.ndim == len(self._transpose), "noise_data ndim and transpose length mismatch"
-            csi_data = np.transpose(csi_data, self._transpose + (3,))
+            csi_data = np.transpose(csi_data, self._transpose + (2,))
             noise_data = np.transpose(noise_data, self._transpose)
 
         if not self._view_as_complex:
             csi_data = np.expand_dims(np.array(csi_data), -1)
-            noise_data = np.expand_dims(np.array(noise_data), -1)
 
             csi_data = csi_data.view(np.float64)
-            noise_data = noise_data.view(np.float64)
 
             if self._complex_merge_axis is not None:
                 csi_data = np.concatenate((np.take(csi_data, 0, axis=-1),
                                            np.take(csi_data, 1, axis=-1)), axis=self._complex_merge_axis)
-                noise_data = np.concatenate((np.take(noise_data, 0, axis=-1),
-                                             np.take(noise_data, 1, axis=-1)), axis=self._complex_merge_axis)
-        elif self._complex_merge_axis is not None:
-            import warnings
-            warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
+        
+        if self._noise_mean_flag:
+            noise_data = np.mean((noise_data))
 
-        return csi_data, noise_data
+        return {
+            'image': csi_data.astype(np.float32),
+            "label": np.zeros([self.image_shape[0], 0], dtype=np.float32),
+            'sigma': noise_data.astype(np.float32),
+            'idx': idx,
+            'filename': self._prefix_fname[idx_tuple[0]],
+            "noise": np.random.randn(*csi_data.shape),
+        }
+    
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def image_shape(self):
+        return list(self._raw_shape[1:])
+
+    @property
+    def num_channels(self):
+        assert len(self.image_shape) == 3 # CHW
+        return self.image_shape[0]
+
+    @property
+    def resolution(self):
+        assert len(self.image_shape) == 3 # CHW
+        return self.image_shape[1:]
+
+    @property
+    def label_shape(self):
+        if self._label_shape is None:
+            raw_labels = self._get_raw_labels()
+            if raw_labels.dtype == np.int64:
+                self._label_shape = [int(np.max(raw_labels)) + 1]
+            else:
+                self._label_shape = raw_labels.shape[1:]
+        return list(self._label_shape)
+
+    @property
+    def label_dim(self):
+        assert len(self.label_shape) == 1
+        return self.label_shape[0]
+
+    @property
+    def has_labels(self):
+        return any(x != 0 for x in self.label_shape)
+
+    @property
+    def has_onehot_labels(self):
+        return self._get_raw_labels().dtype == np.int64
+
 
 if __name__ == "__main__":
     pass

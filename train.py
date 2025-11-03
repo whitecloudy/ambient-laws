@@ -16,6 +16,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
+from training.dataset import renewRfDataset
 import ambient_utils
 import warnings
 import wandb
@@ -83,6 +84,13 @@ def parse_int_list(s):
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
 
+# RF dataset related
+@click.option('--view_as_complex', help='Whether to view the data as complex numbers.', type=bool, default=False, show_default=True)
+@click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to None to not merge.', type=int, default=0, show_default=True)
+@click.option('--transpose', help='Transpose the data axes according to the given order. Provide a list of two integers representing the new order of the first two axes (frame_resolution and ant_resolution). Set to None to not transpose.', type=str, default="1,0", show_default=True)
+@click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
+@click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
+
 
 # Scaling laws related
 @click.option("--corruption_probability", help="Controls what percentage of images should be corrupted.", type=float, default=0.0)
@@ -96,6 +104,9 @@ def parse_int_list(s):
 @click.option("--num_consistency_steps", help="Number of steps for the consistency loss.", type=int, default=6)
 @click.option("--num_primes", help="Number of primes for the consistency loss.", type=int, default=6)
 @click.option("--consistency_coeff", help="Coefficient for the consistency loss.", type=float, default=0.0)
+
+# Wandb related
+@click.option('--wandb', help='Use wandb to log training progress',  type=bool, default=True)
 
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
@@ -112,16 +123,17 @@ def main(**kwargs):
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
 
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and opts.wandb:
         wandb.init(project="ambient_laws", 
                    config=opts, name=opts.expr_id,
                    dir=opts.outdir)
 
     # Initialize config dict.
     c = dnnlib.EasyDict()
-    c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache, sigma=opts.sigma, 
+    c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
                                        corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                       only_positive=False)
+                                       only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+                                       resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
@@ -129,10 +141,9 @@ def main(**kwargs):
 
     # Validate dataset options.
     try:
-        dataset_obj = ambient_utils.dataset_utils.GaussianNoiseAdditiveCorruptedImageFolderDataset(**c.dataset_kwargs)
+        dataset_obj = renewRfDataset(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
         c.dataset_kwargs.dataset_keep_percentage = opts.dataset_keep_percentage
-        c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution  TODO: check we need resolution for rf
         c.dataset_kwargs.max_size = int(len(dataset_obj) * opts.dataset_keep_percentage)
         if opts.cond and not dataset_obj.has_labels:
             raise click.ClickException('--cond=True requires labels specified in dataset.json')
@@ -142,7 +153,7 @@ def main(**kwargs):
 
     # Network architecture.
     if opts.arch == 'ddpmpp':
-        c.network_kwargs.update(model_type='SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
+        c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
@@ -193,6 +204,7 @@ def main(**kwargs):
     c.update(batch_size=opts.batch, batch_gpu=opts.batch_gpu)
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
+    c.update(wandb_onoff=opts.wandb)
 
     # Random seed.
     if opts.seed is not None:

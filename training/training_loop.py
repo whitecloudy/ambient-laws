@@ -23,6 +23,7 @@ from torch_utils import misc
 import ambient_utils
 import wandb
 import tempfile
+from training.dataset import renewRfDataset
 
 
 def save_images_with_sigmas(images, image_path, sigmas=None, num_rows=None, num_cols=None, save_wandb=False, down_factor=None, wandb_down_factor=None):
@@ -159,6 +160,7 @@ def training_loop(
     resume_kimg         = 0,        # Start from the given training progress.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
+    wandb_onoff         = False,    # Enable wandb logging
 ):
     # Initialize.
     start_time = time.time()
@@ -180,7 +182,7 @@ def training_loop(
 
     # Load dataset.
     dist.print0('Loading dataset...')
-    dataset_obj = ambient_utils.dataset_utils.GaussianNoiseAdditiveCorruptedImageFolderDataset(**dataset_kwargs)
+    dataset_obj = renewRfDataset(**dataset_kwargs)
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
     
@@ -197,7 +199,7 @@ def training_loop(
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     with torch.no_grad():
-        images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device)
+        images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device)
         sigma = torch.ones([batch_gpu], device=device)
         labels = torch.zeros([batch_gpu, net.label_dim], device=device)
         misc.print_module_summary(net, [images, sigma, labels], max_nesting=2, verbose=dist.get_rank() == 0)
@@ -328,7 +330,8 @@ def training_loop(
             stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
             # report to wandb
             for key, value in training_stats.default_collector.as_dict().items():
-                wandb.log({key: value}, step=cur_tick * snapshot_ticks)
+                if wandb_onoff:
+                    wandb.log({key: value}, step=cur_tick * snapshot_ticks)
             stats_jsonl.flush()
 
             # Save a copy of the training state dump to the temporary directory
