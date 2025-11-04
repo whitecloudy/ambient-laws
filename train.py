@@ -53,16 +53,16 @@ def parse_int_list(s):
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
 
 # Hyperparameters.
-@click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
-@click.option('--batch',         help='Total batch size', metavar='INT',                            type=click.IntRange(min=1), default=512, show_default=True)
+@click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=150, show_default=True)
+@click.option('--batch',         help='Total batch size', metavar='INT',                            type=click.IntRange(min=1), default=256, show_default=True)
 @click.option('--batch-gpu',     help='Limit batch size per GPU', metavar='INT',                    type=click.IntRange(min=1))
 @click.option('--cbase',         help='Channel multiplier  [default: varies]', metavar='INT',       type=int)
 @click.option('--cres',          help='Channels per resolution  [default: varies]', metavar='LIST', type=parse_int_list)
-@click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=10e-4, show_default=True)
+@click.option('--lr',            help='Learning rate', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=2e-4, show_default=True)
 @click.option('--weight_decay',  help='Weight decay', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=False), default=0.0, show_default=True)
 @click.option('--ema',           help='EMA half-life', metavar='MIMG',                              type=click.FloatRange(min=0), default=0.5, show_default=True)
-@click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
-@click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
+@click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.05, show_default=True)
+@click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
 
 # Performance-related.
@@ -90,6 +90,7 @@ def parse_int_list(s):
 @click.option('--transpose', help='Transpose the data axes according to the given order. Provide a list of two integers representing the new order of the first two axes (frame_resolution and ant_resolution). Set to None to not transpose.', type=str, default="1,0", show_default=True)
 @click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
 @click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
+@click.option('--data_norm', help='Data normalization value for the RF data.', type=float, default=1.0, show_default=True)
 
 
 # Scaling laws related
@@ -124,7 +125,7 @@ def main(**kwargs):
     dist.init()
 
     if dist.get_rank() == 0 and opts.wandb:
-        wandb.init(project="ambient_laws", 
+        wandb.init(project="ambient_rf", 
                    config=opts, name=opts.expr_id,
                    dir=opts.outdir)
 
@@ -133,7 +134,8 @@ def main(**kwargs):
     c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
                                        corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
                                        only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
-                                       resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None)
+                                       resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
+                                       normalize_value=opts.data_norm)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
@@ -154,7 +156,7 @@ def main(**kwargs):
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2])
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
