@@ -268,10 +268,12 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
                  corruption_probability_per_pixel = 1.0,
                  image_corruption_seed = 112154,
                  image_noise_seed = 445481,
+                 normalize_value = 1.0,
                  **super_kwargs):
         self.minimum_sigma = sigma
         self._noise_mean_flag = noise_mean_flag
         self._path = path
+        self._normalize_value = normalize_value
         if isinstance(self._path, list):
             self._all_fnames = self._path
         elif os.path.isdir(self._path):
@@ -389,10 +391,10 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
         idx_tuple = self._each_data_idx[idx]
         csi_data = self._csi_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
                                                          idx_tuple[2],
-                                                         idx_tuple[3]: idx_tuple[3]+self._ant_resolution]
+                                                         idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value
         noise_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
                                                              idx_tuple[2],
-                                                             idx_tuple[3]: idx_tuple[3]+self._ant_resolution]        
+                                                             idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value       
         # csi_data : (frame, antenna, channel) - complex
         # noise_data : (frame, antenna) - float
 
@@ -462,6 +464,21 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
     @property
     def has_onehot_labels(self):
         return self._get_raw_labels().dtype == np.int64
+    
+    @property
+    def get_normalize_value(self):
+        return self._normalize_value
+    
+    @property
+    def calculate_normalized_value(self):
+        var_sum = 0.0
+        var_count = 0
+
+        for csi_data in self._csi_raw_data_list:
+            var_sum += (np.sum(np.abs(csi_data)**2))
+            var_count += csi_data.size
+
+        return np.sqrt(var_sum / var_count)
 
 
 if __name__ == "__main__":
