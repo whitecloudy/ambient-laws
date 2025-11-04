@@ -305,33 +305,13 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
         self._noise_raw_data_list = [np.load(fprefix+'.noise.npy', mmap_mode='r') for fprefix in self._prefix_fname]
         # print(self._csi_raw_data_list[0].shape)
         
-        self.each_data_idx = []
+        self._each_data_idx = []
 
         for idx, csi_data in enumerate(self._csi_raw_data_list):
-            frame_shape = csi_data.shape[0]
-            user_shape = csi_data.shape[1]
-            ant_shape = csi_data.shape[2]
-            channel_shape = csi_data.shape[3]
+            cur_file_idx = self.get_file_idx(csi_data.shape, idx, utilize_remaining_frame) 
+            self._each_data_idx.append(cur_file_idx)
 
-            if self._channel_resolution is None:
-                self._channel_resolution = channel_shape
-            else:
-                assert self._channel_resolution == channel_shape, f"Channel dimension mismatch for prefix {self._prefix_fname[idx]}"
-
-            assert csi_data.shape[:-1] == self._noise_raw_data_list[idx].shape, f"CSI and noise data shape mismatch for prefix {self._prefix_fname[idx]}"
-            assert ant_shape % self._ant_resolution == 0, f"Antenna dimension {ant_shape} is not divisible by ant_resolution {self._ant_resolution}"
-
-            for fidx in range(0, frame_shape, self._frame_resolution):
-                if fidx + self._frame_resolution > frame_shape:
-                    if utilize_remaining_frame:
-                        fidx = frame_shape - self._frame_resolution
-                    else:
-                        continue
-
-                for uidx in range(0, user_shape):
-                    for aidx in range(0, ant_shape, self._ant_resolution):
-                        self.each_data_idx.append((idx, fidx, uidx, aidx))
-
+        self._each_data_idx = np.concatenate(self._each_data_idx, axis=0)
         self._view_as_complex = view_as_complex
         self._complex_merge_axis = complex_merge_axis
         self._transpose = tuple(transpose) if transpose is not None else None
@@ -351,16 +331,62 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
             warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
 
         self.image_actual_shape = actual_csi_shape
-        raw_shape = [len(self.each_data_idx)] + actual_csi_shape
+        raw_shape = [len(self._each_data_idx)] + actual_csi_shape
 
         self._resolution = raw_shape[-2:]
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
 
+    #----------------------------------------------------------------------------
+    # Get all indices for a given file idx
+    #   Returns a (N, 4) shaped array, where each row is (file_idx, frame_idx, user_idx, antenna_idx)
+
+    def get_file_idx(self, csi_shape, idx, utilize_remaining_frame):
+        frame_shape = csi_shape[0]
+        user_shape = csi_shape[1]
+        ant_shape = csi_shape[2]
+        channel_shape = csi_shape[3]
+
+        if self._channel_resolution is None:
+            self._channel_resolution = channel_shape
+        else:
+            assert self._channel_resolution == channel_shape, f"Channel dimension mismatch for prefix {self._prefix_fname[idx]}"
+
+        fname_prefix = self._prefix_fname[idx]
+
+        assert csi_shape[:-1] == self._noise_raw_data_list[idx].shape, f"CSI and noise data shape mismatch for prefix {self._prefix_fname[idx]}"
+        assert ant_shape % self._ant_resolution == 0, f"Antenna dimension {ant_shape} is not divisible by ant_resolution {self._ant_resolution}"
+        
+        fidx_vec = np.arange(0, frame_shape-self._frame_resolution, self._frame_resolution)
+        if utilize_remaining_frame or frame_shape % self._frame_resolution == 0:
+            fidx_vec = np.append(fidx_vec, frame_shape - self._frame_resolution)
+        uidx_vec = np.arange(0, user_shape, 1)
+        aidx_vec = np.arange(0, ant_shape, self._ant_resolution)
+
+        # 1. 3개의 벡터로 모든 조합의 그리드를 생성합니다.
+        #    indexing='ij'는 fidx, uidx, aidx 순서의 축을 보장합니다.
+        f_grid, u_grid, a_grid = np.meshgrid(
+            fidx_vec, uidx_vec, aidx_vec, indexing='ij'
+        )
+
+        # 2. 고정값 idx도 그리드와 동일한 형태로 확장합니다.
+        #    f_grid의 모양을 본떠서 idx 값으로 채웁니다.
+        idx_grid = np.full_like(f_grid, idx)
+
+        # 3. 4개의 그리드를 마지막 축(axis=-1)을 기준으로 쌓습니다.
+        #    결과: (len(fidx_vec), len(uidx_vec), len(aidx_vec), 4) 형태의 4D 배열
+        combined_grids = np.stack([idx_grid, f_grid, u_grid, a_grid], axis=-1)
+
+        # 4. (N, 4) 형태의 2D 배열로 펼칩니다.
+        combined_grids = combined_grids.reshape(-1, 4)
+        
+        return combined_grids
+
+
     def __len__(self):
-        return len(self.each_data_idx)
+        return len(self._each_data_idx)
 
     def __getitem__(self, idx):
-        idx_tuple = self.each_data_idx[idx]
+        idx_tuple = self._each_data_idx[idx]
         csi_data = self._csi_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
                                                          idx_tuple[2],
                                                          idx_tuple[3]: idx_tuple[3]+self._ant_resolution]
