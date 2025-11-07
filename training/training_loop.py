@@ -189,7 +189,7 @@ def training_loop(
     # Initialize temporary directory for training state dumps
     if dist.get_rank() == 0:
         run_dir_name = os.path.basename(os.path.normpath(run_dir))
-        temp_dir_path = tempfile.mkdtemp(prefix=run_dir_name+'_')
+        temp_dir_path = tempfile.mkdtemp(prefix='ambient-rf_'+run_dir_name+'_')
         latest_saved_kimg = None
         dist.print0(f'Temporary directory for training state dumps: {temp_dir_path}')
     
@@ -282,15 +282,21 @@ def training_loop(
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
             continue
-
+        
         # Print status line, accumulating the same information in training_stats.
         tick_end_time = time.time()
+
+        sec_per_kimg = (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3
+        reamin_kimg = (total_kimg * 1000 - cur_nimg)/1000
+        eta_seconds = sec_per_kimg * reamin_kimg
+
         fields = []
         fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
         fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<9.1f}"]
         fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
+        fields += [f"eta time {dnnlib.util.format_time(training_stats.report0('ETA time', eta_seconds)):<12s}"]
         fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
-        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
+        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', sec_per_kimg):<7.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
         fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]

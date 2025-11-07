@@ -310,8 +310,10 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
         self._each_data_idx = []
 
         for idx, csi_data in enumerate(self._csi_raw_data_list):
+            print(f"Loaded CSI data shape for prefix {self._prefix_fname[idx]}: {csi_data.shape}")
             cur_file_idx = self.get_file_idx(csi_data.shape, idx, utilize_remaining_frame) 
             self._each_data_idx.append(cur_file_idx)
+            print(f"Total samples from this file: {cur_file_idx.shape[0]}")
 
         self._each_data_idx = np.concatenate(self._each_data_idx, axis=0)
         self._view_as_complex = view_as_complex
