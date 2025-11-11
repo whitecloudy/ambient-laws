@@ -25,6 +25,11 @@ import wandb
 import tempfile
 from training.dataset import renewRfDataset
 
+def infiniteloop(dataloader):
+    while True:
+        for x in iter(dataloader):
+            yield x
+
 
 def save_images_with_sigmas(images, image_path, sigmas=None, num_rows=None, num_cols=None, save_wandb=False, down_factor=None, wandb_down_factor=None):
     import math
@@ -183,7 +188,10 @@ def training_loop(
     # Load dataset.
     dist.print0('Loading dataset...')
     dataset_obj = renewRfDataset(**dataset_kwargs)
+    ## using This sampler is way way way~~~ too slow for every epoch renewal
+    # dataset_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=True, seed=seed)
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
+    # dataset_iterator = infiniteloop(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
     
     # Initialize temporary directory for training state dumps
@@ -205,10 +213,12 @@ def training_loop(
         misc.print_module_summary(net, [images, sigma, labels], max_nesting=2, verbose=dist.get_rank() == 0)
 
     # Setup optimizer.
-    dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
+    dist.print0('Setting up optimizer...')
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
-    augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
+    # augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
+    augment_pipe = None
+    dist.print0('Setting DDP...')
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=True, find_unused_parameters=True)
     ema = copy.deepcopy(net).eval().requires_grad_(False)
 
@@ -246,8 +256,9 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
-    while True:
 
+    # LOOP STARTS HERE.
+    while True:
         # Accumulate gradients.
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
@@ -285,8 +296,8 @@ def training_loop(
         
         # Print status line, accumulating the same information in training_stats.
         tick_end_time = time.time()
-
-        sec_per_kimg = (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3
+        total_time_per_tick = tick_end_time - tick_start_time
+        sec_per_kimg = (total_time_per_tick) / (cur_nimg - tick_start_nimg) * 1e3
         reamin_kimg = (total_kimg * 1000 - cur_nimg)/1000
         eta_seconds = sec_per_kimg * reamin_kimg
 
@@ -295,7 +306,7 @@ def training_loop(
         fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<9.1f}"]
         fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
         fields += [f"eta time {dnnlib.util.format_time(training_stats.report0('ETA time', eta_seconds)):<12s}"]
-        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
+        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', total_time_per_tick):<7.1f}"]
         fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', sec_per_kimg):<7.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
         fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
