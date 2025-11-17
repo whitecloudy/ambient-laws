@@ -191,7 +191,6 @@ def training_loop(
     ## using This sampler is way way way~~~ too slow for every epoch renewal
     # dataset_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=True, seed=seed)
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
-    # dataset_iterator = infiniteloop(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
     
     # Initialize temporary directory for training state dumps
@@ -267,10 +266,21 @@ def training_loop(
                 images = dataset_item["image"].to(device)                
                 labels = dataset_item["label"].to(device)
                 current_sigma = dataset_item["sigma"].to(device)
+                original_shape = dataset_item["original_shape"].to(device)
+
                 loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe)
                 
+                # Create a mask to zero out the loss on padded areas.
+                # loss is expected to be of shape (N, C, H, W)
+                mask = torch.zeros_like(loss)
+                for i in range(loss.shape[0]):
+                    # Get original shape for the i-th image
+                    _, h, w = original_shape[i]
+                    # Set mask to 1 for the original image area
+                    mask[i, :, :h, :w] = 1
+                
                 training_stats.report('Loss/loss', loss)
-                loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+                (loss * mask).sum().mul(loss_scaling / batch_gpu_total).backward()
 
         # Update weights.
         for g in optimizer.param_groups:

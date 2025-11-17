@@ -482,6 +482,302 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
 
         return np.sqrt(var_sum / var_count)
 
+import pandas as pd
+
+import torch.nn.functional as F
+
+def pad_collate_fn(batch):
+    """
+    가변 크기의 'image' 텐서를 패딩하여 동일한 크기로 맞춘 후,
+    하나의 배치로 합칩니다.
+    """
+    # 1. 배치 내에서 'image'의 최대 높이와 너비를 찾습니다.
+    # 각 image는 (C, H, W) 형태라고 가정합니다.
+    max_h = max(item['image'].shape[1] for item in batch)
+    max_w = max(item['image'].shape[2] for item in batch)
+
+    def power2ceil(original):
+        return int(np.ceil(np.log2(original)))
+
+    # 2. 높이와 너비를 2의 배수로 올림합니다.
+    target_h = power2ceil(max_h)
+    target_w = power2ceil(max_w)
+
+    # 3. 각 'image'를 목표 크기로 패딩합니다.
+    images = []
+    original_shapes = []
+    for item in batch:
+        img = item['image']
+        original_shapes.append(torch.tensor(img.shape))
+        # (padding_left, padding_right, padding_top, padding_bottom)
+        pad_h = target_h - img.shape[1]
+        pad_w = target_w - img.shape[2]
+        padded_img = F.pad(torch.from_numpy(img), (0, pad_w, 0, pad_h), "constant", 0)
+        images.append(padded_img)
+
+    # 4. 다른 데이터들도 배치로 만듭니다.
+    batch_without_images = [{k: v for k, v in item.items() if k != 'image'} for item in batch]
+    collated_batch = torch.utils.data.default_collate(batch_without_images)
+
+    # 5. 패딩된 이미지들을 쌓아서(stack) 배치에 추가합니다.
+    collated_batch['image'] = torch.stack(images)
+    collated_batch['original_shape'] = torch.stack(original_shapes)
+
+    return collated_batch
+
+
+class widarRfDataset(ambient_utils.dataset_utils.Dataset):
+    def __init__(self, 
+                 path,                   # Path to files.
+                 resolution      = None, # Ensure specific resolution, None = highest available.
+                 must_contain    = None, # Require filenames to contain this substring.
+                 must_not_contain = None, # Require filenames to NOT contain this substring.
+                 sigma: float = 0.1,     # ensured minimum currption sigma
+                 utilize_remaining_frame = False,
+                 view_as_complex = False,
+                 complex_merge_axis = 0,
+                 transpose = None,
+                 noise_mean_flag = True,
+                 corruption_probability_per_image = 0.0,
+                 corruption_probability_per_pixel = 1.0,
+                 image_corruption_seed = 112154,
+                 image_noise_seed = 445481,
+                 normalize_value = 1.0,
+                 label_key = ["gesture", ],
+                 **super_kwargs):
+        self.minimum_sigma = sigma
+        self._noise_mean_flag = noise_mean_flag
+        self._path = path
+        self._normalize_value = normalize_value
+
+        if not os.path.isdir(self._path):
+            raise IOError('Path must point to a directory or list of file paths')
+
+        # key => [date, user, gesture, torso, face, repetition, rx, file name, room]
+        # date : data captured date
+        # gesture : gesture while data capture
+        # torso : torso location
+        # face : where user faced
+        # rx : rx device number
+        self.data_label_df = self._load_label_datafile(self._path)
+        self._add_room_number()
+        
+        # label로 사용할 key값 선택
+        self.cond_label = label_key
+        self.max_value =  self._load_max_value(self.data_label_df, self.cond_label)
+        self.min_value =  self._load_min_value(self.data_label_df, self.cond_label)
+        
+        # 사용할 데이터 선택
+        if must_contain is not None:
+            self.data_label_df = self.data_label_df[self.data_label_df['file name'].str.contains(must_contain)]
+        
+        if must_not_contain is not None:
+            self.data_label_df = self.data_label_df[~self.data_label_df['file name'].str.contains(must_not_contain)]
+
+        self._prefix_fname = sorted(list(self.data_label_df['file name'].unique()))
+
+        if type(resolution) is tuple or type(resolution) is list:
+            self._frame_resolution = resolution[0]
+            self._ant_resolution = resolution[1]
+            self._channel_resolution = resolution[2] if len(resolution) > 2 else None
+        elif type(resolution) is int:
+            self._frame_resolution = resolution
+            self._ant_resolution = resolution
+            self._channel_resolution = None
+        else:
+            assert False, "resolution must be int or tuple/list of int"
+            
+        # # data shape = (frame, user, antenna, channel)
+        # self._csi_raw_data_list = [np.load(fprefix+'.csi.npy', mmap_mode='r') for fprefix in self._prefix_fname]
+        # self._noise_raw_data_list = [np.load(fprefix+'.noise.npy', mmap_mode='r') for fprefix in self._prefix_fname]
+        # # print(self._csi_raw_data_list[0].shape)
+        
+        self._view_as_complex = view_as_complex
+        self._complex_merge_axis = complex_merge_axis
+        self._transpose = tuple(transpose) if transpose is not None else None
+
+        name = os.path.splitext(os.path.basename(self._path))[0]
+        single_csi_shape = [self._frame_resolution, self._ant_resolution, self._channel_resolution]
+        if self._transpose is not None:
+            actual_csi_shape = [single_csi_shape[ax] for ax in self._transpose] + [single_csi_shape[2]]
+        else:
+            actual_csi_shape = single_csi_shape
+
+        if not self._view_as_complex:
+            if self._complex_merge_axis is not None:
+                actual_csi_shape[self._complex_merge_axis] *= 2
+        elif self._complex_merge_axis is not None:
+            import warnings
+            warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
+
+        self.image_actual_shape = actual_csi_shape
+        raw_shape = [len(self.data_label_df)] + actual_csi_shape
+
+        self._resolution = raw_shape[-2:]
+        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
+
+    def _condition_maker(self, label : pd.Series):
+        cond_list = []
+        for key in self.cond_label:
+            value = label[key] - self.min_value[key]
+            value_range = self.max_value[key] - self.min_value[key] + 1
+            cond_frac = np.zeros((value_range))
+            cond_frac[value] = 1
+
+            cond_list.append(cond_frac)
+
+        return np.concatenate(cond_list)
+
+
+
+    def _load_max_value(self, df, cond_label):
+        max_list = {}
+        for label in cond_label:
+            max_list[label] = max(df[label])
+
+        return pd.Series(max_list)
+    
+    def _load_min_value(self, df, cond_label):
+        min_list = {}
+        for label in cond_label:
+            min_list[label] = min(df[label])
+
+        return pd.Series(min_list)
+
+
+    def _add_room_number(self):
+        data_room_matching = {
+            20181109: 1,
+            20181112: 1,
+            20181115: 1,
+            20181116: 1,
+            20181117: 2,
+            20181118: 2,
+            20181121: 1,
+            20181127: 2,
+            20181128: 2,
+            20181130: 1,
+            20181204: 2,
+            20181205: 2,
+            20181208: 2,
+            20181209: 2,
+            20181211: 3
+        }
+        self.data_label_df["room"] = [data_room_matching[date] for date in self.data_label_df["date"]]
+
+    def _load_label_datafile(self, save_dir) -> pd.DataFrame:
+        data_label_df_list = pd.read_pickle(save_dir+"/labels.pkl")
+        return data_label_df_list
+    
+    @staticmethod
+    def csi_data_loader(data_dir : str) -> np.ndarray:
+        return np.load(data_dir+".npz", allow_pickle=False)
+
+    def __len__(self):
+        return len(self.data_label_df)
+
+    def __getitem__(self, idx):
+        # idx_tuple = self._each_data_idx[idx]
+        # csi_data = self._csi_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
+        #                                                  idx_tuple[2],
+        #                                                  idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value
+        # noise_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
+        #                                                      idx_tuple[2],
+        #                                                      idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value       
+        # # csi_data : (frame, antenna, channel) - complex
+        # # noise_data : (frame, antenna) - float
+        idx_fname = self.data_label_df.iloc[idx]["file name"]
+        idx_dir = "/".join(self._path, idx_fname)
+        with self.csi_data_loader(idx_dir) as data:
+            csi_data = data["csi"]
+            noise_data = data["noise"]
+            time_data = data["time"]
+        # csi_data : (frame, antenna, channel) - complex
+        # noise_data : (frame, antenna) - float
+
+        if self._transpose is not None:
+            assert noise_data.ndim == len(self._transpose), "noise_data ndim and transpose length mismatch"
+            csi_data = np.transpose(csi_data, self._transpose + (2,))
+            noise_data = np.transpose(noise_data, self._transpose)
+
+        if not self._view_as_complex:
+            csi_data = np.expand_dims(np.array(csi_data), -1)
+
+            csi_data = csi_data.view(np.float64)
+
+            if self._complex_merge_axis is not None:
+                csi_data = np.concatenate((np.take(csi_data, 0, axis=-1),
+                                           np.take(csi_data, 1, axis=-1)), axis=self._complex_merge_axis)
+        
+        if self._noise_mean_flag:
+            noise_data = np.mean((noise_data))
+
+        return {
+            'image': csi_data.astype(np.float32),
+            "label": np.zeros([self.image_shape[0], 0], dtype=np.float32),
+            'sigma': noise_data.astype(np.float32),
+            'idx': idx,
+            'filename': idx_fname,
+            "noise": np.random.randn(*csi_data.shape),
+        }
+    
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def image_shape(self):
+        return list(self._raw_shape[1:])
+
+    @property
+    def num_channels(self):
+        assert len(self.image_shape) == 3 # CHW
+        return self.image_shape[0]
+
+    @property
+    def resolution(self):
+        assert len(self.image_shape) == 3 # CHW
+        return self.image_shape[1:]
+
+    @property
+    def label_shape(self):
+        if self._label_shape is None:
+            raw_labels = self._get_raw_labels()
+            if raw_labels.dtype == np.int64:
+                self._label_shape = [int(np.max(raw_labels)) + 1]
+            else:
+                self._label_shape = raw_labels.shape[1:]
+        return list(self._label_shape)
+
+    @property
+    def label_dim(self):
+        assert len(self.label_shape) == 1
+        return self.label_shape[0]
+
+    @property
+    def has_labels(self):
+        return any(x != 0 for x in self.label_shape)
+
+    @property
+    def has_onehot_labels(self):
+        return self._get_raw_labels().dtype == np.int64
+    
+    @property
+    def get_normalize_value(self):
+        return self._normalize_value
+    
+    @property
+    def calculate_normalized_value(self):
+        var_sum = 0.0
+        var_count = 0
+
+        for csi_data in self._csi_raw_data_list:
+            var_sum += (np.sum(np.abs(csi_data)**2))
+            var_count += csi_data.size
+
+        return np.sqrt(var_sum / var_count)
+
+
 
 if __name__ == "__main__":
     pass
