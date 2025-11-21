@@ -1,4 +1,4 @@
-name: edm
+name: ambient-rf
 channels:
   - pytorch
   - nvidia

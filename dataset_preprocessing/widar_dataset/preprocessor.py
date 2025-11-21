@@ -133,105 +133,23 @@ def fix_labels_file(dir):
     # print(data_label_df_list)
 
 
-class CsiData():
-    def __init__(self, 
-                 save_dir="../data/widar_preprocess", 
-                 live_cond=None):
-        self.save_dir = save_dir
-        
-        self.label_except = ["date", "repetition", "file name"]
-        self.data_label_df = self.load_label_datafile(save_dir)
-        self.add_room_number()
-
-        self.cond_label = [label for label in self.data_label_df.drop(self.label_except, axis=1).columns]
-        self.max_value =  self.load_max_value(self.data_label_df)
-        self.min_value =  self.load_min_value(self.data_label_df)
-
-        self.data_label_df = self.data_label_purning(self.data_label_df, live_cond)
-
-    def add_room_number(self):
-        data_room_matching = {
-            20181109: 1,
-            20181112: 1,
-            20181115: 1,
-            20181116: 1,
-            20181117: 2,
-            20181118: 2,
-            20181121: 1,
-            20181127: 2,
-            20181128: 2,
-            20181130: 1,
-            20181204: 2,
-            20181205: 2,
-            20181208: 2,
-            20181209: 2,
-            20181211: 3
-        }
-        self.data_label_df["room"] = [data_room_matching[date] for date in self.data_label_df["date"]]
-
-    def data_label_purning(self, df, live_cond):
-        if live_cond is None:
-            return
-        
-        for col in live_cond:
-            trueorfalse = df[col].isin(live_cond[col])
-            df = df.loc[trueorfalse]
-        
-        return df
-
-    def load_max_value(self, df):
-        max_list = {}
-        for label in self.cond_label:
-            max_list[label] = max(df[label])
-
-        return pd.Series(max_list)
-    
-    def load_min_value(self, df):
-        min_list = {}
-        for label in self.cond_label:
-            min_list[label] = min(df[label])
-
-        return pd.Series(min_list)
-
-    def load_label_datafile(self, save_dir) -> pd.DataFrame:
+def load_label_datafile(save_dir) -> pd.DataFrame:
         data_label_df_list = pd.read_pickle(save_dir+"/labels.pkl")
         return data_label_df_list
-    
-    def condition_maker(self, label : pd.Series, live_key=["gesture", ]):
-        cond_list = []
-        for key in self.cond_label:
-            if key not in live_key:
-                continue
-            value = label[key] - self.min_value[key]
-            value_range = self.max_value[key] - self.min_value[key] + 1
-            cond_frac = np.zeros((value_range))
-            cond_frac[value] = 1
-
-            cond_list.append(cond_frac)
-
-        return np.concatenate(cond_list)
-
-    @staticmethod
-    def csi_data_loader(data_dir : str) -> np.ndarray:
-        return np.load(data_dir+".npz", allow_pickle=False)
-        
-    def __len__(self):
-        return len(self.data_label_df)
-    
-    def __getitem__(self, idx):
-        data_labels = self.data_label_df.iloc[idx]
-        dir = "/".join([self.save_dir, data_labels['file name']])
-        condition = self.condition_maker(data_labels)
-        csi_data = CsiData.csi_data_loader(dir)
-        time_data = csi_data["time"]
-        csi_data = csi_data["csi"]
-        noise_data = csi_data["noise"]
-
-        return condition, csi_data, time_data, noise_data
-
 
 if __name__=="__main__":
-    my_data = CsiData_preprocessor(dir="/data2/alex9395/widar_dataset/CSI", save_dir="/data2/alex9395/widar_preprocessed", n_proc=64, process_chunk_size=4096)
+    # my_data = CsiData_preprocessor(dir="/data2/alex9395/widar_dataset/CSI", save_dir="/data2/alex9395/widar_preprocessed", n_proc=64, process_chunk_size=4096)
+
+    data_df = load_label_datafile("../data2/widar_preprocessed")
+    shape_list = []
+    for idx, row in data_df.iterrows():
+        data = np.load("".join(["../data2/widar_preprocessed/", row["file name"], ".npz"]))
+        shape_list.append(data["csi"].shape[0])
+        print(data["csi"].shape[0])
+        assert data["csi"].shape[0] == data["time"].shape[0] == data["noise"].shape[0]
+    data_df["frame_len"] = shape_list
+    print(data_df)
+    data_df.to_pickle("../data2/widar_preprocessed/labels2.pkl")
 
     # live_data = {'date' : [20181109, 20181115, 20181117, 20181211]}
     # live_data = {'date' : [20181208,]}

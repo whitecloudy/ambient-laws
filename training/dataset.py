@@ -482,9 +482,196 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
 
         return np.sqrt(var_sum / var_count)
 
+from glob import glob
+import warnings
+
+class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
+    def __init__(self, 
+                 path,                   # Path to files.
+                 resolution      = None, # Ensure specific resolution, None = highest available.
+                 must_contain    = None, # Require filenames to contain this substring.
+                 must_not_contain = None, # Require filenames to NOT contain this substring.
+                 sigma: float = 0.1,     # ensured minimum currption sigma
+                 view_as_complex = False,
+                 complex_merge_axis = 0,
+                 transpose = None,
+                 noise_mean_flag = True,
+                 corruption_probability_per_image = 0.0,
+                 corruption_probability_per_pixel = 1.0,
+                 image_corruption_seed = 112154,
+                 image_noise_seed = 445481,
+                 normalize_value = 1.0,
+                 use_labels  = False,
+                 **super_kwargs):
+        self.minimum_sigma = sigma
+        self._noise_mean_flag = noise_mean_flag
+        self._path = path
+        self._normalize_value = normalize_value
+        self._view_as_complex = view_as_complex
+        self._complex_merge_axis = complex_merge_axis
+        self._label_spliting_flag = use_labels
+        self._transpose = tuple(transpose) if transpose is not None else None
+        self._all_fnames = []
+
+        self._fname = []
+        if isinstance(self._path, list):
+            for path in self._path:
+                self._fname += glob(os.path.join(path, '*.npz'))
+        elif os.path.isdir(self._path):
+            self._fname = glob(os.path.join(self._path, '*.npz'), recursive=True)
+        else:
+            raise IOError('Path must point to a directory or list of file paths')
+                
+        if must_contain is not None:
+            self._fname = {fname for fname in self._fname if must_contain in fname}
+        
+        if must_not_contain is not None:
+            self._fname = {fname for fname in self._fname if must_not_contain not in fname}
+
+        self._fname = sorted(list(self._fname))
+
+        name = os.path.splitext(os.path.basename(self._path))[0]
+        single_csi_shape = self.__load_single_file(self._fname[0])[0].shape
+
+        if self._label_spliting_flag:
+            tmp_shape = np.array(single_csi_shape)
+            tmp_shape[-1] = tmp_shape[-1] // 2
+            single_csi_shape = tuple(tmp_shape.tolist())
+
+        if self._transpose is not None:
+            actual_csi_shape = [single_csi_shape[ax] for ax in self._transpose] + [single_csi_shape[2]]
+        else:
+            actual_csi_shape = single_csi_shape
+
+        if not self._view_as_complex:
+            if self._complex_merge_axis is not None:
+                actual_csi_shape[self._complex_merge_axis] *= 2
+        elif self._complex_merge_axis is not None:
+            warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
+
+        self.image_actual_shape = actual_csi_shape
+        raw_shape = [len(self._fname)] + actual_csi_shape
+
+        self._resolution = raw_shape[-2:]
+        super().__init__(name=name, raw_shape=raw_shape, use_labels=use_labels, **super_kwargs)
+        if self._label_spliting_flag:
+            self._label_shape = actual_csi_shape
+        else:
+            self._label_shape = [0,]
+
+    def __load_single_file(self, f_path):
+        npz_data = np.load(f_path)
+        csi_data = npz_data['csi']
+        noise_data = npz_data['noise']
+
+        return csi_data, noise_data
+
+    def __len__(self):
+        return len(self._fname)
+
+    def __getitem__(self, idx):
+        item_fname = self._fname[idx]
+
+        csi_data, noise_data = self.__load_single_file(item_fname)
+        # csi_data : (frame, antenna, channel) - complex
+        # noise_data : (frame, antenna) - float
+
+        noise_data = np.expand_dims(noise_data, -1)
+        # noise_data : (frame, antenna, 1) - float
+
+        if self._transpose is not None:
+            assert noise_data.ndim == len(self._transpose)+1, f"noise_data ndim and transpose length mismatch, {noise_data.ndim} != {len(self._transpose)+1}"
+            csi_data = np.transpose(csi_data, self._transpose + (2,))
+            noise_data = np.transpose(noise_data, self._transpose + (2,))
+
+        if not self._view_as_complex:
+            if self._complex_merge_axis is not None:
+                csi_data = np.append(csi_data.real, csi_data.imag, axis=self._complex_merge_axis)
+                noise_data = np.append(noise_data, noise_data, axis=self._complex_merge_axis)
+            else:
+                csi_data = np.expand_dims(csi_data, -1)
+                csi_data = np.append(csi_data.real, csi_data.imag, axis=-1)
+                noise_data = np.expand_dims(noise_data, -1)
+                noise_data = np.append(noise_data, noise_data, axis=-1)
+        
+        if self._noise_mean_flag:
+            noise_data = np.mean((noise_data))
+
+        if self._label_spliting_flag:
+            csi_data, label_data = np.split(csi_data, 2, axis=2)
+        else:
+            label_data = np.zeros([self.image_shape[0], 0], dtype=np.float32)
+
+        return {
+            'image': csi_data.astype(np.float32),
+            "label": label_data.astype(np.float32),
+            'sigma': noise_data.astype(np.float32),
+            'idx': idx,
+            'filename': self._fname[idx],
+            "noise": np.random.randn(*csi_data.shape),
+        }
+    
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def image_shape(self):
+        return list(self._raw_shape[1:])
+
+    @property
+    def num_channels(self):
+        assert len(self.image_shape) == 3 # CHW
+        return self.image_shape[0]
+
+    @property
+    def resolution(self):
+        assert len(self.image_shape) == 3 # CHW
+        return self.image_shape[1:]
+
+    @property
+    def label_shape(self):
+        if self._label_spliting_flag:
+            return list(self._label_shape)
+        else:
+            return [0,]
+
+    @property
+    def label_dim(self):
+        if self._label_spliting_flag:
+            return self.label_shape[0]
+        else:
+            return 0
+
+    @property
+    def has_labels(self):
+        return any(x != 0 for x in self.label_shape)
+
+    @property
+    def has_onehot_labels(self):
+        return self._get_raw_labels().dtype == np.int64
+    
+    @property
+    def get_normalize_value(self):
+        return self._normalize_value
+    
+    @property
+    def calculate_normalized_value(self):
+        var_sum = 0.0
+        var_count = 0
+
+        for csi_data in self._csi_raw_data_list:
+            var_sum += (np.sum(np.abs(csi_data)**2))
+            var_count += csi_data.size
+
+        return np.sqrt(var_sum / var_count)
+
+
 import pandas as pd
 
 import torch.nn.functional as F
+def _power2ceil(original):
+    return int(2**np.ceil(np.log2(original)))
 
 def pad_collate_fn(batch):
     """
@@ -493,37 +680,83 @@ def pad_collate_fn(batch):
     """
     # 1. 배치 내에서 'image'의 최대 높이와 너비를 찾습니다.
     # 각 image는 (C, H, W) 형태라고 가정합니다.
-    max_h = max(item['image'].shape[1] for item in batch)
-    max_w = max(item['image'].shape[2] for item in batch)
-
-    def power2ceil(original):
-        return int(np.ceil(np.log2(original)))
+    max_h = max(item['image'].shape[-2] for item in batch)
+    max_w = max(item['image'].shape[-1] for item in batch)
 
     # 2. 높이와 너비를 2의 배수로 올림합니다.
-    target_h = power2ceil(max_h)
-    target_w = power2ceil(max_w)
+    target_h = _power2ceil(max_h)
+    target_w = _power2ceil(max_w)
 
     # 3. 각 'image'를 목표 크기로 패딩합니다.
-    images = []
-    original_shapes = []
+    padded_batch = []
+
     for item in batch:
         img = item['image']
-        original_shapes.append(torch.tensor(img.shape))
+        label = item['label']
+        original_shape = torch.tensor(img.shape)
         # (padding_left, padding_right, padding_top, padding_bottom)
         pad_h = target_h - img.shape[1]
         pad_w = target_w - img.shape[2]
-        padded_img = F.pad(torch.from_numpy(img), (0, pad_w, 0, pad_h), "constant", 0)
-        images.append(padded_img)
+        # img의 차원 수에 따라 pad_width를 동적으로 생성
+        pad_width = [(0, 0)] * (img.ndim - 2) + [(0, pad_h), (0, pad_w)]
+        padded_img = np.pad(img, pad_width, mode='constant', constant_values=0)
+
+        item['original_shape'] = original_shape
+        item['image'] = padded_img
+
+        if img.shape == label.shape:
+            padded_label = np.pad(label, pad_width, mode='constant', constant_values=0)
+            item['label'] = padded_label
+
+        padded_batch.append(item)
 
     # 4. 다른 데이터들도 배치로 만듭니다.
-    batch_without_images = [{k: v for k, v in item.items() if k != 'image'} for item in batch]
-    collated_batch = torch.utils.data.default_collate(batch_without_images)
+    collated_batch = torch.utils.data.default_collate(padded_batch)
 
-    # 5. 패딩된 이미지들을 쌓아서(stack) 배치에 추가합니다.
-    collated_batch['image'] = torch.stack(images)
-    collated_batch['original_shape'] = torch.stack(original_shapes)
+    # # 5. 패딩된 이미지들을 쌓아서(stack) 배치에 추가합니다.
+    # collated_batch['image'] = torch.stack(images)
+    # collated_batch['original_shape'] = torch.stack(original_shapes)
 
     return collated_batch
+
+def widar_collate_fn(batch):
+    """
+    가변 크기의 'image' 텐서를 패딩하여 동일한 크기로 맞춘 후,
+    하나의 배치로 합칩니다.
+    """
+    padded_batch = []
+    target_h = 2048
+
+    for item in batch:
+        img = item['image']
+        noise = item['noise']
+        if img.shape[-2] > target_h:
+            img = img[:, :target_h, :]
+            noise = noise[:, :target_h, :]
+            original_shape = torch.tensor(img.shape)    # save original shape after cutting
+        elif img.shape[-2] < target_h:
+            pad_h = target_h - img.shape[-2]
+            pad_width = [(0, 0)] * (img.ndim - 2) + [(0, pad_h), (0, 0)]
+            original_shape = torch.tensor(img.shape)    # save original shape before padding
+            img = np.pad(img, pad_width, mode='constant', constant_values=0)
+            noise = np.pad(noise, pad_width, mode='constant', constant_values=0)
+        else:
+            original_shape = torch.tensor(img.shape)
+
+        item['original_shape'] = original_shape
+        item['image'] = img
+        item['noise'] = noise
+        padded_batch.append(item)
+
+    # 4. 다른 데이터들도 배치로 만듭니다.
+    collated_batch = torch.utils.data.default_collate(padded_batch)
+
+    # # 5. 패딩된 이미지들을 쌓아서(stack) 배치에 추가합니다.
+    # collated_batch['image'] = torch.stack(images)
+    # collated_batch['original_shape'] = torch.stack(original_shapes)
+
+    return collated_batch
+
 
 
 class widarRfDataset(ambient_utils.dataset_utils.Dataset):
@@ -687,23 +920,22 @@ class widarRfDataset(ambient_utils.dataset_utils.Dataset):
         # # csi_data : (frame, antenna, channel) - complex
         # # noise_data : (frame, antenna) - float
         idx_fname = self.data_label_df.iloc[idx]["file name"]
-        idx_dir = "/".join(self._path, idx_fname)
+        idx_dir = "/".join([self._path, idx_fname])
         with self.csi_data_loader(idx_dir) as data:
             csi_data = data["csi"]
-            noise_data = data["noise"]
+            noise_data = np.expand_dims(data["noise"], -1)
             time_data = data["time"]
         # csi_data : (frame, antenna, channel) - complex
-        # noise_data : (frame, antenna) - float
+        # noise_data : (frame, 1) - float
 
         if self._transpose is not None:
-            assert noise_data.ndim == len(self._transpose), "noise_data ndim and transpose length mismatch"
+            assert noise_data.ndim == len(self._transpose), f"noise_data ndim and transpose length mismatch {noise_data.shape} {len(self._transpose)}"
             csi_data = np.transpose(csi_data, self._transpose + (2,))
             noise_data = np.transpose(noise_data, self._transpose)
 
         if not self._view_as_complex:
             csi_data = np.expand_dims(np.array(csi_data), -1)
-
-            csi_data = csi_data.view(np.float64)
+            csi_data = csi_data.view(np.float32)
 
             if self._complex_merge_axis is not None:
                 csi_data = np.concatenate((np.take(csi_data, 0, axis=-1),

@@ -23,7 +23,8 @@ from torch_utils import misc
 import ambient_utils
 import wandb
 import tempfile
-from training.dataset import renewRfDataset
+from training.dataset import renewRfDataset, renewRfProcessedDataset, widarRfDataset
+
 
 def infiniteloop(dataloader):
     while True:
@@ -187,7 +188,8 @@ def training_loop(
 
     # Load dataset.
     dist.print0('Loading dataset...')
-    dataset_obj = renewRfDataset(**dataset_kwargs)
+    dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    # dataset_obj = widarRfDataset(**dataset_kwargs)
     ## using This sampler is way way way~~~ too slow for every epoch renewal
     # dataset_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=True, seed=seed)
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
@@ -202,13 +204,17 @@ def training_loop(
     
     # Construct network.
     dist.print0('Constructing network...')
-    interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
+    # interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
+    interface_kwargs = dict(img_resolution=[16, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_resolution=[16, 32]) # TODO: This is very clumsy. Need to fix ASAP
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     with torch.no_grad():
         images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device)
         sigma = torch.ones([batch_gpu], device=device)
-        labels = torch.zeros([batch_gpu, net.label_dim], device=device)
+        if net.model.label_type == 'downlink':
+            labels = torch.zeros([batch_gpu, net.label_dim, net.img_resolution[0], net.img_resolution[1]], device=device)
+        elif net.model.label_type == 'classes':
+            labels = torch.zeros([batch_gpu, net.label_dim], device=device)
         misc.print_module_summary(net, [images, sigma, labels], max_nesting=2, verbose=dist.get_rank() == 0)
 
     # Setup optimizer.
@@ -266,21 +272,27 @@ def training_loop(
                 images = dataset_item["image"].to(device)                
                 labels = dataset_item["label"].to(device)
                 current_sigma = dataset_item["sigma"].to(device)
-                original_shape = dataset_item["original_shape"].to(device)
+                if "original_shape" in dataset_item:
+                    original_shape = dataset_item["original_shape"].to(device)
+                else:
+                    original_shape = None
 
                 loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe)
                 
-                # Create a mask to zero out the loss on padded areas.
-                # loss is expected to be of shape (N, C, H, W)
-                mask = torch.zeros_like(loss)
-                for i in range(loss.shape[0]):
-                    # Get original shape for the i-th image
-                    _, h, w = original_shape[i]
-                    # Set mask to 1 for the original image area
-                    mask[i, :, :h, :w] = 1
-                
+                if original_shape is not None:
+                    # Create a mask to zero out the loss on padded areas.
+                    # loss is expected to be of shape (N, C, H, W)
+                    mask = torch.zeros_like(loss)
+                    for i in range(loss.shape[0]):
+                        # Get original shape for the i-th image
+                        _, h, w = original_shape[i]
+                        # Set mask to 1 for the original image area
+                        mask[i, :, :h, :w] = 1
+                else:
+                    mask = 1
+                loss = loss * mask
                 training_stats.report('Loss/loss', loss)
-                (loss * mask).sum().mul(loss_scaling / batch_gpu_total).backward()
+                (loss).sum().mul(loss_scaling / batch_gpu_total).backward()
 
         # Update weights.
         for g in optimizer.param_groups:

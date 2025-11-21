@@ -372,6 +372,8 @@ class SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 # Modifeid for RF data. Minor changes to the original implementation
 # available at https://github.com/yang-song/score_sde_pytorch
 
+from collections import OrderedDict
+
 @persistence.persistent_class
 class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
     def __init__(self,
@@ -379,6 +381,8 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         in_channels,                        # Number of color channels at input.
         out_channels,                       # Number of color channels at output.
         label_dim           = 0,            # Number of class labels, 0 = unconditional.
+        label_resolution    = None,         # Label resolution
+        label_type          = 'downlink',
         augment_dim         = 0,            # Augmentation label dimensionality, 0 = no augmentation.
 
         model_channels      = 128,          # Base multiplier for the number of channels.
@@ -394,14 +398,15 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
-        power_of_two_padding = True,       # Pad input images to the next power of two resolution.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
         assert decoder_type in ['standard', 'skip']
+        assert label_type in ['downlink', 'classes']
 
         super().__init__()
         self.label_dropout = label_dropout
+        self.label_type = label_type
         emb_channels = model_channels * channel_mult_emb
         noise_channels = model_channels * channel_mult_noise
         init = dict(init_mode='xavier_uniform')
@@ -413,26 +418,49 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             init=init, init_zero=init_zero, init_attn=init_attn,
         )
 
-        self.power_of_two_padding = power_of_two_padding
-        if self.power_of_two_padding:
-            self.padded_img_resolution = (2 ** int(np.ceil(np.log2(img_resolution[0]))), 2 ** int(np.ceil(np.log2(img_resolution[1]))))
-        else:
-            self.padded_img_resolution = img_resolution
-
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
-        self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init) if label_dim else None
+        if label_dim != 0:
+            if label_type == 'downlink':
+                if label_resolution == None:
+                    label_resolution = img_resolution
+                flatten_feature_size = label_resolution[0]//4 * label_resolution[1]//4 * model_channels
+                self.map_label = torch.nn.Sequential(
+                    (OrderedDict([
+                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=3, **init)),    # RT : (model_channels, label_resolution[0], label_resolution[1])
+                                ("SiLU 1", torch.nn.SiLU()),
+                                ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, label_resolution[0]//2, label_resolution[1]//2)
+                                ("SiLU 2", torch.nn.SiLU()),
+                                ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, label_resolution[0]//4, label_resolution[1]//4)
+                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * label_resolution[0]//4 * label_resolution[1]//4)
+                                ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*3, **init)),
+                    ]))
+                )
+            elif label_type == 'classes':
+                self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init)
+            else:  
+                assert False, "Unknown label type"
+        else:
+            self.map_label = None
+
         self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
-        self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
-        self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
+
+        if self.map_label != None and self.label_type == 'downlink':
+            self.map_layer0 = Linear(in_features=noise_channels*4, out_features=emb_channels*2, **init)
+            self.map_layer1 = Linear(in_features=emb_channels*2, out_features=emb_channels, **init)
+        else:
+            self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
+            self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
         cout = in_channels
         caux = in_channels
         for level, mult in enumerate(channel_mult):
-            H_res = self.padded_img_resolution[0] >> level
-            W_res = self.padded_img_resolution[1] >> level
+            H_res = img_resolution[0] >> level
+            W_res = img_resolution[1] >> level
             if level == 0:
                 cin = cout
                 cout = model_channels
@@ -455,8 +483,8 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         # Decoder.
         self.dec = torch.nn.ModuleDict()
         for level, mult in reversed(list(enumerate(channel_mult))):
-            H_res = self.padded_img_resolution[0] >> level
-            W_res = self.padded_img_resolution[1] >> level            
+            H_res = img_resolution[0] >> level
+            W_res = img_resolution[1] >> level            
             if level == len(channel_mult) - 1:
                 self.dec[f'{H_res}x{W_res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
                 self.dec[f'{H_res}x{W_res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
@@ -477,24 +505,23 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         # Mapping.
         emb = self.map_noise(noise_labels)
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
+        if self.map_augment is not None and augment_labels is not None:
+            emb = emb + self.map_augment(augment_labels)
         if self.map_label is not None:
             tmp = class_labels
             if self.training and self.label_dropout:
                 tmp = tmp * (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
-            emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
-        if self.map_augment is not None and augment_labels is not None:
-            emb = emb + self.map_augment(augment_labels)
+            if self.label_type == 'downlink':
+                label_emb = self.map_label(tmp)
+                # emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+                emb = torch.concatenate([emb, label_emb], dim=1)
+            elif self.label_type == 'classes':
+                emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+            else:
+                assert False, "Unknown label type"
         emb = silu(self.map_layer0(emb))
         emb = silu(self.map_layer1(emb))
 
-        H_size = x.shape[2]
-        W_size = x.shape[3]
-
-        # Power-of-two padding.
-        if self.power_of_two_padding:
-            W_padd_size = self.padded_img_resolution[1] - W_size
-            H_padd_size = self.padded_img_resolution[0] - H_size
-            x = torch.nn.functional.pad(x, [W_padd_size//2, W_padd_size//2+W_padd_size%2, H_padd_size//2, H_padd_size//2+H_padd_size%2], mode='constant')
         # Encoder.
         skips = []
         aux = x
@@ -524,12 +551,6 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 if x.shape[1] != block.in_channels:
                     x = torch.cat([x, skips.pop()], dim=1)
                 x = block(x, emb)
-        # Remove padding.
-        if self.power_of_two_padding:
-            W_padd_size = self.padded_img_resolution[1] - W_size
-            H_padd_size = self.padded_img_resolution[0] - H_size
-            x = x[:, :, H_padd_size//2 : x.shape[2]- (H_padd_size//2 + H_padd_size%2), W_padd_size//2 : x.shape[3]- (W_padd_size//2 + W_padd_size%2)]
-            aux = aux[:, :, H_padd_size//2 : aux.shape[2]- (H_padd_size//2 + H_padd_size%2), W_padd_size//2 : aux.shape[3]- (W_padd_size//2 + W_padd_size%2)]
 
         return aux
 
@@ -826,7 +847,7 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
     def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
-        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)

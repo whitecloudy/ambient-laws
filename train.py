@@ -16,7 +16,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
-from training.dataset import renewRfDataset, widarRfDataset, pad_collate_fn
+from training.dataset import renewRfDataset, widarRfDataset, renewRfProcessedDataset, pad_collate_fn, widar_collate_fn
 import ambient_utils
 import warnings
 import wandb
@@ -51,6 +51,7 @@ def parse_int_list(s):
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp_192','ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
+
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=150, show_default=True)
@@ -108,6 +109,7 @@ def parse_int_list(s):
 
 # Wandb related
 @click.option('--wandb', help='Use wandb to log training progress',  type=bool, default=True)
+@click.option('--wandb_group', help='Wandb group name',                   type=str, default='Test')
 
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
@@ -127,23 +129,35 @@ def main(**kwargs):
     if dist.get_rank() == 0 and opts.wandb:
         wandb.init(project="ambient_rf", 
                    config=opts, name=opts.expr_id,
+                   group=opts.wandb_group,
                    dir=opts.outdir)
 
     # Initialize config dict.
     c = dnnlib.EasyDict()
+    # dataset_kwargs for RENEW dataset
     c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
                                        corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
                                        only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
                                        resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                        normalize_value=opts.data_norm)
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2, collate_fn=pad_collate_fn)
+    # dataset_kwargs for WIDAR dataset
+    # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
+    #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
+    #                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+    #                                    resolution=(2048, 3, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
+    #                                    normalize_value=opts.data_norm)
+
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+    c.data_loader_kwargs.collate_fn = pad_collate_fn
+    # c.data_loader_kwargs.collate_fn = widar_collate_fn
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8, weight_decay=opts.weight_decay)
 
     # Validate dataset options.
     try:
-        dataset_obj = renewRfDataset(**c.dataset_kwargs)
+        dataset_obj = renewRfProcessedDataset(**c.dataset_kwargs)
+        # dataset_obj = widarRfDataset(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
         c.dataset_kwargs.dataset_keep_percentage = opts.dataset_keep_percentage
         c.dataset_kwargs.max_size = int(len(dataset_obj) * opts.dataset_keep_percentage)
@@ -152,12 +166,11 @@ def main(**kwargs):
         del dataset_obj # conserve memory
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
-
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2])
-    if opts.arch == 'ddpmpp_192':
+    elif opts.arch == 'ddpmpp_192':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[1,2,2,2])
     elif opts.arch == 'ncsnpp':
@@ -261,7 +274,14 @@ def main(**kwargs):
     # Print options.
     dist.print0()
     dist.print0('Training options:')
-    dist.print0(json.dumps(c, indent=2))
+    # Create a deep copy for JSON serialization
+    import copy
+    c_json = copy.deepcopy(c)
+    # Convert function object to its name for serialization
+    if 'collate_fn' in c_json.data_loader_kwargs and callable(c_json.data_loader_kwargs.collate_fn):
+        c_json.data_loader_kwargs.collate_fn = c_json.data_loader_kwargs.collate_fn.__name__
+
+    dist.print0(json.dumps(c_json, indent=2))
     dist.print0()
     dist.print0(f'Output directory:        {c.run_dir}')
     dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
@@ -283,7 +303,7 @@ def main(**kwargs):
     if dist.get_rank() == 0:
         os.makedirs(c.run_dir, exist_ok=True)
         with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
-            json.dump(c, f, indent=2)
+            json.dump(c_json, f, indent=2)
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     del c.dataset_kwargs.dataset_keep_percentage
