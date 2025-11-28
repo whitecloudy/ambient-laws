@@ -226,16 +226,17 @@ def load_hf_checkpoint(repo_id):
     model_config['class_name'] = 'training.networks.EDMPrecond'
     net = dnnlib.util.construct_class_by_name(**model_config)
     net = net.from_pretrained(repo_id)
-    return net 
+    return net, model_config
 #----------------------------------------------------------------------------
 
 @click.command()
 @click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
-@click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
+@click.option('--config_json',             help='Network config json filename', metavar='PATH|URL',                 type=str, required=True)
 @click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
 @click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
 @click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--data',                    help='Path to the dataset', metavar='ZIP|DIR',                           type=str, required=True)
 
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
@@ -253,7 +254,7 @@ def load_hf_checkpoint(repo_id):
 @click.option('--stop_variance', help="Early stop generation at this variance", type=float, default=0.0)
 
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, config_json, subdirs, seeds, class_idx, max_batch_size, data, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -284,8 +285,14 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     if "pkl" in network_pkl:
         with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
             net = pickle.load(f)['ema'].to(device)
+        with open(config_json, "r", encoding="utf-8") as f:
+            opts = json.load(f)
     else:
-        net = load_hf_checkpoint(network_pkl).to(device)
+        net, opts = load_hf_checkpoint(network_pkl).to(device)
+    # opts = opts['dataset_kwargs']
+    # dataset_kwargs for RENEW dataset
+    dataset_kwargs = dnnlib.EasyDict(**opts['dataset_kwargs'])
+    dataset_kwargs.data = data
 
     # Other ranks follow.
     if dist.get_rank() == 0:
