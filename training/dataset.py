@@ -500,6 +500,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  corruption_probability_per_pixel = 1.0,
                  image_corruption_seed = 112154,
                  image_noise_seed = 445481,
+                 dataset_keep_percentage = 1.0,
                  normalize_value = 1.0,
                  use_labels  = False,
                  **super_kwargs):
@@ -528,7 +529,15 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         if must_not_contain is not None:
             self._fname = {fname for fname in self._fname if must_not_contain not in fname}
 
-        self._fname = sorted(list(self._fname))
+        self._fname = list(self._fname)
+
+        if dataset_keep_percentage < 1.0:
+            num_to_keep = int(len(self._fname) * dataset_keep_percentage)
+            rng = np.random.RandomState(image_corruption_seed)
+            rng.shuffle(self._fname)
+            self._fname = self._fname[:num_to_keep]
+        
+        self._fname = sorted(self._fname)
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         single_csi_shape = self.__load_single_file(self._fname[0])[0].shape
