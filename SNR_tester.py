@@ -20,6 +20,7 @@ import dnnlib
 from torch_utils import distributed as dist
 import joblib
 from huggingface_hub import hf_hub_download
+from training.dataset import renewRfDataset, renewRfProcessedDataset, widarRfDataset, pad_collate_fn, widar_collate_fn
 import json
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -50,7 +51,7 @@ def edm_sampler(
         x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
 
         # Euler step.
-        denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+        denoised = net(x_hat, t_hat.expand(x_hat.shape[0]), class_labels).to(torch.float64)
         
         # Stop if variance is below threshold
         if t_next ** 2 < stop_variance:
@@ -61,7 +62,7 @@ def edm_sampler(
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
-            denoised = net(x_next, t_next, class_labels).to(torch.float64)
+            denoised = net(x_next, t_next.expand(x_hat.shape[0]), class_labels).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
@@ -183,25 +184,25 @@ def ablation_sampler(
 
     return x_next
 
-#----------------------------------------------------------------------------
-# Wrapper for torch.Generator that allows specifying a different random seed
-# for each sample in a minibatch.
 
-class StackedRandomGenerator:
-    def __init__(self, device, seeds):
-        super().__init__()
-        self.generators = [torch.Generator(device).manual_seed(int(seed) % (1 << 32)) for seed in seeds]
+def cal_SNR(predict : torch.Tensor, truth : torch.Tensor, complex_axis=None):
+    if complex_axis != None:
+        assert predict.dtype != torch.complex and truth.dtype != torch.complex, "\'complex axis\' is given while dtype is already complex!"
+        # Handling batch axis
+        if complex_axis >= 0:
+            complex_axis += 1
 
-    def randn(self, size, **kwargs):
-        assert size[0] == len(self.generators)
-        return torch.stack([torch.randn(size[1:], generator=gen, **kwargs) for gen in self.generators])
+        predict = torch.split(predict, 2, dim=complex_axis)
+        truth = torch.split(truth, 2, dim=complex_axis)
 
-    def randn_like(self, input):
-        return self.randn(input.shape, dtype=input.dtype, layout=input.layout, device=input.device)
+        predict = predict[0] + 1j * predict[1]
+        truth = truth[0] + 1j * truth[1]
+    axis_list = [i for i in range(1, len(predict.shape))]
+    PS = torch.sum(torch.abs(truth)**2, axis=axis_list)  # power of signal
+    PN = torch.sum(torch.abs(predict - truth)**2, axis=axis_list)  # power of noise
+    ratio = PS / PN
+    return 10 * torch.log10(ratio)
 
-    def randint(self, *args, size, **kwargs):
-        assert size[0] == len(self.generators)
-        return torch.stack([torch.randint(*args, size=size[1:], generator=gen, **kwargs) for gen in self.generators])
 
 #----------------------------------------------------------------------------
 # Parse a comma separated list of numbers or ranges and return a list of ints.
@@ -232,9 +233,8 @@ def load_hf_checkpoint(repo_id):
 @click.command()
 @click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
 @click.option('--config_json',             help='Network config json filename', metavar='PATH|URL',                 type=str, required=True)
-@click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
+@click.option('--seed',                    help='Random seed', metavar='INT',                                       type=int, default=11454, show_default=True)
 @click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
-@click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
 @click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--data',                    help='Path to the dataset', metavar='ZIP|DIR',                           type=str, required=True)
 
@@ -254,7 +254,7 @@ def load_hf_checkpoint(repo_id):
 @click.option('--stop_variance', help="Early stop generation at this variance", type=float, default=0.0)
 
 
-def main(network_pkl, config_json, subdirs, seeds, class_idx, max_batch_size, data, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -271,9 +271,6 @@ def main(network_pkl, config_json, subdirs, seeds, class_idx, max_batch_size, da
         --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
     """
     dist.init()
-    num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
-    all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
-    rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
 
     # Rank 0 goes first.
     if dist.get_rank() != 0:
@@ -292,50 +289,86 @@ def main(network_pkl, config_json, subdirs, seeds, class_idx, max_batch_size, da
     # opts = opts['dataset_kwargs']
     # dataset_kwargs for RENEW dataset
     dataset_kwargs = dnnlib.EasyDict(**opts['dataset_kwargs'])
-    dataset_kwargs.data = data
+    dataset_kwargs.path = data
+    dataset_kwargs.dataset_keep_percentage = 0.01
+
+    data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=4, prefetch_factor=2)
+    data_loader_kwargs.collate_fn = pad_collate_fn
+
+    rnd_gen = torch.Generator(device=device).manual_seed(seed)
+
+    dist.print0('Loading dataset...')
+    dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
+    dataloader_obj = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dist_sampler, batch_size=max_batch_size, **data_loader_kwargs)
 
     # Other ranks follow.
     if dist.get_rank() == 0:
         torch.distributed.barrier()
 
-    # Loop over batches.
-    dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
-    for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
-        batch_size = len(batch_seeds)
-        if batch_size == 0:
-            continue
+    total_SNR_sum = 0.0
 
-        # Pick latents and labels.
-        rnd = StackedRandomGenerator(device, batch_seeds)
-        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
-        class_labels = None
-        if net.label_dim:
-            class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]
-        if class_idx is not None:
-            class_labels[:, :] = 0
-            class_labels[:, class_idx] = 1
-
-        # Generate images.
-        sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
-        have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
-
-        # Save images.
-        images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
-        for seed, image_np in zip(batch_seeds, images_np):
-            image_dir = os.path.join(outdir, f'{seed-seed%1000:06d}') if subdirs else outdir
-            os.makedirs(image_dir, exist_ok=True)
-            image_path = os.path.join(image_dir, f'{seed:06d}.png')
-            if image_np.shape[2] == 1:
-                PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
+    # # Loop over batches.
+    with torch.inference_mode(True):
+        for dataset_item in tqdm.tqdm(dataloader_obj, unit='data', disable=(dist.get_rank() != 0)):
+            torch.distributed.barrier()
+            true_images = dataset_item["image"].to(device)                
+            labels = dataset_item["label"].to(device)
+            current_sigma = dataset_item["sigma"].to(device)
+            if "original_shape" in dataset_item:
+                original_shape = dataset_item["original_shape"].to(device)
             else:
-                PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+                original_shape = None
+
+            latents = torch.randn(true_images.shape, generator=rnd_gen, device=device)
+
+            # # Pick latents and labels.
+            # rnd = StackedRandomGenerator(device, batch_seeds)
+            # latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
+            # class_labels = None
+            # if net.label_dim:
+            #     class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]
+            # if class_idx is not None:
+            #     class_labels[:, :] = 0
+            #     class_labels[:, class_idx] = 1
+
+            # Generate images.
+            sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
+            have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
+            sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
+            sampler_fn = edm_sampler
+            gen_data = sampler_fn(net, latents, labels, **sampler_kwargs)
+
+            if original_shape is not None:
+                # Create a mask to zero out the loss on padded areas.
+                # loss is expected to be of shape (N, C, H, W)
+                mask = torch.zeros_like(gen_data)
+                for i in range(gen_data.shape[0]):
+                    # Get original shape for the i-th image
+                    _, h, w = original_shape[i]
+                    # Set mask to 1 for the original image area
+                    mask[i, :, :h, :w] = 1
+            else:
+                mask = 1
+
+            gen_data = gen_data * mask
+            SNR = cal_SNR(gen_data, true_images)
+
+            SNR_sum = torch.sum(SNR)
+            collect_SNR_sum_list = [torch.tensor(0.0, dtype=torch.float64, device=device) for _ in range(dist.get_world_size())]
+            torch.distributed.gather(SNR_sum, gather_list=collect_SNR_sum_list, dst=0)
+
+            if dist.get_rank() == 0:
+                total_SNR_sum += sum(collect_SNR_sum_list).cpu().item()
+            
+            torch.distributed.barrier()
+    dist.print0(f'Final SNR average : {total_SNR_sum / len(dataset_obj)}')
 
     # Done.
     torch.distributed.barrier()
+
     dist.print0('Done.')
+    dist.destroy_process_group()
 
 #----------------------------------------------------------------------------
 
