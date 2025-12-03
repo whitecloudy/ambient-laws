@@ -62,11 +62,77 @@ def edm_sampler(
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
-            denoised = net(x_next, t_next.expand(x_hat.shape[0]), class_labels).to(torch.float64)
+            denoised = net(x_next, t_next.expand(x_next.shape[0]), class_labels).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
     return x_next
+
+#----------------------------------------------------------------------------
+# Proposed EDM sampler (Algorithm 2).
+
+def truncated_edm_sampler(
+    net, latents, class_labels=None, sigma=0.0, randn_like=torch.randn_like,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    stop_variance=0.0
+):
+    batch_size = latents.shape[0]
+    device = latents.device
+
+    # Adjust noise levels based on what's supported by the network.
+    sigma_min = max(sigma_min, net.sigma_min)
+    sigma_max = min(sigma_max, net.sigma_max)
+
+    # Time step discretization.
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    step_indices = step_indices.expand(batch_size, -1)
+    
+    if sigma.ndim == 1:
+        sigma = sigma.unsqueeze(1)
+        
+    sigma_min_rho = sigma ** (1 / rho)
+    sigma_max_rho = sigma_max ** (1 / rho)
+    
+    t_steps = (sigma_max_rho + step_indices / (num_steps - 1) * (sigma_min_rho - sigma_max_rho)) ** rho
+
+    zeros = torch.zeros((t_steps.shape[0], 1), device=t_steps.device, dtype=t_steps.dtype)
+    t_steps = torch.cat([net.round_sigma(t_steps), zeros], dim=1) # t_N = 0
+
+    dim_diff = len(latents.shape) - (len(t_steps.shape) - 1)
+    for _ in range(dim_diff):
+        t_steps = t_steps.unsqueeze(-1)
+
+    # Main sampling loop.
+    x_next = latents.to(torch.float64) * t_steps[0, 0]
+    for i in range(num_steps): # 0, ..., N-1
+        x_cur = x_next
+        t_cur = t_steps[:, i]
+        t_next = t_steps[:, i+1]
+
+        # Increase noise temporarily.
+        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur[0] <= S_max else 0
+        t_hat = net.round_sigma(t_cur + gamma * t_cur)
+        x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
+
+        # Euler step.
+        denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+        
+        # Stop if variance is below threshold
+        if torch.all(t_next ** 2 < stop_variance):
+            return denoised
+
+        d_cur = (x_hat - denoised) / t_hat
+        x_next = x_hat + (t_next - t_hat) * d_cur
+
+        # Apply 2nd order correction.
+        if i < num_steps - 1:
+            denoised = net(x_next, t_next, class_labels).to(torch.float64)
+            d_prime = (x_next - denoised) / t_next
+            x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+    return x_next
+
 
 #----------------------------------------------------------------------------
 # Generalized ablation sampler, representing the superset of all sampling
@@ -231,30 +297,32 @@ def load_hf_checkpoint(repo_id):
 #----------------------------------------------------------------------------
 
 @click.command()
-@click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
-@click.option('--config_json',             help='Network config json filename', metavar='PATH|URL',                 type=str, required=True)
-@click.option('--seed',                    help='Random seed', metavar='INT',                                       type=int, default=11454, show_default=True)
-@click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
-@click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
-@click.option('--data',                    help='Path to the dataset', metavar='ZIP|DIR',                           type=str, required=True)
+@click.option('--network', 'network_pkl',   help='Network pickle filename', metavar='PATH|URL',                     type=str, required=True)
+@click.option('--config_json',              help='Network config json filename', metavar='PATH|URL',                type=str, required=True)
+@click.option('--seed',                     help='Random seed', metavar='INT',                                      type=int, default=11454, show_default=True)
+@click.option('--subdirs',                  help='Create subdirectory for every 1000 seeds',                        is_flag=True)
+@click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--data',                     help='Path to the dataset', metavar='ZIP|DIR',                          type=str, required=True)
+@click.option('--data_keep_ratio',          help='How much data keeping ratio', metavar='FLOAT',                    type=float, default=1.0, show_default=True)
 
-@click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
-@click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
-@click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
-@click.option('--rho',                     help='Time step exponent', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
-@click.option('--S_churn', 'S_churn',      help='Stochasticity strength', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
-@click.option('--S_min', 'S_min',          help='Stoch. min noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
-@click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
-@click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
+@click.option('--steps', 'num_steps',       help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=18, show_default=True)
+@click.option('--sigma_min',                help='Lowest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
+@click.option('--sigma_max',                help='Highest noise level  [default: varies]', metavar='FLOAT',         type=click.FloatRange(min=0, min_open=True))
+@click.option('--rho',                      help='Time step exponent', metavar='FLOAT',                             type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
+@click.option('--S_churn', 'S_churn',       help='Stochasticity strength', metavar='FLOAT',                         type=click.FloatRange(min=0), default=0, show_default=True)
+@click.option('--S_min', 'S_min',           help='Stoch. min noise level', metavar='FLOAT',                         type=click.FloatRange(min=0), default=0, show_default=True)
+@click.option('--S_max', 'S_max',           help='Stoch. max noise level', metavar='FLOAT',                         type=click.FloatRange(min=0), default='inf', show_default=True)
+@click.option('--S_noise', 'S_noise',       help='Stoch. noise inflation', metavar='FLOAT',                         type=float, default=1, show_default=True)
 
-@click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
-@click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
-@click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
-@click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
-@click.option('--stop_variance', help="Early stop generation at this variance", type=float, default=0.0)
+@click.option('--solver',                   help='Ablate ODE solver', metavar='euler|heun',                         type=click.Choice(['euler', 'heun']))
+@click.option('--disc', 'discretization',   help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm',type=click.Choice(['vp', 've', 'iddpm', 'edm']))
+@click.option('--schedule',                 help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',          type=click.Choice(['vp', 've', 'linear']))
+@click.option('--scaling',                  help='Ablate signal scaling s(t)', metavar='vp|none',                   type=click.Choice(['vp', 'none']))
+@click.option('--stop_variance',            help="Early stop generation at this variance",                          type=float, default=0.0)
+@click.option('--trunc',                    help='Activate truncated sampling',                                     is_flag=True)
 
 
-def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_keep_ratio, trunc, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -290,7 +358,7 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, device=t
     # dataset_kwargs for RENEW dataset
     dataset_kwargs = dnnlib.EasyDict(**opts['dataset_kwargs'])
     dataset_kwargs.path = data
-    dataset_kwargs.dataset_keep_percentage = 0.01
+    dataset_kwargs.dataset_keep_percentage = data_keep_ratio
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=4, prefetch_factor=2)
     data_loader_kwargs.collate_fn = pad_collate_fn
@@ -334,10 +402,14 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, device=t
 
             # Generate images.
             sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
-            have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-            sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-            sampler_fn = edm_sampler
-            gen_data = sampler_fn(net, latents, labels, **sampler_kwargs)
+            # have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
+            # sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
+            sampler_fn = edm_sampler if not trunc else truncated_edm_sampler
+            
+            if sampler_fn == truncated_edm_sampler:
+                gen_data = sampler_fn(net, latents, labels, current_sigma, **sampler_kwargs)
+            else:
+                gen_data = sampler_fn(net, latents, labels, **sampler_kwargs)
 
             if original_shape is not None:
                 # Create a mask to zero out the loss on padded areas.
@@ -355,7 +427,11 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, device=t
             SNR = cal_SNR(gen_data, true_images)
 
             SNR_sum = torch.sum(SNR)
-            collect_SNR_sum_list = [torch.tensor(0.0, dtype=torch.float64, device=device) for _ in range(dist.get_world_size())]
+            if dist.get_rank() == 0:
+                collect_SNR_sum_list = [torch.tensor(0.0, dtype=torch.float64, device=device) for _ in range(dist.get_world_size())]
+            else:
+                collect_SNR_sum_list = None
+
             torch.distributed.gather(SNR_sum, gather_list=collect_SNR_sum_list, dst=0)
 
             if dist.get_rank() == 0:
