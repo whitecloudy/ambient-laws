@@ -298,7 +298,7 @@ def load_hf_checkpoint(repo_id):
 
 @click.command()
 @click.option('--network', 'network_pkl',   help='Network pickle filename', metavar='PATH|URL',                     type=str, required=True)
-@click.option('--config_json',              help='Network config json filename', metavar='PATH|URL',                type=str, required=True)
+@click.option('--config_json',              help='Network config json filename', metavar='PATH|URL',                type=str, default=None, show_default=True)
 @click.option('--seed',                     help='Random seed', metavar='INT',                                      type=int, default=11454, show_default=True)
 @click.option('--subdirs',                  help='Create subdirectory for every 1000 seeds',                        is_flag=True)
 @click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=64, show_default=True)
@@ -350,8 +350,15 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
     if "pkl" in network_pkl:
         with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
             net = pickle.load(f)['ema'].to(device)
-        with open(config_json, "r", encoding="utf-8") as f:
-            opts = json.load(f)
+        if config_json is not None:
+            with open(config_json, "r", encoding="utf-8") as f:
+                opts = json.load(f)
+        else:
+            config_filepath = os.path.join(os.path.dirname(network_pkl), 'training_options.json')
+            assert os.path.isfile(config_filepath), f'Cannot find config file at {config_filepath}'
+            dist.print0(f'Loading config from "{config_filepath}"...')
+            with open(config_filepath, "r", encoding="utf-8") as f:
+                opts = json.load(f)
     else:
         net, opts = load_hf_checkpoint(network_pkl).to(device)
     # opts = opts['dataset_kwargs']
