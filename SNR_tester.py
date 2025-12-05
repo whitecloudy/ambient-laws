@@ -85,7 +85,9 @@ def truncated_edm_sampler(
     sigma_max = min(sigma_max, net.sigma_max)
 
     # Time step discretization.
-    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    # step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    step_indices = torch.arange(num_steps+1, dtype=torch.float64, device=latents.device)
+
     step_indices = step_indices.expand(batch_size, -1)
     
     if sigma.ndim == 1:
@@ -94,11 +96,12 @@ def truncated_edm_sampler(
     sigma_min_rho = sigma ** (1 / rho)
     sigma_max_rho = sigma_max ** (1 / rho)
     
-    t_steps = (sigma_max_rho + step_indices / (num_steps - 1) * (sigma_min_rho - sigma_max_rho)) ** rho
+    # t_steps = (sigma_max_rho + step_indices / (num_steps - 1) * (sigma_min_rho - sigma_max_rho)) ** rho
+    t_steps = (sigma_max_rho + step_indices / (num_steps) * (sigma_min_rho - sigma_max_rho)) ** rho
 
-    zeros = torch.zeros((t_steps.shape[0], 1), device=t_steps.device, dtype=t_steps.dtype)
-    t_steps = torch.cat([net.round_sigma(t_steps), zeros], dim=1) # t_N = 0
-
+    # zeros = torch.zeros((t_steps.shape[0], 1), device=t_steps.device, dtype=t_steps.dtype)
+    # t_steps = torch.cat([net.round_sigma(t_steps), zeros], dim=1) # t_N = 0
+    print(t_steps)
     dim_diff = len(latents.shape) - (len(t_steps.shape) - 1)
     for _ in range(dim_diff):
         t_steps = t_steps.unsqueeze(-1)
@@ -431,9 +434,9 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
                 mask = 1
 
             gen_data = gen_data * mask
-            SNR = cal_SNR(gen_data, true_images)
-
+            SNR = cal_SNR(gen_data, true_images, dataset_kwargs.complex_merge_axis)
             SNR_sum = torch.sum(SNR)
+            
             if dist.get_rank() == 0:
                 collect_SNR_sum_list = [torch.tensor(0.0, dtype=torch.float64, device=device) for _ in range(dist.get_world_size())]
             else:

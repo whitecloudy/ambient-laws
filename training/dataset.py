@@ -585,6 +585,10 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         # csi_data : (frame, antenna, channel) - complex
         # noise_data : (frame, antenna) - float
 
+        # Scale Normalization
+        csi_data /= self._normalize_value
+        noise_data /= self._normalize_value
+
         noise_data = np.expand_dims(noise_data, -1)
         # noise_data : (frame, antenna, 1) - float
 
