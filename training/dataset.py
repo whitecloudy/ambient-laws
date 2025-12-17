@@ -14,6 +14,7 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+import fnmatch
 
 try:
     import pyspng
@@ -522,13 +523,20 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             self._fname = glob(os.path.join(self._path, '*.npz'), recursive=True)
         else:
             raise IOError('Path must point to a directory or list of file paths')
-                
+        
+        print("Dataset Length before", len(self._fname))
         if must_contain is not None:
-            self._fname = {fname for fname in self._fname if must_contain in fname}
+            if any(c in must_contain for c in '*?['):
+                self._fname = {fname for fname in self._fname if fnmatch.fnmatch(fname, must_contain)}
+            else:
+                self._fname = {fname for fname in self._fname if must_contain in fname}
         
         if must_not_contain is not None:
-            self._fname = {fname for fname in self._fname if must_not_contain not in fname}
-
+            if any(c in must_not_contain for c in '*?['):
+                self._fname = {fname for fname in self._fname if not fnmatch.fnmatch(fname, must_not_contain)}
+            else:
+                self._fname = {fname for fname in self._fname if must_not_contain not in fname}
+        print("Dataset Length after", len(self._fname))
         self._fname = list(self._fname)
 
         if dataset_keep_percentage < 1.0:
@@ -615,14 +623,27 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         else:
             label_data = np.zeros([self.image_shape[0], 0], dtype=np.float32)
 
-        return {
-            'image': csi_data.astype(np.float32),
-            "label": label_data.astype(np.float32),
-            'sigma': noise_data.astype(np.float32),
-            'idx': idx,
-            'filename': self._fname[idx],
-            "noise": np.random.randn(*csi_data.shape),
-        }
+        if self._view_as_complex:
+            return {
+                'image': csi_data.astype(np.complex64),
+                "label": label_data.astype(np.complex64),
+                'sigma': noise_data.astype(np.float32),
+                'idx': idx,
+                'filename': self._fname[idx],
+                "noise": np.random.randn(*csi_data.shape),
+                'fname': item_fname,
+            }
+        else:
+            return {
+                'image': csi_data.astype(np.float32),
+                "label": label_data.astype(np.float32),
+                'sigma': noise_data.astype(np.float32),
+                'idx': idx,
+                'filename': self._fname[idx],
+                "noise": np.random.randn(*csi_data.shape),
+                'fname': item_fname,
+
+            }   
     
     @property
     def name(self):
