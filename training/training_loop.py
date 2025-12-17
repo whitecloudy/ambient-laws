@@ -373,7 +373,7 @@ def training_loop(
             # report to wandb
             for key, value in training_stats.default_collector.as_dict().items():
                 if wandb_onoff:
-                    wandb.log({key: value}, step=cur_tick * snapshot_ticks)
+                    wandb.log({key: value}, step=int(cur_nimg/1e3))
             stats_jsonl.flush()
 
             # Save a copy of the training state dump to the temporary directory
