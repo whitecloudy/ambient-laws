@@ -163,3 +163,5 @@ cython_debug/
 
 # Result directory
 *_result/
+
+data
