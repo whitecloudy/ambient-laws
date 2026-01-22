@@ -272,6 +272,31 @@ def cal_SNR(predict : torch.Tensor, truth : torch.Tensor, complex_axis=None):
     ratio = PS / PN
     return 10 * torch.log10(ratio)
 
+class renew_with_average_image(renewRfProcessedDataset):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def __getitem__(self, idx):
+        item = super().__getitem__(idx)
+        image_original = item['image']
+
+        fname = str(item['filename'])
+
+        # get other data from pilot pair
+        if fname.find('pilot0') != -1:
+            change_fname = fname.replace('pilot0', 'pilot1')
+        elif fname.find('pilot1') != -1:
+            change_fname = fname.replace('pilot1', 'pilot0')
+        else:
+            import warnings
+            warnings.warn(f"Filename {fname} does not contain 'pilot0' or 'pilot1'. Returning original item.")
+            return item
+
+        image_pair = super().__create_item__(change_fname)['image']
+        item['image'] = (image_original + image_pair) / 2.0
+        
+        return item
+
 
 #----------------------------------------------------------------------------
 # Parse a comma separated list of numbers or ranges and return a list of ints.
@@ -380,7 +405,8 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
     rnd_gen = torch.Generator(device=device).manual_seed(seed)
 
     dist.print0('Loading dataset...')
-    dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    # dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    dataset_obj = renew_with_average_image(**dataset_kwargs)
     dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
     dataloader_obj = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dist_sampler, batch_size=max_batch_size, **data_loader_kwargs)
 

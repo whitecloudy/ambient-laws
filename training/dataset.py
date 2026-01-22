@@ -585,10 +585,8 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
     def __len__(self):
         return len(self._fname)
-
-    def __getitem__(self, idx):
-        item_fname = self._fname[idx]
-
+    
+    def __create_item__(self, item_fname):
         csi_data, noise_data = self.__load_single_file(item_fname)
         # csi_data : (frame, antenna, channel) - complex
         # noise_data : (frame, antenna) - float
@@ -628,22 +626,25 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 'image': csi_data.astype(np.complex64),
                 "label": label_data.astype(np.complex64),
                 'sigma': noise_data.astype(np.float32),
-                'idx': idx,
-                'filename': self._fname[idx],
+                'filename': item_fname,
                 "noise": np.random.randn(*csi_data.shape),
-                'fname': item_fname,
             }
         else:
             return {
                 'image': csi_data.astype(np.float32),
                 "label": label_data.astype(np.float32),
                 'sigma': noise_data.astype(np.float32),
-                'idx': idx,
-                'filename': self._fname[idx],
+                'filename': item_fname,
                 "noise": np.random.randn(*csi_data.shape),
-                'fname': item_fname,
-
             }   
+
+    def __getitem__(self, idx):
+        item_fname = self._fname[idx]
+
+        return_item = self.__create_item__(item_fname)
+        return_item['idx'] = idx
+        return return_item
+
     
     @property
     def name(self):
