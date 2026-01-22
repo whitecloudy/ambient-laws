@@ -307,6 +307,8 @@ def load_hf_checkpoint(repo_id):
 @click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--data',                     help='Path to the dataset', metavar='ZIP|DIR',                          type=str, required=True)
 @click.option('--data_keep_ratio',          help='How much data keeping ratio', metavar='FLOAT',                    type=float, default=1.0, show_default=True)
+@click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                                 type=str, default=None, show_default=True)
+@click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',                           type=str, default=None, show_default=True)
 
 @click.option('--steps', 'num_steps',       help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',                help='Lowest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
@@ -325,7 +327,7 @@ def load_hf_checkpoint(repo_id):
 @click.option('--trunc',                    help='Activate truncated sampling',                                     is_flag=True)
 
 
-def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_keep_ratio, trunc, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_keep_ratio, must_contain, must_not_contain, trunc, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -369,6 +371,8 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
     dataset_kwargs = dnnlib.EasyDict(**opts['dataset_kwargs'])
     dataset_kwargs.path = data
     dataset_kwargs.dataset_keep_percentage = data_keep_ratio
+    dataset_kwargs.must_contain = must_contain
+    dataset_kwargs.must_not_contain = must_not_contain
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=4, prefetch_factor=2)
     data_loader_kwargs.collate_fn = pad_collate_fn
