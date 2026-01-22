@@ -26,9 +26,14 @@ def process_file(args):
         print(f"Error loading data for {prefix}: {e}")
         return
 
-    # 데이터 shape: [Frame, User, Cell, Subcarrier] 및 [Frame, User, Cell]
-    n_frames, n_users, n_cells, n_subcarriers = csi_data.shape
-    
+    if csi_data.ndim == 4 and noise_data.ndim == 3:
+        # 데이터 shape: [Frame, User, Cell, Subcarrier] 및 [Frame, User, Cell]
+        n_frames, n_users, n_cells, n_subcarriers = csi_data.shape
+        pilot_rep = 1
+    elif csi_data.ndim == 5 and noise_data.ndim == 3:
+        # 데이터 shape: [Frame, User, Pilot_Rep, Cell, Subcarrier] 및 [Frame, User, Cell]
+        n_frames, n_users, pilot_rep, n_cells, n_subcarriers = csi_data.shape
+
     # 출력 디렉토리 생성
     file_prefix = os.path.basename(prefix)
     target_dir = os.path.join(output_dir, file_prefix)
@@ -36,28 +41,33 @@ def process_file(args):
 
     # 데이터 분할 및 저장
     for u_start in range(n_users): # User는 1개 단위로 처리
-        for f_start in range(0, n_frames, frame_size):
-            f_end = min(f_start + frame_size, n_frames)
-            if f_end - f_start < frame_size: continue # 꽉 찬 프레임만 사용
+        for p_start in range(pilot_rep):
+            for f_start in range(0, n_frames, frame_size):
+                f_end = min(f_start + frame_size, n_frames)
+                if f_end - f_start < frame_size: continue # 꽉 찬 프레임만 사용
 
-            for c_start in range(0, n_cells, cell_size):
-                c_end = min(c_start + cell_size, n_cells)
-                if c_end - c_start < cell_size: continue # 꽉 찬 셀만 사용
+                for c_start in range(0, n_cells, cell_size):
+                    c_end = min(c_start + cell_size, n_cells)
+                    if c_end - c_start < cell_size: continue # 꽉 찬 셀만 사용
 
-                for s_start in range(0, n_subcarriers, subcarrier_size):
-                    s_end = min(s_start + subcarrier_size, n_subcarriers)
-                    if s_end - s_start < subcarrier_size: continue # 꽉 찬 subcarrier만 사용
-                    
-                    # 데이터 청크 추출
-                    csi_chunk = csi_data[f_start:f_end, u_start, c_start:c_end, s_start:s_end]
-                    # noise 데이터는 subcarrier 차원이 없음
-                    noise_chunk = noise_data[f_start:f_end, u_start, c_start:c_end]
-                    
-                    # 파일명 생성 및 저장
-                    output_filename = f"{f_start}_{u_start}_{c_start}_{s_start}.npz"
-                    output_path = os.path.join(target_dir, output_filename)
-                    
-                    np.savez_compressed(output_path, csi=csi_chunk, noise=noise_chunk)
+                    for s_start in range(0, n_subcarriers, subcarrier_size):
+                        s_end = min(s_start + subcarrier_size, n_subcarriers)
+                        if s_end - s_start < subcarrier_size: continue # 꽉 찬 subcarrier만 사용
+                        
+                        # 데이터 청크 추출
+                        if csi_data.ndim == 5:
+                            csi_chunk = csi_data[f_start:f_end, u_start, p_start, c_start:c_end, s_start:s_end]
+                        elif csi_data.ndim == 4:
+                            csi_chunk = csi_data[f_start:f_end, u_start, c_start:c_end, s_start:s_end]
+
+                        # noise 데이터는 subcarrier, pilot repetition 차원이 없음
+                        noise_chunk = noise_data[f_start:f_end, u_start, c_start:c_end]
+                        
+                        # 파일명 생성 및 저장
+                        output_filename = f"frame{f_start}_user{u_start}_pilot{p_start}_cell{c_start}_subcarrier{s_start}.npz"
+                        output_path = os.path.join(target_dir, output_filename)
+                        
+                        np.savez_compressed(output_path, csi=csi_chunk, noise=noise_chunk)
 
 def main():
     parser = argparse.ArgumentParser(description="RENEW 데이터셋 분할 스크립트")
