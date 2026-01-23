@@ -66,7 +66,7 @@ def edm_sampler(
             denoised = net(x_next, t_next.expand(x_next.shape[0]), class_labels).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
-        x_list.append(x_next.copy().detach())
+        x_list.append(x_next.clone().detach())
 
     return x_next, x_list
 
@@ -470,7 +470,7 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
             SNR = cal_SNR(gen_data, true_images, dataset_kwargs.complex_merge_axis)
             SNR_sum = torch.sum(SNR)
 
-            SNR_step_sum = torch.zeros(gen_data_each_list.shape[0], dtype=torch.float64, device=device)
+            SNR_step_sum = torch.zeros(len(gen_data_each_list), dtype=torch.float64, device=device)
             for i, gen_data_step in enumerate(gen_data_each_list):
                 gen_data_step = gen_data_step * mask
                 SNR_step = cal_SNR(gen_data_step, true_images, dataset_kwargs.complex_merge_axis)
