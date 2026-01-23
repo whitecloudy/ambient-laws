@@ -34,6 +34,7 @@ def edm_sampler(
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
+    x_list = []
 
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
@@ -65,8 +66,9 @@ def edm_sampler(
             denoised = net(x_next, t_next.expand(x_next.shape[0]), class_labels).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+        x_list.append(x_next.copy().detach())
 
-    return x_next
+    return x_next, x_list
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -133,8 +135,8 @@ def truncated_edm_sampler(
             denoised = net(x_next, t_next, class_labels).to(torch.float64)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
-
-    return x_next
+    # temporary return empty list for debugging
+    return x_next, []
 
 
 #----------------------------------------------------------------------------
@@ -415,6 +417,7 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
         torch.distributed.barrier()
 
     total_SNR_sum = 0.0
+    total_SNR_step_sum = torch.zeros(sampler_kwargs['num_steps'], dtype=torch.float64, device='cpu')
 
     # # Loop over batches.
     with torch.inference_mode(True):
@@ -447,9 +450,9 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
             sampler_fn = edm_sampler if not trunc else truncated_edm_sampler
             
             if sampler_fn == truncated_edm_sampler:
-                gen_data = sampler_fn(net, latents, labels, current_sigma, **sampler_kwargs)
+                gen_data, gen_data_each_list = sampler_fn(net, latents, labels, current_sigma, **sampler_kwargs)
             else:
-                gen_data = sampler_fn(net, latents, labels, **sampler_kwargs)
+                gen_data, gen_data_each_list = sampler_fn(net, latents, labels, **sampler_kwargs)
 
             if original_shape is not None:
                 # Create a mask to zero out the loss on padded areas.
@@ -466,6 +469,12 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
             gen_data = gen_data * mask
             SNR = cal_SNR(gen_data, true_images, dataset_kwargs.complex_merge_axis)
             SNR_sum = torch.sum(SNR)
+
+            SNR_step_sum = torch.zeros(gen_data_each_list.shape[0], dtype=torch.float64, device=device)
+            for i, gen_data_step in enumerate(gen_data_each_list):
+                gen_data_step = gen_data_step * mask
+                SNR_step = cal_SNR(gen_data_step, true_images, dataset_kwargs.complex_merge_axis)
+                SNR_step_sum[i] = torch.sum(SNR_step)
             
             if dist.get_rank() == 0:
                 collect_SNR_sum_list = [torch.tensor(0.0, dtype=torch.float64, device=device) for _ in range(dist.get_world_size())]
@@ -475,10 +484,19 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
             torch.distributed.gather(SNR_sum, gather_list=collect_SNR_sum_list, dst=0)
 
             if dist.get_rank() == 0:
+                collect_SNR_step_sum_list = [torch.zeros_like(SNR_step_sum, dtype=torch.float64, device=device) for _ in range(dist.get_world_size())]
+            else:
+                collect_SNR_step_sum_list = None
+
+            torch.distributed.gather(SNR_step_sum, gather_list=collect_SNR_step_sum_list, dst=0)
+
+            if dist.get_rank() == 0:
                 total_SNR_sum += sum(collect_SNR_sum_list).cpu().item()
+                total_SNR_step_sum += sum(collect_SNR_step_sum_list).cpu()
             
             torch.distributed.barrier()
     dist.print0(f'Final SNR average : {total_SNR_sum / len(dataset_obj)}')
+    dist.print0(f'Final SNR step average : {total_SNR_step_sum / len(dataset_obj)}')
 
     # Done.
     torch.distributed.barrier()
