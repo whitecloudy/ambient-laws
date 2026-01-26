@@ -53,6 +53,7 @@ def edm_sampler(
 
         # Euler step.
         denoised = net(x_hat, t_hat.expand(x_hat.shape[0]), class_labels).to(torch.float64)
+        x_list.append(denoised.clone().detach())
         
         # Stop if variance is below threshold
         if t_next ** 2 < stop_variance:
@@ -64,9 +65,10 @@ def edm_sampler(
         # Apply 2nd order correction.
         if i < num_steps - 1:
             denoised = net(x_next, t_next.expand(x_next.shape[0]), class_labels).to(torch.float64)
+            x_list.append(denoised.clone().detach())
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
-        x_list.append(x_next.clone().detach())
+        
 
     return x_next, x_list
 
