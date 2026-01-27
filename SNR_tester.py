@@ -409,8 +409,8 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
     rnd_gen = torch.Generator(device=device).manual_seed(seed)
 
     dist.print0('Loading dataset...')
-    # dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
-    dataset_obj = renew_with_average_image(**dataset_kwargs)
+    dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    # dataset_obj = renew_with_average_image(**dataset_kwargs)
     dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
     dataloader_obj = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dist_sampler, batch_size=max_batch_size, **data_loader_kwargs)
 
@@ -419,7 +419,7 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
         torch.distributed.barrier()
 
     total_SNR_sum = 0.0
-    total_SNR_step_sum = torch.zeros(sampler_kwargs['num_steps'], dtype=torch.float64, device='cpu')
+    total_SNR_step_sum = torch.zeros(sampler_kwargs['num_steps']*2-1, dtype=torch.float64, device='cpu')
 
     # # Loop over batches.
     with torch.inference_mode(True):
