@@ -159,6 +159,7 @@ def training_loop(
     lr_rampup_kimg      = 10000,    # Learning rate ramp-up duration.
     loss_scaling        = 1,        # Loss scaling factor for reducing FP16 under/overflows.
     no_asm              = False,    # Force no ASM Loss
+    only_additive_noise = False,    # Use only additive noise without natural noise
     kimg_per_tick       = 50,       # Interval of progress prints.
     snapshot_ticks      = 50,       # How often to save network snapshots, None = disable.
     state_dump_ticks    = 500,      # How often to dump training state, None = disable.
@@ -273,10 +274,18 @@ def training_loop(
                 images = dataset_item["image"].to(device)                
                 labels = dataset_item["label"].to(device)
                 current_sigma = dataset_item["sigma"].to(device)
+                additive_noise_sigma = dataset_item['additive_noise_sigma'].to(device)
+
                 if "original_shape" in dataset_item:
                     original_shape = dataset_item["original_shape"].to(device)
                 else:
                     original_shape = None
+
+                if only_additive_noise:
+                    current_sigma = additive_noise_sigma
+                else:
+                    current_sigma = torch.sqrt(current_sigma**2 + additive_noise_sigma**2)
+
                 if no_asm:
                     current_sigma = torch.zeros_like(current_sigma)
 

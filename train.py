@@ -96,11 +96,12 @@ def parse_int_list(s):
 @click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
 @click.option('--data_norm', help='Data normalization value for the RF data.', type=float, default=1.0, show_default=True)
 
-
 # Scaling laws related
 @click.option("--corruption_probability", help="Controls what percentage of images should be corrupted.", type=float, default=0.0)
 @click.option("--sigma", help="How much noise to add to the corrupted images.", type=float, default=0.0)
 @click.option('--dataset_keep_percentage', help='Limit training samples.', type=float, default=1.0, show_default=True)
+@click.option('--additive_noise_sigma', help='Standard deviation of the additive noise to be added to the clean images during corruption.', type=float, default=0.0, show_default=True)
+@click.option('--only_additive_noise', help='Whether to only use additive noise for corruption without natural noise.', is_flag=True)
 
 # Consistency params
 @click.option("--consistency_batch_size", help="Batch size for the consistency loss.", type=int, default=32)
@@ -142,7 +143,8 @@ def main(**kwargs):
                                        corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
                                        only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
                                        resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
-                                       normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain)
+                                       normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
+                                       additive_noise_sigma=opts.additive_noise_sigma)
     # dataset_kwargs for WIDAR dataset
     # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
     #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
@@ -229,6 +231,7 @@ def main(**kwargs):
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
     c.update(wandb_onoff=opts.wandb)
+    c.update(only_additive_noise=opts.only_additive_noise)
 
     # Random seed.
     if opts.seed is not None:

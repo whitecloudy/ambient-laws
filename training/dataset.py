@@ -493,6 +493,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  must_contain    = None, # Require filenames to contain this substring.
                  must_not_contain = None, # Require filenames to NOT contain this substring.
                  sigma: float = 0.1,     # ensured minimum currption sigma
+                 additive_noise_sigma: float = 0.0,
                  view_as_complex = False,
                  complex_merge_axis = 0,
                  transpose = None,
@@ -506,6 +507,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  use_labels  = False,
                  **super_kwargs):
         self.minimum_sigma = sigma
+        self.additive_noise_sigma = additive_noise_sigma
         self._noise_mean_flag = noise_mean_flag
         self._path = path
         self._normalize_value = normalize_value
@@ -514,6 +516,10 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         self._label_spliting_flag = use_labels
         self._transpose = tuple(transpose) if transpose is not None else None
         self._all_fnames = []
+        self._image_corruption_seed = image_corruption_seed
+        self._image_noise_seed = image_noise_seed
+        self.corruption_probability_per_image = corruption_probability_per_image
+        self.corruption_probability_per_pixel = corruption_probability_per_pixel
 
         self._fname = []
         if isinstance(self._path, list):
@@ -586,7 +592,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
     def __len__(self):
         return len(self._fname)
     
-    def __create_item__(self, item_fname):
+    def __create_item__(self, item_fname, idx):
         csi_data, noise_data = self.__load_single_file(item_fname)
         # csi_data : (frame, antenna, channel) - complex
         # noise_data : (frame, antenna) - float
@@ -616,6 +622,24 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         if self._noise_mean_flag:
             noise_data = np.mean((noise_data))
 
+        np_gen = np.random.default_rng(int(self._image_corruption_seed+175))
+        torch_gen = torch.Generator()
+        torch_gen.manual_seed(int(idx+self._image_noise_seed+4454))
+
+        if self.additive_noise_sigma > 0.0 and self.corruption_probability_per_image > 0.0:
+            if np_gen.random() < self.corruption_probability_per_image:
+                corruption_label = 1
+                # pick one of the corruptions
+                # mask = (torch.randn(csi_data.shape[1:], generator=torch_gen) < self.corruption_probability_per_pixel).unsqueeze(0).repeat(csi_data.shape[0], 1, 1)
+                noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
+
+                # csi_data = csi_data + (mask.numpy() * noise_image * self.additive_noise_sigma).astype(csi_data.dtype)
+                csi_data = csi_data + (noise_image * self.additive_noise_sigma).astype(csi_data.dtype)
+            else:
+                corruption_label = 0
+        else:
+            corruption_label = 0
+
         if self._label_spliting_flag:
             csi_data, label_data = np.split(csi_data, 2, axis=2)
         else:
@@ -628,6 +652,8 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 'sigma': noise_data.astype(np.float32),
                 'filename': item_fname,
                 "noise": np.random.randn(*csi_data.shape),
+                'corruption_label': corruption_label,
+                'additive_noise_sigma': self.additive_noise_sigma,
             }
         else:
             return {
@@ -636,12 +662,14 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 'sigma': noise_data.astype(np.float32),
                 'filename': item_fname,
                 "noise": np.random.randn(*csi_data.shape),
+                'corruption_label': corruption_label,
+                'additive_noise_sigma': self.additive_noise_sigma,
             }   
 
     def __getitem__(self, idx):
         item_fname = self._fname[idx]
 
-        return_item = self.__create_item__(item_fname)
+        return_item = self.__create_item__(item_fname, idx)
         return_item['idx'] = idx
         return return_item
 
