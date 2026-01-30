@@ -317,7 +317,6 @@ def main(**kwargs):
             json.dump(c_json, f, indent=2)
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
-    del c.dataset_kwargs.dataset_keep_percentage
     # Train.
     training_loop.training_loop(**c)
 

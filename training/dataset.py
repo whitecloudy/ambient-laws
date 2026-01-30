@@ -547,9 +547,11 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
         if dataset_keep_percentage < 1.0:
             num_to_keep = int(len(self._fname) * dataset_keep_percentage)
-            rng = np.random.RandomState(image_corruption_seed)
+            rng = np.random.RandomState(self._image_corruption_seed)
             rng.shuffle(self._fname)
             self._fname = self._fname[:num_to_keep]
+            self._removed_fname = self._fname[num_to_keep:]
+            print(f"Dataset reduced to {len(self._fname)} samples using keep percentage {dataset_keep_percentage}")
         
         self._fname = sorted(self._fname)
 
@@ -626,6 +628,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         torch_gen = torch.Generator()
         torch_gen.manual_seed(int(idx+self._image_noise_seed+4454))
 
+        # Apply corruption
         if self.additive_noise_sigma > 0.0 and self.corruption_probability_per_image > 0.0:
             if np_gen.random() < self.corruption_probability_per_image:
                 corruption_label = 1
