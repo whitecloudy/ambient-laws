@@ -435,7 +435,8 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                                 ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
                                 ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, label_resolution[0]//4, label_resolution[1]//4)
                                 ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * label_resolution[0]//4 * label_resolution[1]//4)
-                                ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*3, **init)),
+                                ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
+                                ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
                     ]))
                 )
             elif label_type == 'classes':
@@ -448,7 +449,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
 
         if self.map_label != None and self.label_type == 'downlink':
-            self.map_layer0 = Linear(in_features=noise_channels*4, out_features=emb_channels*2, **init)
+            self.map_layer0 = Linear(in_features=noise_channels*3, out_features=emb_channels*2, **init)
             self.map_layer1 = Linear(in_features=emb_channels*2, out_features=emb_channels, **init)
         else:
             self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
