@@ -395,16 +395,16 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
         csi_data = self._csi_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
                                                          idx_tuple[2],
                                                          idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value
-        noise_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
+        noise_sigma_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
                                                              idx_tuple[2],
                                                              idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value       
         # csi_data : (frame, antenna, channel) - complex
-        # noise_data : (frame, antenna) - float
+        # noise_sigma_data : (frame, antenna) - float
 
         if self._transpose is not None:
-            assert noise_data.ndim == len(self._transpose), "noise_data ndim and transpose length mismatch"
+            assert noise_sigma_data.ndim == len(self._transpose), "noise_sigma_data ndim and transpose length mismatch"
             csi_data = np.transpose(csi_data, self._transpose + (2,))
-            noise_data = np.transpose(noise_data, self._transpose)
+            noise_sigma_data = np.transpose(noise_sigma_data, self._transpose)
 
         if not self._view_as_complex:
             csi_data = np.expand_dims(np.array(csi_data), -1)
@@ -416,12 +416,12 @@ class renewRfDataset(ambient_utils.dataset_utils.Dataset):
                                            np.take(csi_data, 1, axis=-1)), axis=self._complex_merge_axis)
         
         if self._noise_mean_flag:
-            noise_data = np.mean((noise_data))
+            noise_sigma_data = np.mean((noise_sigma_data))
 
         return {
             'image': csi_data.astype(np.float32),
             "label": np.zeros([self.image_shape[0], 0], dtype=np.float32),
-            'sigma': noise_data.astype(np.float32),
+            'sigma': noise_sigma_data.astype(np.float32),
             'idx': idx,
             'filename': self._prefix_fname[idx_tuple[0]],
             "noise": np.random.randn(*csi_data.shape),
@@ -587,49 +587,47 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
     def __load_single_file(self, f_path):
         npz_data = np.load(f_path)
         csi_data = npz_data['csi']
-        noise_data = npz_data['noise']
+        noise_sigma_data = npz_data['noise']
 
-        return csi_data, noise_data
+        return csi_data, noise_sigma_data
 
     def __len__(self):
         return len(self._fname)
     
     def __create_item__(self, item_fname, idx):
-        csi_data, noise_data = self.__load_single_file(item_fname)
+        csi_data, noise_sigma_data = self.__load_single_file(item_fname)
         # csi_data : (frame, antenna, channel) - complex
-        # noise_data : (frame, antenna) - float
+        # noise_sigma_data : (frame, antenna) - float
 
         # Scale Normalization
         csi_data /= self._normalize_value
-        noise_data /= self._normalize_value
+        noise_sigma_data /= self._normalize_value
 
-        noise_data = np.expand_dims(noise_data, -1)
-        # noise_data : (frame, antenna, 1) - float
+        noise_sigma_data = np.expand_dims(noise_sigma_data, -1)
+        # noise_sigma_data : (frame, antenna, 1) - float
 
         if self._transpose is not None:
-            assert noise_data.ndim == len(self._transpose)+1, f"noise_data ndim and transpose length mismatch, {noise_data.ndim} != {len(self._transpose)+1}"
+            assert noise_sigma_data.ndim == len(self._transpose)+1, f"noise_sigma_data ndim and transpose length mismatch, {noise_sigma_data.ndim} != {len(self._transpose)+1}"
             csi_data = np.transpose(csi_data, self._transpose + (2,))
-            noise_data = np.transpose(noise_data, self._transpose + (2,))
+            noise_sigma_data = np.transpose(noise_sigma_data, self._transpose + (2,))
 
         if not self._view_as_complex:
             if self._complex_merge_axis is not None:
                 csi_data = np.append(csi_data.real, csi_data.imag, axis=self._complex_merge_axis)
-                noise_data = np.append(noise_data, noise_data, axis=self._complex_merge_axis)
+                noise_sigma_data = np.append(noise_sigma_data, noise_sigma_data, axis=self._complex_merge_axis)
             else:
                 csi_data = np.expand_dims(csi_data, -1)
                 csi_data = np.append(csi_data.real, csi_data.imag, axis=-1)
-                noise_data = np.expand_dims(noise_data, -1)
-                noise_data = np.append(noise_data, noise_data, axis=-1)
-        
-        if self._noise_mean_flag:
-            noise_data = np.mean((noise_data))
+                noise_sigma_data = np.expand_dims(noise_sigma_data, -1)
+                noise_sigma_data = np.append(noise_sigma_data, noise_sigma_data, axis=-1)
 
-        np_gen = np.random.default_rng(int(self._image_corruption_seed+175))
-        torch_gen = torch.Generator()
-        torch_gen.manual_seed(int(idx+self._image_noise_seed+4454))
 
         # Apply corruption
         if self.additive_noise_sigma > 0.0 and self.corruption_probability_per_image > 0.0:
+            np_gen = np.random.default_rng(int(self._image_corruption_seed+175))
+            torch_gen = torch.Generator()
+            torch_gen.manual_seed(int(idx+self._image_noise_seed+4454))
+
             if np_gen.random() < self.corruption_probability_per_image:
                 corruption_label = 1
                 # pick one of the corruptions
@@ -638,10 +636,14 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
                 # csi_data = csi_data + (mask.numpy() * noise_image * self.additive_noise_sigma).astype(csi_data.dtype)
                 csi_data = csi_data + (noise_image * self.additive_noise_sigma).astype(csi_data.dtype)
+                noise_sigma_data = np.sqrt(noise_sigma_data ** 2 + (self.additive_noise_sigma ** 2))
             else:
                 corruption_label = 0
         else:
             corruption_label = 0
+        
+        if self._noise_mean_flag:
+            noise_sigma_data = np.mean((noise_sigma_data))
 
         if self._label_spliting_flag:
             csi_data, label_data = np.split(csi_data, 2, axis=2)
@@ -652,7 +654,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             return {
                 'image': csi_data.astype(np.complex64),
                 "label": label_data.astype(np.complex64),
-                'sigma': noise_data.astype(np.float32),
+                'sigma': noise_sigma_data.astype(np.float32),
                 'filename': item_fname,
                 "noise": np.random.randn(*csi_data.shape),
                 'corruption_label': corruption_label,
@@ -662,7 +664,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             return {
                 'image': csi_data.astype(np.float32),
                 "label": label_data.astype(np.float32),
-                'sigma': noise_data.astype(np.float32),
+                'sigma': noise_sigma_data.astype(np.float32),
                 'filename': item_fname,
                 "noise": np.random.randn(*csi_data.shape),
                 'corruption_label': corruption_label,
@@ -980,24 +982,24 @@ class widarRfDataset(ambient_utils.dataset_utils.Dataset):
         # csi_data = self._csi_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
         #                                                  idx_tuple[2],
         #                                                  idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value
-        # noise_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
+        # noise_sigma_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
         #                                                      idx_tuple[2],
         #                                                      idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value       
         # # csi_data : (frame, antenna, channel) - complex
-        # # noise_data : (frame, antenna) - float
+        # # noise_sigma_data : (frame, antenna) - float
         idx_fname = self.data_label_df.iloc[idx]["file name"]
         idx_dir = "/".join([self._path, idx_fname])
         with self.csi_data_loader(idx_dir) as data:
             csi_data = data["csi"]
-            noise_data = np.expand_dims(data["noise"], -1)
+            noise_sigma_data = np.expand_dims(data["noise"], -1)
             time_data = data["time"]
         # csi_data : (frame, antenna, channel) - complex
-        # noise_data : (frame, 1) - float
+        # noise_sigma_data : (frame, 1) - float
 
         if self._transpose is not None:
-            assert noise_data.ndim == len(self._transpose), f"noise_data ndim and transpose length mismatch {noise_data.shape} {len(self._transpose)}"
+            assert noise_sigma_data.ndim == len(self._transpose), f"noise_sigma_data ndim and transpose length mismatch {noise_sigma_data.shape} {len(self._transpose)}"
             csi_data = np.transpose(csi_data, self._transpose + (2,))
-            noise_data = np.transpose(noise_data, self._transpose)
+            noise_sigma_data = np.transpose(noise_sigma_data, self._transpose)
 
         if not self._view_as_complex:
             csi_data = np.expand_dims(np.array(csi_data), -1)
@@ -1008,12 +1010,12 @@ class widarRfDataset(ambient_utils.dataset_utils.Dataset):
                                            np.take(csi_data, 1, axis=-1)), axis=self._complex_merge_axis)
         
         if self._noise_mean_flag:
-            noise_data = np.mean((noise_data))
+            noise_sigma_data = np.mean((noise_sigma_data))
 
         return {
             'image': csi_data.astype(np.float32),
             "label": np.zeros([self.image_shape[0], 0], dtype=np.float32),
-            'sigma': noise_data.astype(np.float32),
+            'sigma': noise_sigma_data.astype(np.float32),
             'idx': idx,
             'filename': idx_fname,
             "noise": np.random.randn(*csi_data.shape),

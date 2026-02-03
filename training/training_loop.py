@@ -283,8 +283,6 @@ def training_loop(
 
                 if only_additive_noise:
                     current_sigma = additive_noise_sigma
-                else:
-                    current_sigma = torch.sqrt(current_sigma**2 + additive_noise_sigma**2)
 
                 if no_asm:
                     current_sigma = torch.zeros_like(current_sigma)
