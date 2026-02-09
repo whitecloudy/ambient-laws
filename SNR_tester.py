@@ -336,6 +336,7 @@ def load_hf_checkpoint(repo_id):
 @click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--data',                     help='Path to the dataset', metavar='ZIP|DIR',                          type=str, required=True)
 @click.option('--data_keep_ratio',          help='How much data keeping ratio', metavar='FLOAT',                    type=float, default=1.0, show_default=True)
+@click.option('--flip_dataset',            help='Whether to flip the dataset to use the removed data',             is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',                           type=str, default=None, show_default=True)
 
@@ -347,6 +348,8 @@ def load_hf_checkpoint(repo_id):
 @click.option('--S_min', 'S_min',           help='Stoch. min noise level', metavar='FLOAT',                         type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_max', 'S_max',           help='Stoch. max noise level', metavar='FLOAT',                         type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',       help='Stoch. noise inflation', metavar='FLOAT',                         type=float, default=1, show_default=True)
+@click.option('--cond_additive_noise',      help='Whether to add noise to condition during training.',              type=float, default=0.0, show_default=True)
+@click.option('--only_additive_noise',      help='Whether to only use additive noise for corruption without natural noise.', is_flag=True)
 
 @click.option('--solver',                   help='Ablate ODE solver', metavar='euler|heun',                         type=click.Choice(['euler', 'heun']))
 @click.option('--disc', 'discretization',   help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm',type=click.Choice(['vp', 've', 'iddpm', 'edm']))
@@ -356,7 +359,7 @@ def load_hf_checkpoint(repo_id):
 @click.option('--trunc',                    help='Activate truncated sampling',                                     is_flag=True)
 
 
-def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_keep_ratio, must_contain, must_not_contain, trunc, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, data, data_keep_ratio, must_contain, must_not_contain, trunc, cond_additive_noise, only_additive_noise, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -402,6 +405,8 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
     dataset_kwargs.dataset_keep_percentage = data_keep_ratio
     dataset_kwargs.must_contain = must_contain
     dataset_kwargs.must_not_contain = must_not_contain
+    if flip_dataset:
+        dataset_kwargs.flip_keep_dataset = True
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=4, prefetch_factor=2)
     data_loader_kwargs.collate_fn = pad_collate_fn
@@ -432,6 +437,13 @@ def main(network_pkl, config_json, subdirs, seed, max_batch_size, data, data_kee
                 original_shape = dataset_item["original_shape"].to(device)
             else:
                 original_shape = None
+
+            if only_additive_noise:
+                current_sigma = torch.zeros_like(current_sigma)
+
+            if cond_additive_noise > 0.0:
+                noise = torch.randn_like(labels) * cond_additive_noise
+                labels = labels + noise
 
             latents = torch.randn(true_images.shape, generator=rnd_gen, device=device)
 
