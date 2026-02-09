@@ -426,7 +426,9 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
             with open(config_filepath, "r", encoding="utf-8") as f:
                 opts = json.load(f)
     else:
-        net, opts = load_hf_checkpoint(network_pkl).to(device)
+        print("non pkl file is not supported yet.")
+        exit(1)
+
     # opts = opts['dataset_kwargs']
     # dataset_kwargs for RENEW dataset
     dataset_kwargs = dnnlib.EasyDict(**opts['dataset_kwargs'])
@@ -443,8 +445,13 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
     rnd_gen = torch.Generator(device=device).manual_seed(seed)
 
     dist.print0('Loading dataset...')
-    dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    # dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
     # dataset_obj = renew_with_average_image(**dataset_kwargs)
+    clear_label_dir, final_dir_name = os.path.split(data)
+    clear_label_dir, _ = os.path.split(clear_label_dir)
+    clear_label_dir = os.path.join(clear_label_dir, 'splited', final_dir_name)
+    
+    dataset_obj = renew_with_clear_image(clear_label_dir=clear_label_dir, **dataset_kwargs)
     dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
     dataloader_obj = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dist_sampler, batch_size=max_batch_size, **data_loader_kwargs)
 
