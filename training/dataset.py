@@ -605,7 +605,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
     def __len__(self):
         return len(self._fname)
     
-    def __create_item__(self, item_fname, idx):
+    def _load_and_normalize(self, item_fname):
         csi_data, noise_sigma_data = self.__load_single_file(item_fname)
         # csi_data : (frame, antenna, channel) - complex
         # noise_sigma_data : (frame, antenna) - float
@@ -616,12 +616,16 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
         noise_sigma_data = np.expand_dims(noise_sigma_data, -1)
         # noise_sigma_data : (frame, antenna, 1) - float
+        return csi_data, noise_sigma_data
 
+    def _apply_transpose(self, csi_data, noise_sigma_data):
         if self._transpose is not None:
             assert noise_sigma_data.ndim == len(self._transpose)+1, f"noise_sigma_data ndim and transpose length mismatch, {noise_sigma_data.ndim} != {len(self._transpose)+1}"
             csi_data = np.transpose(csi_data, self._transpose + (2,))
             noise_sigma_data = np.transpose(noise_sigma_data, self._transpose + (2,))
+        return csi_data, noise_sigma_data
 
+    def _handle_complex_view(self, csi_data, noise_sigma_data):
         if not self._view_as_complex:
             if self._complex_merge_axis is not None:
                 csi_data = np.append(csi_data.real, csi_data.imag, axis=self._complex_merge_axis)
@@ -631,9 +635,9 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 csi_data = np.append(csi_data.real, csi_data.imag, axis=-1)
                 noise_sigma_data = np.expand_dims(noise_sigma_data, -1)
                 noise_sigma_data = np.append(noise_sigma_data, noise_sigma_data, axis=-1)
+        return csi_data, noise_sigma_data
 
-
-        # Apply corruption
+    def _apply_corruption(self, csi_data, noise_sigma_data, idx):
         if self.additive_noise_sigma > 0.0 and self.corruption_probability_per_image > 0.0:
             np_gen = np.random.default_rng(int(self._image_corruption_seed+175))
             torch_gen = torch.Generator()
@@ -652,35 +656,43 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 corruption_label = 0
         else:
             corruption_label = 0
-        
-        if self._noise_mean_flag:
-            noise_sigma_data = np.mean((noise_sigma_data))
+        return csi_data, noise_sigma_data, corruption_label
 
+    def _split_label(self, csi_data):
         if self._label_spliting_flag:
             csi_data, label_data = np.split(csi_data, 2, axis=2)
         else:
             label_data = np.zeros([self.image_shape[0], 0], dtype=np.float32)
+        return csi_data, label_data
 
+    def _format_output(self, csi_data, label_data, noise_sigma_data, item_fname, corruption_label):
         if self._view_as_complex:
-            return {
-                'image': csi_data.astype(np.complex64),
-                "label": label_data.astype(np.complex64),
-                'sigma': noise_sigma_data.astype(np.float32),
-                'filename': item_fname,
-                "noise": np.random.randn(*csi_data.shape),
-                'corruption_label': corruption_label,
-                'additive_noise_sigma': self.additive_noise_sigma,
-            }
+            dtype = np.complex64
         else:
-            return {
-                'image': csi_data.astype(np.float32),
-                "label": label_data.astype(np.float32),
-                'sigma': noise_sigma_data.astype(np.float32),
-                'filename': item_fname,
-                "noise": np.random.randn(*csi_data.shape),
-                'corruption_label': corruption_label,
-                'additive_noise_sigma': self.additive_noise_sigma,
-            }   
+            dtype = np.float32
+
+        return {
+            'image': csi_data.astype(dtype),
+            "label": label_data.astype(dtype),
+            'sigma': noise_sigma_data.astype(np.float32),
+            'filename': item_fname,
+            "noise": np.random.randn(*csi_data.shape),
+            'corruption_label': corruption_label,
+            'additive_noise_sigma': self.additive_noise_sigma,
+        }
+
+    def __create_item__(self, item_fname, idx):
+        csi_data, noise_sigma_data = self._load_and_normalize(item_fname)
+        csi_data, noise_sigma_data = self._apply_transpose(csi_data, noise_sigma_data)
+        csi_data, noise_sigma_data = self._handle_complex_view(csi_data, noise_sigma_data)
+        csi_data, noise_sigma_data, corruption_label = self._apply_corruption(csi_data, noise_sigma_data, idx)
+        
+        if self._noise_mean_flag:
+            noise_sigma_data = np.mean((noise_sigma_data))
+
+        csi_data, label_data = self._split_label(csi_data)
+
+        return self._format_output(csi_data, label_data, noise_sigma_data, item_fname, corruption_label)
 
     def __getitem__(self, idx):
         item_fname = self._fname[idx]

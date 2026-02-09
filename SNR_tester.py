@@ -300,6 +300,35 @@ class renew_with_average_image(renewRfProcessedDataset):
         item['image'] = (image_original + image_pair) / 2.0
         
         return item
+    
+class renew_with_clear_image(renewRfProcessedDataset):
+    def __init__(self, clear_label_dir, **kwargs):
+        self.clear_label_dir = clear_label_dir
+        super().__init__(**kwargs)
+
+    def __create_item_without_noise_additive(self, fname):
+        csi_data, noise_sigma_data = super()._load_and_normalize(fname)
+        csi_data, noise_sigma_data = super()._apply_transpose(csi_data, noise_sigma_data)
+        csi_data, noise_sigma_data = super()._handle_complex_view(csi_data, noise_sigma_data)
+
+        return csi_data, noise_sigma_data
+
+
+    def __getitem__(self, idx):
+        item = super().__getitem__(idx)
+        # Original filename would be frame<n1>_user<n2>_pilot<p>_cell<n3>_subcarrier<n4>.npz
+        fname = str(item['filename'])
+        
+        # Clear filename would be frame<n1>_user<n2>_mean_cell<n3>_subcarrier<n4>.npz
+        clear_fname = re.sub(r'pilot[01]', 'mean', fname)
+        clear_fname = os.path.join(self.clear_label_dir, clear_fname)
+
+        csi_data, noise_sigma_data = self.__create_item_without_noise_additive(clear_fname)
+        csi_data, label_data = self._split_label(csi_data)
+        item['image'] = csi_data
+        
+        return item
+
 
 
 #----------------------------------------------------------------------------
@@ -336,9 +365,9 @@ def load_hf_checkpoint(repo_id):
 @click.option('--batch', 'max_batch_size',  help='Maximum batch size', metavar='INT',                               type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--data',                     help='Path to the dataset', metavar='ZIP|DIR',                          type=str, required=True)
 @click.option('--data_keep_ratio',          help='How much data keeping ratio', metavar='FLOAT',                    type=float, default=1.0, show_default=True)
-@click.option('--flip_dataset',            help='Whether to flip the dataset to use the removed data',             is_flag=True)
-@click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                                 type=str, default=None, show_default=True)
-@click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',                           type=str, default=None, show_default=True)
+@click.option('--flip_dataset',             help='Whether to flip the dataset to use the removed data',             is_flag=True)
+@click.option('--must_contain',             help='Dataset name should contain', metavar='STR',                                 type=str, default=None, show_default=True)
+@click.option('--must_not_contain',         help='Dataset name should not contain', metavar='STR',                           type=str, default=None, show_default=True)
 
 @click.option('--steps', 'num_steps',       help='Number of sampling steps', metavar='INT',                         type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',                help='Lowest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
