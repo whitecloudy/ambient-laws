@@ -505,6 +505,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  dataset_keep_percentage = 1.0,
                  normalize_value = 1.0,
                  use_labels  = False,
+                 flip_keep_dataset = False,
                  **super_kwargs):
         self.minimum_sigma = sigma
         self.additive_noise_sigma = additive_noise_sigma
@@ -549,11 +550,21 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             num_to_keep = int(len(self._fname) * dataset_keep_percentage)
             rng = np.random.RandomState(self._image_corruption_seed)
             rng.shuffle(self._fname)
-            self._fname = self._fname[:num_to_keep]
-            self._removed_fname = self._fname[num_to_keep:]
+            tmp_fname = self._fname
+            self._fname = tmp_fname[:num_to_keep]
+            self._removed_fname = tmp_fname[num_to_keep:]
             print(f"Dataset reduced to {len(self._fname)} samples using keep percentage {dataset_keep_percentage}")
+        else:
+            self._removed_fname = []
+            print(f"Dataset not reduced using keep percentage {dataset_keep_percentage}")
         
         self._fname = sorted(self._fname)
+        self._removed_fname = sorted(self._removed_fname)
+
+        if flip_keep_dataset:
+            tmp_fname = self._fname.copy()
+            self._fname = self._removed_fname
+            self._removed_fname = tmp_fname
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         single_csi_shape = self.__load_single_file(self._fname[0])[0].shape
