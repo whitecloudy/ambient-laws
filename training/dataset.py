@@ -577,7 +577,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         if self._transpose is not None:
             actual_csi_shape = [single_csi_shape[ax] for ax in self._transpose] + [single_csi_shape[2]]
         else:
-            actual_csi_shape = single_csi_shape
+            actual_csi_shape = list(single_csi_shape)
 
         if not self._view_as_complex:
             if self._complex_merge_axis is not None:

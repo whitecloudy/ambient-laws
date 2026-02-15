@@ -317,7 +317,8 @@ class renew_with_clear_image(renewRfProcessedDataset):
     def __getitem__(self, idx):
         item = super().__getitem__(idx)
         # Original filename would be frame<n1>_user<n2>_pilot<p>_cell<n3>_subcarrier<n4>.npz
-        fname = str(item['filename'])
+        f_dir = str(item['filename'])
+        fname = os.path.basename(f_dir)
         
         # Clear filename would be frame<n1>_user<n2>_mean_cell<n3>_subcarrier<n4>.npz
         clear_fname = re.sub(r'pilot[01]', 'mean', fname)

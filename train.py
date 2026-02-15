@@ -67,6 +67,8 @@ def parse_int_list(s):
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.05, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
+@click.option('--label_dropout', help='Label dropout probability for classifier-free guidance', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
+
 
 
 # Performance-related.
@@ -222,7 +224,8 @@ def main(**kwargs):
         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=opts.augment)
         c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
         c.network_kwargs.augment_dim = 9
-    c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
+    c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16, label_dropout=opts.label_dropout)
+
 
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)

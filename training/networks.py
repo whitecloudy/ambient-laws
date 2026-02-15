@@ -511,7 +511,9 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         if self.map_label is not None:
             tmp = class_labels
             if self.training and self.label_dropout:
-                tmp = tmp * (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
+                label_dropout_table = torch.unsqueeze(torch.unsqueeze((torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype), dim=-1), dim=-1)
+
+                tmp = tmp * label_dropout_table
             if self.label_type == 'downlink':
                 label_emb = self.map_label(tmp)
                 # emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
