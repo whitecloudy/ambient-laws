@@ -79,7 +79,7 @@ def parse_int_list(s):
 @click.option('--workers',       help='DataLoader worker processes', metavar='INT',                 type=click.IntRange(min=1), default=1, show_default=True)
 
 # I/O-related.
-@click.option("--expr_id", help="Experiment ID", type=str, default="test")
+@click.option("--expr_id",      help="Experiment ID", type=str, default="test")
 @click.option('--desc',          help='String to include in result dir name', metavar='STR',        type=str)
 @click.option('--nosubdir',      help='Do not create a subdirectory for results',                   is_flag=True)
 @click.option('--tick',          help='How often to print progress', metavar='KIMG',                type=click.IntRange(min=1), default=50, show_default=True)
@@ -103,6 +103,7 @@ def parse_int_list(s):
 @click.option("--sigma", help="How much noise to add to the corrupted images.", type=float, default=0.0)
 @click.option('--dataset_keep_percentage', help='Limit training samples.', type=float, default=1.0, show_default=True)
 @click.option('--additive_noise_sigma', help='Standard deviation of the additive noise to be added to the clean images during corruption.', type=float, default=0.0, show_default=True)
+@click.option('--multiply_noise_sigma', help='Multiplying factor of the noise to be added to the clean images during corruption.', type=float, default=1.0, show_default=True)
 @click.option('--only_additive_noise', help='Whether to only use additive noise for corruption without natural noise.', is_flag=True)
 
 # Consistency params
@@ -146,7 +147,7 @@ def main(**kwargs):
                                        only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
                                        resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                        normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                       additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
+                                       multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
     # dataset_kwargs for WIDAR dataset
     # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
     #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
@@ -261,7 +262,7 @@ def main(**kwargs):
     # Description string.
     cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
     dtype_str = 'fp16' if c.network_kwargs.use_fp16 else 'fp32'
-    desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
+    desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}-{opts.wandb_group:s}-{opts.expr_id:s}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 

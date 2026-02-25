@@ -494,7 +494,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  must_not_contain = None, # Require filenames to NOT contain this substring.
                  sigma: float = 0.1,     # ensured minimum currption sigma
                  additive_noise_sigma: float = 0.0,
-                 mulitply_noise_sigma: float = 1.0,
+                 multiply_noise_sigma: float = 1.0,
                  view_as_complex = False,
                  complex_merge_axis = 0,
                  transpose = None,
@@ -510,10 +510,10 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  only_additive_noise = False,
                  **super_kwargs):
         self.minimum_sigma = sigma
-        assert self.additive_noise_sigma >= 0.0, "additive_noise_sigma must be non-negative"
+        assert additive_noise_sigma >= 0.0, "additive_noise_sigma must be non-negative"
         self.additive_noise_sigma = additive_noise_sigma
-        assert self.mulitply_noise_sigma >= 1.0, "mulitply_noise_sigma must be greater than or equal to 1.0"
-        self.mulitply_noise_sigma = mulitply_noise_sigma
+        assert multiply_noise_sigma >= 1.0, "multiply_noise_sigma must be greater than or equal to 1.0"
+        self.multiply_noise_sigma = multiply_noise_sigma
         self._noise_mean_flag = noise_mean_flag
         self._path = path
         self._normalize_value = normalize_value
@@ -644,7 +644,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         return csi_data, noise_sigma_data
 
     def _apply_corruption(self, csi_data, noise_sigma_data, idx):
-        if self.additive_noise_sigma > 0.0 and self.corruption_probability_per_image > 0.0 and self.mulitply_noise_sigma > 1.0:
+        if self.additive_noise_sigma > 0.0 and self.corruption_probability_per_image > 0.0 and self.multiply_noise_sigma > 1.0:
             np_gen = np.random.default_rng(int(self._image_corruption_seed+175))
             torch_gen = torch.Generator()
             torch_gen.manual_seed(int(idx+self._image_noise_seed+4454))
@@ -656,7 +656,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
 
                 # noise sigma that we are targetting
-                target_noise_sigma = noise_sigma_data * self.mulitply_noise_sigma + self.additive_noise_sigma
+                target_noise_sigma = noise_sigma_data * self.multiply_noise_sigma + self.additive_noise_sigma
                 if self.only_additive_noise:
                     noise_sigma_data = np.zeros_like(noise_sigma_data)
 
