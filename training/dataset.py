@@ -885,6 +885,12 @@ class rf_augmentation_collate_fn(object):
 
         ant_axis_size = batch[0]['image'].shape[ant_axis]
 
+        if 'complex' in axis_name_list[ant_axis]:
+            ant_axis_complex = True
+            ant_axis_size = ant_axis_size//2
+        else:
+            ant_axis_complex = False
+
         flipped_batch = []
 
         for item in batch:
@@ -895,10 +901,14 @@ class rf_augmentation_collate_fn(object):
             
                 flip_idx = np.random.permutation(ant_axis_size)
 
+                # 안테나 축에 복소수 정보가 포함된 경우, 실수와 허수 부분을 동일하게 뒤집기 위해 인덱스를 확장합니다.
+                if ant_axis_complex:
+                    flip_idx = np.concatenate((flip_idx, flip_idx+ant_axis_size))
+
                 # np.take를 사용하여 ant_axis를 기준으로 데이터 순서를 변경합니다.
                 item['image'] = np.take(img, flip_idx, axis=ant_axis)
                 if item['sigma'].ndim > ant_axis:
-                    if item['sigma'].shape[ant_axis] == ant_axis_size:
+                    if item['sigma'].shape[ant_axis] == item['image'].shape[ant_axis]:
                         item['sigma'] = np.take(noise_sigma, flip_idx, axis=ant_axis)
                     else:
                         warnings.warn(f"Sigma shape {noise_sigma.shape} does not match expected antenna axis size {ant_axis_size}, skipping sigma flip")
