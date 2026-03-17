@@ -76,7 +76,7 @@ def edm_sampler(
 # Proposed EDM sampler (Algorithm 2).
 
 def truncated_edm_sampler(
-    net, latents, class_labels=None, sigma=0.0, randn_like=torch.randn_like,
+    net, latents, class_labels=None, sigma=torch.tensor(0.0), randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
     stop_variance=0.0
@@ -265,14 +265,14 @@ def cal_SNR(predict : torch.Tensor, truth : torch.Tensor, complex_axis=None):
         if complex_axis >= 0:
             complex_axis += 1
 
-        predict = torch.split(predict, 2, dim=complex_axis)
-        truth = torch.split(truth, 2, dim=complex_axis)
+        predict_split = torch.split(predict, 2, dim=complex_axis)
+        truth_split = torch.split(truth, 2, dim=complex_axis)
 
-        predict = predict[0] + 1j * predict[1]
-        truth = truth[0] + 1j * truth[1]
+        predict = predict_split[0] + 1j * predict_split[1]
+        truth = truth_split[0] + 1j * truth_split[1]
     axis_list = [i for i in range(1, len(predict.shape))]
-    PS = torch.sum(torch.abs(truth)**2, axis=axis_list)  # power of signal
-    PN = torch.sum(torch.abs(predict - truth)**2, axis=axis_list)  # power of noise
+    PS = torch.sum(torch.abs(truth)**2, dim=axis_list)  # power of signal
+    PN = torch.sum(torch.abs(predict - truth)**2, dim=axis_list)  # power of noise
     ratio = PS / PN
     return 10 * torch.log10(ratio)
 
@@ -296,7 +296,7 @@ class renew_with_average_image(renewRfProcessedDataset):
             warnings.warn(f"Filename {fname} does not contain 'pilot0' or 'pilot1'. Returning original item.")
             return item
 
-        image_pair = super().__create_item__(change_fname)['image']
+        image_pair = super().__create_item__(change_fname, idx)['image']
         item['image'] = (image_original + image_pair) / 2.0
         
         return item
@@ -452,8 +452,9 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
     clear_label_dir, _ = os.path.split(clear_label_dir)
     clear_label_dir = os.path.join(clear_label_dir, 'splited', final_dir_name)
     
-    dataset_obj = renew_with_clear_image(clear_label_dir=clear_label_dir, **dataset_kwargs)
-    dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
+    # dataset_obj = renew_with_clear_image(clear_label_dir=clear_label_dir, **dataset_kwargs)
+    dataset_obj = renewRfDataset(**dataset_kwargs)
+    dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False) # type: ignore
     dataloader_obj = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dist_sampler, batch_size=max_batch_size, **data_loader_kwargs)
 
     # Other ranks follow.
@@ -467,7 +468,7 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
     with torch.inference_mode(True):
         for dataset_item in tqdm.tqdm(dataloader_obj, unit='data', disable=(dist.get_rank() != 0)):
             torch.distributed.barrier()
-            true_images = dataset_item["image"].to(device)                
+            true_images = dataset_item["image"].to(device)
             labels = dataset_item["label"].to(device)
             current_sigma = dataset_item["sigma"].to(device)
             if "original_shape" in dataset_item:
@@ -483,16 +484,6 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
                 labels = labels + noise
 
             latents = torch.randn(true_images.shape, generator=rnd_gen, device=device)
-
-            # # Pick latents and labels.
-            # rnd = StackedRandomGenerator(device, batch_seeds)
-            # latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
-            # class_labels = None
-            # if net.label_dim:
-            #     class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]
-            # if class_idx is not None:
-            #     class_labels[:, :] = 0
-            #     class_labels[:, class_idx] = 1
 
             # Generate images.
             sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
