@@ -803,6 +803,116 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         return np.sqrt(var_sum / var_count)
 
 
+class rf_augmentation_collate_fn(object):
+    def __init__(self, flip_probability=0.0, phase_shift_probability=0.0, other_collate_fn=[]):
+        self._flip_probability = flip_probability
+        self._phase_shift_probability = phase_shift_probability
+        self._other_collate_fn = other_collate_fn
+
+        self._name = str(["rf_augmentation_collate_fn",] + [collate_fn.__name__ for collate_fn in self._other_collate_fn])
+
+    def __call__(self, batch):
+        batch = self.antenna_random_flip_collate_fn(batch)
+        
+        for collate_fn in self._other_collate_fn:
+            batch = collate_fn(batch)
+        return batch
+    
+    @property
+    def __name__(self):
+        return self._name
+    
+    def random_phase_shift_collate_fn(self, batch):
+        """
+        배치 내의 각 샘플에 대해 랜덤한 위상 이동을 적용하는 collate_fn입니다.
+        """
+        shifted_batch = []
+
+        does_complex = np.iscomplexobj(batch[0]['image'])
+        axis_name_list = batch[0]['axis_name']
+
+        complex_axis = None
+        if not does_complex:
+            for idx, axis_name in enumerate(axis_name_list):
+                if 'complex' in axis_name:
+                    complex_axis = idx # 개별 이미지 단위로 처리하므로 +1을 제외합니다.
+                    break
+            assert complex_axis is not None, "No antenna axis found in axis_name"
+
+        for item in batch:
+            img = item['image']
+            noise_sigma = item['sigma']
+            label = item['label']
+
+            if not does_complex:
+                # 복소수 형태로 변환
+                real_part, imag_part = np.split(img, 2, axis=complex_axis)
+                img = real_part + 1j * imag_part
+
+                real_part, imag_part = np.split(label, 2, axis=complex_axis)
+                label = real_part + 1j * imag_part
+
+            # 랜덤한 위상 이동 생성 (0에서 2π 사이)
+            random_phase = np.random.uniform(0, 2 * np.pi)
+
+            # 이미지에 위상 이동 적용 (복소수 데이터라고 가정)
+            shifted_img = img * np.exp(1j * random_phase)
+            shifted_label = label * np.exp(1j * random_phase)
+
+            if not does_complex:
+                # 다시 실수 형태로 변환
+                shifted_img = np.stack((shifted_img.real, shifted_img.imag), axis=complex_axis)
+                shifted_label = np.stack((shifted_label.real, shifted_label.imag), axis=complex_axis)
+
+            item['image'] = shifted_img
+            item['label'] = shifted_label
+
+            shifted_batch.append(item)
+
+        return shifted_batch
+
+    def antenna_random_flip_collate_fn(self, batch):
+        """
+        배치 내의 각 샘플에 대해 안테나 축을 랜덤하게 뒤집는 collate_fn입니다.
+        """
+        axis_name_list = batch[0]['axis_name']
+        ant_axis = None
+        for idx, axis_name in enumerate(axis_name_list):
+            if 'antenna' in axis_name:
+                ant_axis = idx # 개별 이미지 단위로 처리하므로 +1을 제외합니다.
+                break
+        assert ant_axis is not None, "No antenna axis found in axis_name"
+
+        ant_axis_size = batch[0]['image'].shape[ant_axis]
+
+        flipped_batch = []
+
+        for item in batch:
+            if (self._flip_probability > 0.0) and (np.random.rand() < self._flip_probability):
+                img = item['image']
+                noise_sigma = item['sigma']
+                label = item['label']
+            
+                flip_idx = np.random.permutation(ant_axis_size)
+
+                # np.take를 사용하여 ant_axis를 기준으로 데이터 순서를 변경합니다.
+                item['image'] = np.take(img, flip_idx, axis=ant_axis)
+                if item['sigma'].ndim > ant_axis:
+                    if item['sigma'].shape[ant_axis] == ant_axis_size:
+                        item['sigma'] = np.take(noise_sigma, flip_idx, axis=ant_axis)
+                    else:
+                        warnings.warn(f"Sigma shape {noise_sigma.shape} does not match expected antenna axis size {ant_axis_size}, skipping sigma flip")
+                if label.shape[0] != 0:
+                    item['label'] = np.take(label, flip_idx, axis=ant_axis)
+                item['flip_aug'] = 1
+
+                flipped_batch.append(item)
+            else:
+                item['flip_aug'] = 0
+                flipped_batch.append(item)
+
+        return flipped_batch
+
 import pandas as pd
 
 import torch.nn.functional as F
@@ -846,14 +956,7 @@ def pad_collate_fn(batch):
 
         padded_batch.append(item)
 
-    # 4. 다른 데이터들도 배치로 만듭니다.
-    collated_batch = torch.utils.data.default_collate(padded_batch)
-
-    # # 5. 패딩된 이미지들을 쌓아서(stack) 배치에 추가합니다.
-    # collated_batch['image'] = torch.stack(images)
-    # collated_batch['original_shape'] = torch.stack(original_shapes)
-
-    return collated_batch
+    return padded_batch
 
 def widar_collate_fn(batch):
     """

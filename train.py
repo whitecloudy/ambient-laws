@@ -16,7 +16,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
-from training.dataset import renewRfDataset, widarRfDataset, renewRfProcessedDataset, pad_collate_fn, widar_collate_fn
+from training.dataset import renewRfDataset, widarRfDataset, renewRfProcessedDataset, pad_collate_fn, widar_collate_fn, rf_augmentation_collate_fn
 import ambient_utils
 import warnings
 import wandb
@@ -97,6 +97,8 @@ def parse_int_list(s):
 @click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
 @click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
 @click.option('--data_norm', help='Data normalization value for the RF data.', type=float, default=1.0, show_default=True)
+@click.option('--flip_aug_ratio', help='Ratio of flip augmentation.', type=float, default=0.0, show_default=True)
+@click.option('--phase_shift_aug_ratio', help='Ratio of phase shift augmentation.', type=float, default=0.0, show_default=True)
 
 # Scaling laws related
 @click.option("--corruption_probability", help="Controls what percentage of images should be corrupted.", type=float, default=0.0)
@@ -156,7 +158,10 @@ def main(**kwargs):
     #                                    normalize_value=opts.data_norm)
 
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
-    c.data_loader_kwargs.collate_fn = pad_collate_fn
+    c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(flip_probability=opts.flip_aug_ratio, 
+                                                                 phase_shift_probability=opts.phase_shift_aug_ratio, 
+                                                                 other_collate_fn=[pad_collate_fn, torch.utils.data.default_collate])
+    # c.data_loader_kwargs.collate_fn = pad_collate_fn
     # c.data_loader_kwargs.collate_fn = widar_collate_fn
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
@@ -294,7 +299,7 @@ def main(**kwargs):
     # Convert function object to its name for serialization
     if 'collate_fn' in c_json.data_loader_kwargs and callable(c_json.data_loader_kwargs.collate_fn):
         c_json.data_loader_kwargs.collate_fn = c_json.data_loader_kwargs.collate_fn.__name__
-
+    print(c_json.data_loader_kwargs.collate_fn)
     dist.print0(json.dumps(c_json, indent=2))
     dist.print0()
     dist.print0(f'Output directory:        {c.run_dir}')
