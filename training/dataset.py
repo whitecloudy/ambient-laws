@@ -529,6 +529,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         self.only_additive_noise = only_additive_noise
 
         self._fname = []
+        self._axis_name = ['frame', 'antenna', 'channel']   # Default axis names for indexing
         if isinstance(self._path, list):
             for path in self._path:
                 self._fname += glob(os.path.join(path, '*.npz'))
@@ -582,12 +583,17 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
         if self._transpose is not None:
             actual_csi_shape = [single_csi_shape[ax] for ax in self._transpose] + [single_csi_shape[2]]
+            self._axis_name = [self._axis_name[ax] for ax in self._transpose] + [self._axis_name[2]]
         else:
             actual_csi_shape = list(single_csi_shape)
 
         if not self._view_as_complex:
             if self._complex_merge_axis is not None:
                 actual_csi_shape[self._complex_merge_axis] *= 2
+                self._axis_name[self._complex_merge_axis] = 'complex/' + self._axis_name[self._complex_merge_axis]
+            else:
+                actual_csi_shape.append(2)
+                self._axis_name.append('complex')
         elif self._complex_merge_axis is not None:
             warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
 
@@ -602,9 +608,25 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             self._label_shape = [0,]
 
     def __load_single_file(self, f_path):
+        """
+        Loads CSI and noise sigma data from a .npz file.
+
+        Args:
+            f_path (str): Path to the .npz file containing the data.
+
+        Returns:
+            tuple:
+                - csi_data (numpy.ndarray): The CSI (Channel State Information) data array.
+                - noise_sigma_data (numpy.ndarray): The noise sigma data array.
+
+        Note:
+            The .npz file is expected to contain two arrays:
+                - 'csi': numpy.ndarray, shape and dtype depend on dataset.
+                - 'noise': numpy.ndarray, shape and dtype depend on dataset.
+        """
         npz_data = np.load(f_path)
-        csi_data = npz_data['csi']
-        noise_sigma_data = npz_data['noise']
+        csi_data = np.array(npz_data['csi'])
+        noise_sigma_data = np.array(npz_data['noise'])
 
         return csi_data, noise_sigma_data
 
@@ -644,8 +666,8 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         return csi_data, noise_sigma_data
 
     def _apply_corruption(self, csi_data, noise_sigma_data, idx):
-        if self.additive_noise_sigma > 0.0 and self.corruption_probability_per_image > 0.0 and self.multiply_noise_sigma > 1.0:
-            np_gen = np.random.default_rng(int(self._image_corruption_seed+175))
+        if (self.additive_noise_sigma > 0.0 or self.multiply_noise_sigma > 1.0) and self.corruption_probability_per_image > 0.0:
+            np_gen = np.random.default_rng(int(self._image_corruption_seed+175+idx))
             torch_gen = torch.Generator()
             torch_gen.manual_seed(int(idx+self._image_noise_seed+4454))
 
@@ -657,11 +679,13 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
                 # noise sigma that we are targetting
                 target_noise_sigma = noise_sigma_data * self.multiply_noise_sigma + self.additive_noise_sigma
-                if self.only_additive_noise:
-                    noise_sigma_data = np.zeros_like(noise_sigma_data)
 
                 # noise sigma that will be added to the image
-                sigma_will_be_added = np.sqrt((target_noise_sigma ** 2) - (noise_sigma_data ** 2))
+                if self.only_additive_noise:
+                    target_noise_sigma = target_noise_sigma - noise_sigma_data
+                    sigma_will_be_added = target_noise_sigma
+                else:
+                    sigma_will_be_added = np.sqrt((target_noise_sigma ** 2) - (noise_sigma_data ** 2))
 
                 # csi_data = csi_data + (mask.numpy() * noise_image * self.additive_noise_sigma).astype(csi_data.dtype)
                 csi_data = csi_data + (noise_image * sigma_will_be_added).astype(csi_data.dtype)
@@ -698,6 +722,8 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             "noise": np.random.randn(*csi_data.shape),
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
+            'complex_merge_axis': self._complex_merge_axis,
+            'axis_name': self._axis_name,
         }
 
     def __create_item__(self, item_fname, idx):
@@ -770,10 +796,10 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         var_sum = 0.0
         var_count = 0
 
-        for csi_data in self._csi_raw_data_list:
-            var_sum += (np.sum(np.abs(csi_data)**2))
-            var_count += csi_data.size
-
+        for fname in self._fname:
+            csi_data, noise_sigma_data = self._load_and_normalize(fname)
+            var_sum += (np.sum((csi_data * np.conj(csi_data)).real.flatten()))
+            var_count += csi_data.flatten().size
         return np.sqrt(var_sum / var_count)
 
 

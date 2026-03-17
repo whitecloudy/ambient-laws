@@ -164,4 +164,12 @@ cython_debug/
 # Result directory
 *_result/
 
-data
+data/
+spectrograms/
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.npz
+*.npy
