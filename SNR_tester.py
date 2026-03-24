@@ -302,7 +302,7 @@ class renew_with_average_image(renewRfProcessedDataset):
         return item
     
 class renew_with_clear_image(renewRfProcessedDataset):
-    def __init__(self, clear_label_dir, **kwargs):
+    def __init__(self, clear_label_dir=None, **kwargs):
         self.clear_label_dir = clear_label_dir
         super().__init__(**kwargs)
 
@@ -449,8 +449,12 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
         dataset_kwargs.only_additive_noise = True
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=4, prefetch_factor=2)
-    data_loader_kwargs.collate_fn = pad_collate_fn
-
+    
+    def chained_collate_fn(batch):
+        batch = pad_collate_fn(batch)
+        return torch.utils.data.default_collate(batch)
+        
+    data_loader_kwargs.collate_fn = chained_collate_fn
     rnd_gen = torch.Generator(device=device).manual_seed(seed)
 
     dist.print0('Loading dataset...')
@@ -460,9 +464,9 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
     clear_label_dir, _ = os.path.split(clear_label_dir)
     clear_label_dir = os.path.join(clear_label_dir, 'splited', final_dir_name)
     
-    # dataset_obj = renew_with_clear_image(clear_label_dir=clear_label_dir, **dataset_kwargs)
+    dataset_obj = renew_with_clear_image(clear_label_dir=clear_label_dir, **dataset_kwargs)
     # dataset_obj = renewRfDataset(**dataset_kwargs)
-    dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    # dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
     dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False) # type: ignore
     dataloader_obj = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dist_sampler, batch_size=max_batch_size, **data_loader_kwargs)
 
