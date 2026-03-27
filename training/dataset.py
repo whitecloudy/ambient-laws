@@ -381,14 +381,25 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             
         self.transpose_collate_fn = TransposeCollateFn(self._transpose)
         self.complex_view_collate_fn = ComplexViewCollateFn(self._view_as_complex, self._complex_merge_axis)
-        self.corruption_collate_fn = CorruptionCollateFn(
-            additive_noise_sigma=self.additive_noise_sigma,
-            multiply_noise_sigma=self.multiply_noise_sigma,
-            corruption_probability_per_image=self.corruption_probability_per_image,
-            only_additive_noise=self.only_additive_noise,
-            image_corruption_seed=self._image_corruption_seed,
-            image_noise_seed=self._image_noise_seed
-        )
+        self.curruption_collate_fn = None
+        if self._noise_mean_alter_way:
+            self.corruption_collate_fn = AlternativeCorruptionCollateFn(
+                additive_noise_sigma=self.additive_noise_sigma,
+                multiply_noise_sigma=self.multiply_noise_sigma,
+                corruption_probability_per_image=self.corruption_probability_per_image,
+                only_additive_noise=self.only_additive_noise,
+                image_corruption_seed=self._image_corruption_seed,
+                image_noise_seed=self._image_noise_seed,
+            )
+        else:
+            self.corruption_collate_fn = CorruptionCollateFn(
+                additive_noise_sigma=self.additive_noise_sigma,
+                multiply_noise_sigma=self.multiply_noise_sigma,
+                corruption_probability_per_image=self.corruption_probability_per_image,
+                only_additive_noise=self.only_additive_noise,
+                image_corruption_seed=self._image_corruption_seed,
+                image_noise_seed=self._image_noise_seed,
+            )
         self.noise_mean_collate_fn = NoiseMeanCollateFn(self._noise_mean_flag, self._noise_mean_alter_way)
 
     def __load_single_file(self, f_path):
@@ -718,6 +729,77 @@ class CorruptionCollateFn(object):
             item['corruption_label'] = corruption_label
 
         return batch
+    
+def sigma_mean(sigma):
+    return np.sqrt(np.mean(np.power(sigma, 2)))
+    
+class AlternativeCorruptionCollateFn(object):
+    """
+    이미지에 노이즈를 추가하여 손상시키는 Collate Function.
+    additive_noise_sigma와 multiply_noise_sigma를 이용해 노이즈 레벨을 조절합니다.
+    """
+    def __init__(self, additive_noise_sigma=0.0, multiply_noise_sigma=1.0, 
+                 corruption_probability_per_image=0.0, only_additive_noise=False,
+                 image_corruption_seed=112154, image_noise_seed=445481):
+        self.additive_noise_sigma = additive_noise_sigma
+        self.corruption_probability_per_image = corruption_probability_per_image
+        self.only_additive_noise = only_additive_noise
+        self._image_corruption_seed = image_corruption_seed
+        self._image_noise_seed = image_noise_seed
+        self.__name__ = "AlternativeCorruptionCollateFn"
+
+    def __call__(self, batch):
+        if not ((self.additive_noise_sigma > 0.0) and self.corruption_probability_per_image > 0.0):
+            for item in batch:
+                if self.only_additive_noise:
+                    item['sigma'] = np.zeros_like(item['sigma'])
+                item['corruption_label'] = 0
+            return batch
+
+        for item in batch:
+            idx = item['idx']
+            csi_data = item['image']
+            noise_sigma_data = item['sigma']
+
+            np_gen = np.random.default_rng(int(self._image_corruption_seed + 175 + idx))
+            
+            if np_gen.random() < self.corruption_probability_per_image:
+                torch_gen = torch.Generator()
+                torch_gen.manual_seed(int(idx + self._image_noise_seed + 4454))
+
+                corruption_label = 1
+                noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
+
+                sqrt_E_sigma_n_power2 = sigma_mean(noise_sigma_data)
+
+                multiply_noise_sigma = self.additive_noise_sigma/sqrt_E_sigma_n_power2 + 1.0
+
+                target_noise_sigma = noise_sigma_data * multiply_noise_sigma 
+
+                if self.only_additive_noise:
+                    target_noise_sigma = target_noise_sigma - noise_sigma_data
+                    sigma_will_be_added = target_noise_sigma
+                    final_noise_sigma = target_noise_sigma
+                else:
+                    # 추가될 노이즈의 분산 = 목표 분산 - 현재 분산
+                    sigma_will_be_added_squared = (target_noise_sigma ** 2) - (noise_sigma_data ** 2)
+                    # 분산이 음수가 되는 경우를 방지 (수치적 오류 등)
+                    sigma_will_be_added = np.sqrt(np.maximum(0, sigma_will_be_added_squared))
+                    final_noise_sigma = target_noise_sigma
+
+                csi_data = csi_data + (noise_image * sigma_will_be_added).astype(csi_data.dtype)
+                noise_sigma_data = final_noise_sigma
+            else:
+                if self.only_additive_noise:
+                    noise_sigma_data = np.zeros_like(noise_sigma_data)
+                corruption_label = 0
+
+            item['image'] = csi_data
+            item['sigma'] = noise_sigma_data
+            item['corruption_label'] = corruption_label
+
+        return batch
+
 
 
 class NoiseMeanCollateFn(object):
