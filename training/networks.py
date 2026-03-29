@@ -51,7 +51,7 @@ class Linear(torch.nn.Module):
 class Conv2d(torch.nn.Module):
     def __init__(self,
         in_channels, out_channels, kernel, bias=True, up=False, down=False,
-        resample_filter=[1,1], fused_resample=False, init_mode='kaiming_normal', init_weight=1, init_bias=0,
+        resample_filter=[1,1], resample_stride=2, fused_resample=False, init_mode='kaiming_normal', init_weight=1, init_bias=0,
     ):
         assert not (up and down)
         super().__init__()
@@ -60,31 +60,60 @@ class Conv2d(torch.nn.Module):
         self.up = up
         self.down = down
         self.fused_resample = fused_resample
-        init_kwargs = dict(mode=init_mode, fan_in=in_channels*kernel*kernel, fan_out=out_channels*kernel*kernel)
-        self.weight = torch.nn.Parameter(weight_init([out_channels, in_channels, kernel, kernel], **init_kwargs) * init_weight) if kernel else None
-        self.bias = torch.nn.Parameter(weight_init([out_channels], **init_kwargs) * init_bias) if kernel and bias else None
-        f = torch.as_tensor(resample_filter, dtype=torch.float32)
-        f = f.ger(f).unsqueeze(0).unsqueeze(1) / f.sum().square()
-        self.register_buffer('resample_filter', f if up or down else None)
+        
+        if isinstance(resample_stride, int):
+            self.resample_stride = (resample_stride, resample_stride)
+        else:
+            self.resample_stride = tuple(resample_stride)
+        
+        if isinstance(kernel, int):
+            kernel = [kernel, kernel]
+        else:
+            kernel = list(kernel)
+            
+        init_kwargs = dict(mode=init_mode, fan_in=in_channels*kernel[0]*kernel[1], fan_out=out_channels*kernel[0]*kernel[1])
+        self.weight = torch.nn.Parameter(weight_init([out_channels, in_channels, kernel[0], kernel[1]], **init_kwargs) * init_weight) if kernel[0] > 0 and kernel[1] > 0 else None
+        self.bias = torch.nn.Parameter(weight_init([out_channels], **init_kwargs) * init_bias) if kernel[0] > 0 and kernel[1] > 0 and bias else None
+        if up or down:
+            if isinstance(resample_filter, (list, tuple)) and len(resample_filter) == 2 and isinstance(resample_filter[0], (list, tuple)):
+                f_h = torch.as_tensor(resample_filter[0], dtype=torch.float32)
+                f_w = torch.as_tensor(resample_filter[1], dtype=torch.float32)
+            else:
+                f_h = torch.as_tensor(resample_filter, dtype=torch.float32)
+                f_w = f_h
+            f = f_h.ger(f_w)
+            f = f.unsqueeze(0).unsqueeze(1) / (f_h.sum() * f_w.sum())
+            self.register_buffer('resample_filter', f)
+        else:
+            self.register_buffer('resample_filter', None)
 
     def forward(self, x):
         w = self.weight.to(x.dtype) if self.weight is not None else None
         b = self.bias.to(x.dtype) if self.bias is not None else None
         f = self.resample_filter.to(x.dtype) if self.resample_filter is not None else None
-        w_pad = w.shape[-1] // 2 if w is not None else 0
-        f_pad = (f.shape[-1] - 1) // 2 if f is not None else 0
+        w_pad = (w.shape[-2] // 2, w.shape[-1] // 2) if w is not None else (0, 0)
+        f_pad = ((f.shape[-2] - 1) // 2, (f.shape[-1] - 1) // 2) if f is not None else (0, 0)
+        stride_mul = self.resample_stride[0] * self.resample_stride[1]
+        
+        out_pad = (0, 0)
+        if f is not None:
+            out_pad = (max(0, self.resample_stride[0] - (f.shape[-2] - 2 * f_pad[0])),
+                       max(0, self.resample_stride[1] - (f.shape[-1] - 2 * f_pad[1])))
 
         if self.fused_resample and self.up and w is not None:
-            x = torch.nn.functional.conv_transpose2d(x, f.mul(4).tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=2, padding=max(f_pad - w_pad, 0))
-            x = torch.nn.functional.conv2d(x, w, padding=max(w_pad - f_pad, 0))
+            pad_t = (max(f_pad[0] - w_pad[0], 0), max(f_pad[1] - w_pad[1], 0))
+            x = torch.nn.functional.conv_transpose2d(x, f.mul(stride_mul).tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=self.resample_stride, padding=pad_t, output_padding=out_pad)
+            pad_c = (max(w_pad[0] - f_pad[0], 0), max(w_pad[1] - f_pad[1], 0))
+            x = torch.nn.functional.conv2d(x, w, padding=pad_c)
         elif self.fused_resample and self.down and w is not None:
-            x = torch.nn.functional.conv2d(x, w, padding=w_pad+f_pad)
-            x = torch.nn.functional.conv2d(x, f.tile([self.out_channels, 1, 1, 1]), groups=self.out_channels, stride=2)
+            pad_c = (w_pad[0] + f_pad[0], w_pad[1] + f_pad[1])
+            x = torch.nn.functional.conv2d(x, w, padding=pad_c)
+            x = torch.nn.functional.conv2d(x, f.tile([self.out_channels, 1, 1, 1]), groups=self.out_channels, stride=self.resample_stride)
         else:
             if self.up:
-                x = torch.nn.functional.conv_transpose2d(x, f.mul(4).tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=2, padding=f_pad)
+                x = torch.nn.functional.conv_transpose2d(x, f.mul(stride_mul).tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=self.resample_stride, padding=f_pad, output_padding=out_pad)
             if self.down:
-                x = torch.nn.functional.conv2d(x, f.tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=2, padding=f_pad)
+                x = torch.nn.functional.conv2d(x, f.tile([self.in_channels, 1, 1, 1]), groups=self.in_channels, stride=self.resample_stride, padding=f_pad)
             if w is not None:
                 x = torch.nn.functional.conv2d(x, w, padding=w_pad)
         if b is not None:
@@ -137,7 +166,8 @@ class UNetBlock(torch.nn.Module):
     def __init__(self,
         in_channels, out_channels, emb_channels, up=False, down=False, attention=False,
         num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-5,
-        resample_filter=[1,1], resample_proj=False, adaptive_scale=True,
+        resample_filter=[1,1], resample_stride=2, resample_proj=False, adaptive_scale=True,
+        kernel=3,
         init=dict(), init_zero=dict(init_weight=0), init_attn=None,
     ):
         super().__init__()
@@ -150,15 +180,15 @@ class UNetBlock(torch.nn.Module):
         self.adaptive_scale = adaptive_scale
 
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
-        self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
+        self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=kernel, up=up, down=down, resample_filter=resample_filter, resample_stride=resample_stride, **init)
         self.affine = Linear(in_features=emb_channels, out_features=out_channels*(2 if adaptive_scale else 1), **init)
         self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
-        self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
+        self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=kernel, **init_zero)
 
         self.skip = None
         if out_channels != in_channels or up or down:
-            kernel = 1 if resample_proj or out_channels!= in_channels else 0
-            self.skip = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=kernel, up=up, down=down, resample_filter=resample_filter, **init)
+            skip_kernel = 1 if resample_proj or out_channels!= in_channels else 0
+            self.skip = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=skip_kernel, up=up, down=down, resample_filter=resample_filter, resample_stride=resample_stride, **init)
 
         if self.num_heads:
             self.norm2 = GroupNorm(num_channels=out_channels, eps=eps)
@@ -556,6 +586,194 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 x = block(x, emb)
 
         return aux
+
+
+@persistence.persistent_class
+class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
+    def __init__(self,
+        img_resolution,                     # Image resolution at input/output.
+        in_channels,                        # Number of color channels at input.
+        out_channels,                       # Number of color channels at output.
+        label_dim           = 0,            # Number of class labels, 0 = unconditional.
+        label_resolution    = None,         # Label resolution
+        label_type          = 'downlink',
+        augment_dim         = 0,            # Augmentation label dimensionality, 0 = no augmentation.
+
+        model_channels      = 128,          # Base multiplier for the number of channels.
+        channel_mult        = [1,2,2,2],    # Per-resolution multipliers for the number of channels.
+        channel_mult_emb    = 4,            # Multiplier for the dimensionality of the embedding vector.
+        num_blocks          = 4,            # Number of residual blocks per resolution.
+        attn_resolutions    = [16],         # List of resolutions with self-attention.
+        dropout             = 0.10,         # Dropout probability of intermediate activations.
+        label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
+
+        embedding_type      = 'positional', # Timestep embedding type: 'positional' for DDPM++, 'fourier' for NCSN++.
+        channel_mult_noise  = 1,            # Timestep embedding size: 1 for DDPM++, 2 for NCSN++.
+        encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
+        decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
+        resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
+        resample_stride     = [2,2],        
+        kernel_size         = [9,3],       # Base kernel size.
+    ):
+        assert embedding_type in ['fourier', 'positional']
+        assert encoder_type in ['standard', 'skip', 'residual']
+        assert decoder_type in ['standard', 'skip']
+        assert label_type in ['downlink', 'classes']
+
+        super().__init__()
+        self.label_dropout = label_dropout
+        self.label_type = label_type
+        emb_channels = model_channels * channel_mult_emb
+        noise_channels = model_channels * channel_mult_noise
+        init = dict(init_mode='xavier_uniform')
+        init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
+        init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
+        block_kwargs = dict(
+            emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
+            resample_filter=resample_filter, resample_stride=resample_stride, resample_proj=True, adaptive_scale=False,
+            kernel=kernel_size,
+            init=init, init_zero=init_zero, init_attn=init_attn,
+        )
+
+        # Mapping.
+        self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
+        if label_dim != 0:
+            if label_type == 'downlink':
+                if label_resolution == None:
+                    label_resolution = img_resolution
+                flatten_feature_size = label_resolution[0]//4 * label_resolution[1]//4 * model_channels
+                self.map_label = torch.nn.Sequential(
+                    (OrderedDict([
+                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=kernel_size, **init)),    # RT : (model_channels, label_resolution[0], label_resolution[1])
+                                ("SiLU 1", torch.nn.SiLU()),
+                                ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, **init)),    # RT : (model_channels, label_resolution[0]//2, label_resolution[1]//2)
+                                ("SiLU 2", torch.nn.SiLU()),
+                                ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, **init)),    # RT : (model_channels, label_resolution[0]//4, label_resolution[1]//4)
+                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * label_resolution[0]//4 * label_resolution[1]//4)
+                                ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
+                                ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
+                    ]))
+                )
+            elif label_type == 'classes':
+                self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init)
+            else:  
+                assert False, "Unknown label type"
+        else:
+            self.map_label = None
+
+        self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
+
+        if self.map_label != None and self.label_type == 'downlink':
+            self.map_layer0 = Linear(in_features=noise_channels*3, out_features=emb_channels*2, **init)
+            self.map_layer1 = Linear(in_features=emb_channels*2, out_features=emb_channels, **init)
+        else:
+            self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
+            self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
+
+        # Encoder.
+        self.enc = torch.nn.ModuleDict()
+        cout = in_channels
+        caux = in_channels
+        for level, mult in enumerate(channel_mult):
+            H_res = img_resolution[0] >> level
+            W_res = img_resolution[1] >> level
+            if level == 0:
+                cin = cout
+                cout = model_channels
+                self.enc[f'{H_res}x{W_res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=kernel_size, **init)
+            else:
+                self.enc[f'{H_res}x{W_res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                if encoder_type == 'skip':
+                    self.enc[f'{H_res}x{W_res}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter, resample_stride=resample_stride)
+                    self.enc[f'{H_res}x{W_res}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
+                if encoder_type == 'residual':
+                    self.enc[f'{H_res}x{W_res}_aux_residual'] = Conv2d(in_channels=caux, out_channels=cout, kernel=kernel_size, down=True, resample_filter=resample_filter, resample_stride=resample_stride, fused_resample=True, **init)
+                    caux = cout
+            for idx in range(num_blocks):
+                cin = cout
+                cout = model_channels * mult
+                attn = (W_res in attn_resolutions)
+                self.enc[f'{H_res}x{W_res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+        skips = [block.out_channels for name, block in self.enc.items() if 'aux' not in name]
+
+        # Decoder.
+        self.dec = torch.nn.ModuleDict()
+        for level, mult in reversed(list(enumerate(channel_mult))):
+            H_res = img_resolution[0] >> level
+            W_res = img_resolution[1] >> level            
+            if level == len(channel_mult) - 1:
+                self.dec[f'{H_res}x{W_res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
+                self.dec[f'{H_res}x{W_res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+            else:
+                self.dec[f'{H_res}x{W_res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+            for idx in range(num_blocks + 1):
+                cin = cout + skips.pop()
+                cout = model_channels * mult
+                attn = (idx == num_blocks and W_res in attn_resolutions)
+                self.dec[f'{H_res}x{W_res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+            if decoder_type == 'skip' or level == 0:
+                if decoder_type == 'skip' and level < len(channel_mult) - 1:
+                    self.dec[f'{H_res}x{W_res}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter, resample_stride=resample_stride)
+                self.dec[f'{H_res}x{W_res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
+                self.dec[f'{H_res}x{W_res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=kernel_size, **init_zero)
+
+    def forward(self, x, noise_labels, class_labels, augment_labels=None):
+        # Mapping.
+        emb = self.map_noise(noise_labels)
+        emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
+        if self.map_augment is not None and augment_labels is not None:
+            emb = emb + self.map_augment(augment_labels)
+        if self.map_label is not None:
+            tmp = class_labels
+            if self.training and self.label_dropout:
+                label_dropout_table = torch.unsqueeze(torch.unsqueeze((torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype), dim=-1), dim=-1)
+
+                tmp = tmp * label_dropout_table
+            if self.label_type == 'downlink':
+                label_emb = self.map_label(tmp)
+                # emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+                emb = torch.concatenate([emb, label_emb], dim=1)
+            elif self.label_type == 'classes':
+                emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+            else:
+                assert False, "Unknown label type"
+        emb = silu(self.map_layer0(emb))
+        emb = silu(self.map_layer1(emb))
+
+        # Encoder.
+        skips = []
+        aux = x
+        for name, block in self.enc.items():
+            if 'aux_down' in name:
+                aux = block(aux)
+            elif 'aux_skip' in name:
+                x = skips[-1] = x + block(aux)
+            elif 'aux_residual' in name:
+                x = skips[-1] = aux = (x + block(aux)) / np.sqrt(2)
+            else:
+                x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
+                skips.append(x)
+
+        # Decoder.
+        aux = None
+        tmp = None
+        for name, block in self.dec.items():
+            if 'aux_up' in name:
+                aux = block(aux)
+            elif 'aux_norm' in name:
+                tmp = block(x)
+            elif 'aux_conv' in name:
+                tmp = block(silu(tmp))
+                aux = tmp if aux is None else tmp + aux
+            else:
+                if x.shape[1] != block.in_channels:
+                    x = torch.cat([x, skips.pop()], dim=1)
+                x = block(x, emb)
+
+        return aux
+
 
 
 #----------------------------------------------------------------------------

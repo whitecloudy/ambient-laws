@@ -196,7 +196,9 @@ def training_loop(
         dataset_obj = WiDARDataset(**dataset_kwargs)
     ## using This sampler is way way way~~~ too slow for every epoch renewal
     # dataset_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=True, seed=seed)
+    dist.print0('Dataset Loading completed...')
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
+    dist.print0('Sampler Loading completed...')
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
     
     # Initialize temporary directory for training state dumps
