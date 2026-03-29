@@ -50,6 +50,11 @@ def should_stop():
 def update_progress(cur, total):
     _ = cur, total
 
+
+def synchronize():
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
 #----------------------------------------------------------------------------
 
 def print0(*args, **kwargs):

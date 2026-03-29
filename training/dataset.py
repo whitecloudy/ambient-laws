@@ -1138,11 +1138,6 @@ class WiDARDataset(Dataset):
 
         # self.file_paths = self.filter_files(self.file_paths)
 
-        csi_data_list = []
-        noise_sigma_list = []
-        true_length_list = []
-        label_list = []
-        ant_size = 3
         self._axis_name = ['antenna', 'frame', 'channel']
         self._label_dim = 6
         self._name = "WiDARDataset"
@@ -1172,26 +1167,9 @@ class WiDARDataset(Dataset):
         self._name = "WiDARDataset"
         # --- End of shape calculation logic ---
 
-        print("Loading and preprocessing data from files...")
-        pool_args = [(fp, ant_size, self._label_dim) for fp in self.file_paths]
-        
-        # imap ensures the order of outputs precisely matches the input order
-        with mp.Pool(processes=min(mp.cpu_count(), 16)) as pool:
-            for csi_data, noise_sigma_data, true_length, label in tqdm(pool.imap(_process_widar_file, pool_args, chunksize=32), total=len(pool_args), desc="Loading files"):
-                csi_data_list.append(csi_data)
-                noise_sigma_list.append(noise_sigma_data)
-                true_length_list.append(true_length)
-                label_list.append(label)
-
-        self.csi_data_list = np.stack(csi_data_list)
-        self.noise_sigma_list = np.stack(noise_sigma_list)
-        self.true_length_list = np.stack(true_length_list)
-        self.label_list = np.stack(label_list)
-
         self.idx_list = np.arange(len(self.file_paths))
 
         self.live_idx, self.dead_idx = self.split_datasets(self.idx_list)
-        print("Preprocessing Done")
 
         self.transpose_collate_fn = TransposeCollateFn(self.transpose)
         self.complex_view_collate_fn = ComplexViewCollateFn(self.view_as_complex, self.complex_merge_axis)
@@ -1304,10 +1282,7 @@ class WiDARDataset(Dataset):
         true_idx = self.live_idx[idx]
         file_path = self.file_paths[true_idx]
 
-        csi_data = self.csi_data_list[true_idx].copy()
-        noise_sigma_data = self.noise_sigma_list[true_idx].copy()
-        true_length = self.true_length_list[true_idx]
-        label_data = self.label_list[true_idx].copy()
+        csi_data, noise_sigma_data, true_length, label_data = _process_widar_file((file_path, 3, self._label_dim))
         axis_name = self._axis_name.copy()
 
         # 1. Normalize
@@ -1381,8 +1356,9 @@ class WiDARDataset(Dataset):
         var_sum = 0.0
         var_count = 0
 
-        for idx in self.live_idx:
-            csi_data = self.csi_data_list[idx]
+        for idx in tqdm(self.live_idx, desc="Calculating normalized value"):
+            file_path = self.file_paths[idx]
+            csi_data, _, _, _ = _process_widar_file((file_path, 3, self._label_dim))
             var_sum += (np.sum((csi_data * np.conj(csi_data)).real.flatten()))
             var_count += csi_data.flatten().size
         return np.sqrt(var_sum / var_count)
