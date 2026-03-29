@@ -16,7 +16,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
-from training.dataset import renewRfDataset, widarRfDataset, renewRfProcessedDataset, pad_collate_fn, widar_collate_fn, rf_augmentation_collate_fn
+from training.dataset import renewRfProcessedDataset, pad_collate_fn, rf_augmentation_collate_fn, WiDARDataset
 import ambient_utils
 import warnings
 import wandb
@@ -46,6 +46,7 @@ def parse_int_list(s):
 @click.command()
 
 # Main options.
+@click.option('--task',          help='Current task',         metavar='STR',                        type=str, required=True, show_default=True, default='RENEW')
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
@@ -93,7 +94,7 @@ def parse_int_list(s):
 # RF dataset related
 @click.option('--view_as_complex', help='Whether to view the data as complex numbers.', type=bool, default=False, show_default=True)
 @click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to None to not merge.', type=int, default=0, show_default=True)
-@click.option('--transpose', help='Transpose the data axes according to the given order. Provide a list of two integers representing the new order of the first two axes (frame_resolution and ant_resolution). Set to None to not transpose.', type=str, default="1,0", show_default=True)
+@click.option('--transpose', help='Transpose the data axes according to the given order. Provide a list of two integers representing the new order of the first two axes (frame_resolution and ant_resolution). Set to None to not transpose.', type=str, default="0,1", show_default=True)
 @click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
 @click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
 @click.option('--data_norm', help='Data normalization value for the RF data.', type=float, default=1.0, show_default=True)
@@ -143,33 +144,45 @@ def main(**kwargs):
 
     # Initialize config dict.
     c = dnnlib.EasyDict()
-    # dataset_kwargs for RENEW dataset
-    c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
-                                       corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                       only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
-                                       resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
-                                       normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                       multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
-    # dataset_kwargs for WIDAR dataset
-    # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
-    #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-    #                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
-    #                                    resolution=(2048, 3, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
-    #                                    normalize_value=opts.data_norm)
 
+    if opts.task == 'RENEW':
+        # dataset_kwargs for RENEW dataset
+        c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
+                                        corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
+                                        only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+                                        resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
+                                        normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
+                                        multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
+    elif opts.task == 'WIDAR':
+        # dataset_kwargs for WIDAR dataset
+        c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
+                                           corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
+                                           only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+                                           resolution=(3, 512, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
+                                           normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
+                                           multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
+    else:
+        raise ValueError(f'Unknown task: {opts.task}')
+        
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+
     c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(flip_probability=opts.flip_aug_ratio, 
-                                                                 phase_shift_probability=opts.phase_shift_aug_ratio, 
-                                                                 other_collate_fn=[pad_collate_fn, torch.utils.data.default_collate])
-    # c.data_loader_kwargs.collate_fn = pad_collate_fn
-    # c.data_loader_kwargs.collate_fn = widar_collate_fn
+                                                                phase_shift_probability=opts.phase_shift_aug_ratio, 
+                                                                other_collate_fn=[pad_collate_fn, torch.utils.data.default_collate])
+
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8, weight_decay=opts.weight_decay)
 
     # Validate dataset options.
     try:
-        dataset_obj = renewRfProcessedDataset(**c.dataset_kwargs)
+        if opts.task == 'RENEW':
+            dataset_obj = renewRfProcessedDataset(**c.dataset_kwargs)
+        elif opts.task == 'WIDAR':
+            c.dataset_kwargs.must_contain = "regex:gesture(0|1|2|3|17|18)(?!\d)"
+            dataset_obj = WiDARDataset(**c.dataset_kwargs)
+        else:
+            raise ValueError(f'Unknown task: {opts.task}')
         # dataset_obj = widarRfDataset(**c.dataset_kwargs)
         dataset_name = dataset_obj.name
         c.dataset_kwargs.dataset_keep_percentage = opts.dataset_keep_percentage
@@ -240,6 +253,7 @@ def main(**kwargs):
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
     c.update(wandb_onoff=opts.wandb)
+    c.update(task=opts.task)
 
     # Random seed.
     if opts.seed is not None:

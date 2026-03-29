@@ -23,7 +23,7 @@ from torch_utils import misc
 import ambient_utils
 import wandb
 import tempfile
-from training.dataset import renewRfDataset, renewRfProcessedDataset, widarRfDataset
+from training.dataset import renewRfProcessedDataset, WiDARDataset
 
 
 def infiniteloop(dataloader):
@@ -150,6 +150,7 @@ def training_loop(
     loss_kwargs         = {},       # Options for loss function.
     optimizer_kwargs    = {},       # Options for optimizer.
     augment_kwargs      = None,     # Options for augmentation pipeline, None = disable.
+    task                = 'RENEW',  # Current task
     seed                = 0,        # Global random seed.
     batch_size          = 512,      # Total batch size for one training iteration.
     batch_gpu           = None,     # Limit batch size per GPU, None = no limit.
@@ -189,8 +190,10 @@ def training_loop(
 
     # Load dataset.
     dist.print0('Loading dataset...')
-    dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
-    # dataset_obj = widarRfDataset(**dataset_kwargs)
+    if task == 'RENEW':
+        dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    elif task == 'WIDAR':
+        dataset_obj = WiDARDataset(**dataset_kwargs)
     ## using This sampler is way way way~~~ too slow for every epoch renewal
     # dataset_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=True, seed=seed)
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
@@ -206,7 +209,10 @@ def training_loop(
     # Construct network.
     dist.print0('Constructing network...')
     # interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
-    interface_kwargs = dict(img_resolution=[16, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_resolution=[16, 32]) # TODO: This is very clumsy. Need to fix ASAP
+    if task == 'RENEW':  
+        interface_kwargs = dict(img_resolution=[16, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_resolution=[16, 32]) # TODO: This is very clumsy. Need to fix ASAP
+    elif task == 'WIDAR':
+        interface_kwargs = dict(img_resolution=[512, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_type='classes')
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     with torch.no_grad():
@@ -273,7 +279,7 @@ def training_loop(
                 images = dataset_item["image"].to(device)                
                 labels = dataset_item["label"].to(device)
                 current_sigma = dataset_item["sigma"].to(device)
-                additive_noise_sigma = dataset_item['additive_noise_sigma'].to(device)
+                # additive_noise_sigma = dataset_item['additive_noise_sigma'].to(device)
 
                 if "original_shape" in dataset_item:
                     original_shape = dataset_item["original_shape"].to(device)

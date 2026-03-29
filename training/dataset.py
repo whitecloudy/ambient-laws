@@ -13,7 +13,6 @@ import zipfile
 import PIL.Image
 import json
 import torch
-import dnnlib
 import fnmatch
 
 try:
@@ -110,13 +109,6 @@ class Dataset(torch.utils.data.Dataset):
             onehot[label] = 1
             label = onehot
         return label.copy()
-
-    def get_details(self, idx):
-        d = dnnlib.EasyDict()
-        d.raw_idx = int(self._raw_idx[idx])
-        d.xflip = (int(self._xflip[idx]) != 0)
-        d.raw_label = self._get_raw_labels()[d.raw_idx].copy()
-        return d
 
     @property
     def name(self):
@@ -256,6 +248,19 @@ import ambient_utils
 from glob import glob
 import warnings
 
+def find_npz_files(dir_path : str, recursive=True):
+    file_paths = []
+    if recursive:
+        for root, dirs, files in os.walk(dir_path):
+            for file in files:
+                if file.endswith('.npz'):
+                    file_paths.append(os.path.join(root, file))
+    else:
+        for file in os.listdir(dir_path):
+            if file.endswith('.npz'):
+                file_paths.append(os.path.join(dir_path, file))
+    return file_paths
+
 class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
     def __init__(self, 
                  path,                   # Path to files.
@@ -302,23 +307,32 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
         self._fname = []
         self._axis_name = ['frame', 'antenna', 'channel']   # Default axis names for indexing
+
         if isinstance(self._path, list):
             for path in self._path:
-                self._fname += glob(os.path.join(path, '*.npz'))
+                self._fname += find_npz_files(path)
         elif os.path.isdir(self._path):
-            self._fname = glob(os.path.join(self._path, '*.npz'), recursive=True)
+            self._fname = find_npz_files(self._path)
         else:
             raise IOError('Path must point to a directory or list of file paths')
         
         print("Dataset Length before", len(self._fname))
         if must_contain is not None:
-            if any(c in must_contain for c in '*?['):
+            import re
+            if must_contain.startswith('regex:'):
+                pattern = re.compile(must_contain.replace('regex:', ''))
+                self._fname = {fname for fname in self._fname if pattern.search(fname)}
+            elif any(c in must_contain for c in '*?['):
                 self._fname = {fname for fname in self._fname if fnmatch.fnmatch(fname, must_contain)}
             else:
                 self._fname = {fname for fname in self._fname if must_contain in fname}
         
         if must_not_contain is not None:
-            if any(c in must_not_contain for c in '*?['):
+            import re
+            if must_not_contain.startswith('regex:'):
+                pattern = re.compile(must_not_contain.replace('regex:', ''))
+                self._fname = {fname for fname in self._fname if not pattern.search(fname)}
+            elif any(c in must_not_contain for c in '*?['):
                 self._fname = {fname for fname in self._fname if not fnmatch.fnmatch(fname, must_not_contain)}
             else:
                 self._fname = {fname for fname in self._fname if must_not_contain not in fname}
@@ -989,7 +1003,6 @@ def pad_collate_fn(batch):
     # 2. 높이와 너비를 2의 배수로 올림합니다.
     target_h = _power2ceil(max_h)
     target_w = _power2ceil(max_w)
-
     # 3. 각 'image'를 목표 크기로 패딩합니다.
     padded_batch = []
 
@@ -1015,297 +1028,367 @@ def pad_collate_fn(batch):
 
     return padded_batch
 
-def widar_collate_fn(batch):
-    """
-    가변 크기의 'image' 텐서를 패딩하여 동일한 크기로 맞춘 후,
-    하나의 배치로 합칩니다.
-    """
-    padded_batch = []
-    target_h = 2048
+import multiprocessing as mp
+from tqdm import tqdm
 
-    for item in batch:
-        img = item['image']
-        noise = item['noise']
-        if img.shape[-2] > target_h:
-            img = img[:, :target_h, :]
-            noise = noise[:, :target_h, :]
-            original_shape = torch.tensor(img.shape)    # save original shape after cutting
-        elif img.shape[-2] < target_h:
-            pad_h = target_h - img.shape[-2]
-            pad_width = [(0, 0)] * (img.ndim - 2) + [(0, pad_h), (0, 0)]
-            original_shape = torch.tensor(img.shape)    # save original shape before padding
-            img = np.pad(img, pad_width, mode='constant', constant_values=0)
-            noise = np.pad(noise, pad_width, mode='constant', constant_values=0)
-        else:
-            original_shape = torch.tensor(img.shape)
+def _process_widar_file(args):
+    file_path, ant_size, label_dim = args
+    with np.load(file_path) as file_data:
+        csi_data = file_data['csi_data'].astype(np.complex64)
+        csi_data = np.split(csi_data, axis=1, indices_or_sections=ant_size)
+        csi_data = np.stack(csi_data)
 
-        item['original_shape'] = original_shape
-        item['image'] = img
-        item['noise'] = noise
-        padded_batch.append(item)
+        noise_sigma_data = file_data['noise_array'].astype(np.float32) 
+        noise_sigma_data = np.repeat(np.expand_dims(noise_sigma_data, axis=0), ant_size, axis=0)
+        true_length = file_data['resized_non_padded_length'].astype(np.float32)
 
-    # 4. 다른 데이터들도 배치로 만듭니다.
-    collated_batch = torch.utils.data.default_collate(padded_batch)
+    base_name = os.path.basename(file_path)
+    parts = base_name.split('-')
+    gesture_num = None
+    for part in parts:
+        if part.startswith('gesture'):
+            gesture_num = int(part.replace('gesture', ''))
+            break
 
-    # # 5. 패딩된 이미지들을 쌓아서(stack) 배치에 추가합니다.
-    # collated_batch['image'] = torch.stack(images)
-    # collated_batch['original_shape'] = torch.stack(original_shapes)
+    if gesture_num is None:
+        label = None
+    else:
+        label_list_map = [0, 1, 2, 3, 17, 18]
+        label = np.zeros(label_dim, dtype=np.float32)
+        if gesture_num in label_list_map:
+            label[label_list_map.index(gesture_num)] = 1.0
 
-    return collated_batch
+    return csi_data, noise_sigma_data, true_length, label
 
-
-
-class widarRfDataset(ambient_utils.dataset_utils.Dataset):
-    def __init__(self, 
-                 path,                   # Path to files.
-                 resolution      = None, # Ensure specific resolution, None = highest available.
-                 must_contain    = None, # Require filenames to contain this substring.
-                 must_not_contain = None, # Require filenames to NOT contain this substring.
-                 sigma: float = 0.1,     # ensured minimum currption sigma
-                 utilize_remaining_frame = False,
-                 view_as_complex = False,
-                 complex_merge_axis = 0,
-                 transpose = None,
-                 noise_mean_flag = True,
+class WiDARDataset(Dataset):
+    def __init__(self, path, 
+                 transform=None, 
+                 dataset_keep_percentage=0.8, 
+                 split_seed=42, 
+                 must_contain="regex:gesture(0|1|2|3|17|18)(?!\d)", 
+                 must_not_contain=None,
+                 normalize_value=1.0,
+                 transpose=None,
+                 view_as_complex=False,
+                 complex_merge_axis=0,
+                 additive_noise_sigma: float = 0.0,
+                 multiply_noise_sigma: float = 1.0,
                  corruption_probability_per_image = 0.0,
                  corruption_probability_per_pixel = 1.0,
+                 only_additive_noise = False,
                  image_corruption_seed = 112154,
                  image_noise_seed = 445481,
-                 normalize_value = 1.0,
-                 label_key = ["gesture", ],
-                 **super_kwargs):
-        self.minimum_sigma = sigma
-        self._noise_mean_flag = noise_mean_flag
-        self._path = path
-        self._normalize_value = normalize_value
+                 noise_mean_flag = True,
+                 noise_mean_alter_way = True,
+                 use_labels=True, # WiDAR seems to always have labels
+                 cache = None,
+                 sigma = 0.0,
+                 only_positive = False,
+                 resolution = None,
+                 max_size = None,
+                 ):
+        self.dir_path = path
+        self.transform = transform
+        self.split_ratio = dataset_keep_percentage
+        self.split_seed = split_seed
+        self.must_contain = must_contain
+        self.must_not_contain = must_not_contain
+        self.normalize_value = normalize_value
+        self.transpose = tuple(transpose) if transpose is not None else None
+        self.view_as_complex = view_as_complex
+        self.complex_merge_axis = complex_merge_axis
+        self.additive_noise_sigma = additive_noise_sigma
+        self.multiply_noise_sigma = multiply_noise_sigma
+        self.corruption_probability_per_image = corruption_probability_per_image
+        self.only_additive_noise = only_additive_noise
+        self.image_corruption_seed = image_corruption_seed
+        self.image_noise_seed = image_noise_seed
+        self.noise_mean_flag = noise_mean_flag
+        self.noise_mean_alter_way = noise_mean_alter_way
+        self.file_paths = []
 
-        if not os.path.isdir(self._path):
-            raise IOError('Path must point to a directory or list of file paths')
-
-        # key => [date, user, gesture, torso, face, repetition, rx, file name, room]
-        # date : data captured date
-        # gesture : gesture while data capture
-        # torso : torso location
-        # face : where user faced
-        # rx : rx device number
-        self.data_label_df = self._load_label_datafile(self._path)
-        self._add_room_number()
+        if isinstance(self.dir_path, str):
+            # find .npz files in recursive way
+            self.file_paths = find_npz_files(self.dir_path)
+        elif isinstance(self.dir_path, list):
+            for path in self.dir_path:
+                self.file_paths.extend(find_npz_files(path))
+        else:
+            raise ValueError("dir_path should be a string or a list of strings.")
         
-        # label로 사용할 key값 선택
-        self.cond_label = label_key
-        self.max_value =  self._load_max_value(self.data_label_df, self.cond_label)
-        self.min_value =  self._load_min_value(self.data_label_df, self.cond_label)
-        
-        # 사용할 데이터 선택
         if must_contain is not None:
-            self.data_label_df = self.data_label_df[self.data_label_df['file name'].str.contains(must_contain)]
-        
+            import re
+            if must_contain.startswith('regex:'):
+                pattern = re.compile(must_contain.replace('regex:', ''))
+                self.file_paths = [fname for fname in self.file_paths if pattern.search(fname)]
+            elif any(c in must_contain for c in '*?['):
+                self.file_paths = [fname for fname in self.file_paths if fnmatch.fnmatch(fname, must_contain)]
+            else:
+                self.file_paths = [fname for fname in self.file_paths if must_contain in fname]
+
         if must_not_contain is not None:
-            self.data_label_df = self.data_label_df[~self.data_label_df['file name'].str.contains(must_not_contain)]
+            import re
+            if must_not_contain.startswith('regex:'):
+                pattern = re.compile(must_not_contain.replace('regex:', ''))
+                self.file_paths = [fname for fname in self.file_paths if not pattern.search(fname)]
+            elif any(c in must_not_contain for c in '*?['):
+                self.file_paths = [fname for fname in self.file_paths if not fnmatch.fnmatch(fname, must_not_contain)]
+            else:
+                self.file_paths = [fname for fname in self.file_paths if must_not_contain not in fname]
 
-        self._prefix_fname = sorted(list(self.data_label_df['file name'].unique()))
+        # self.file_paths = self.filter_files(self.file_paths)
 
-        if type(resolution) is tuple or type(resolution) is list:
-            self._frame_resolution = resolution[0]
-            self._ant_resolution = resolution[1]
-            self._channel_resolution = resolution[2] if len(resolution) > 2 else None
-        elif type(resolution) is int:
-            self._frame_resolution = resolution
-            self._ant_resolution = resolution
-            self._channel_resolution = None
-        else:
-            assert False, "resolution must be int or tuple/list of int"
+        csi_data_list = []
+        noise_sigma_list = []
+        true_length_list = []
+        label_list = []
+        ant_size = 3
+        self._axis_name = ['antenna', 'frame', 'channel']
+        self._label_dim = 6
+        self._name = "WiDARDataset"
+        self._image_shape = [3, 512, 30]
+        actual_csi_shape = self._image_shape
+
+
+        if self.transpose is not None:
+            actual_csi_shape = self._image_shape
+            img_ndim = len(actual_csi_shape)
+            # Assumes transpose is a permutation of the first N axes that are being transposed
+            transpose_axes = self.transpose + tuple(range(len(self.transpose), img_ndim))
             
-        # # data shape = (frame, user, antenna, channel)
-        # self._csi_raw_data_list = [np.load(fprefix+'.csi.npy', mmap_mode='r') for fprefix in self._prefix_fname]
-        # self._noise_raw_data_list = [np.load(fprefix+'.noise.npy', mmap_mode='r') for fprefix in self._prefix_fname]
-        # # print(self._csi_raw_data_list[0].shape)
-        
-        self._view_as_complex = view_as_complex
-        self._complex_merge_axis = complex_merge_axis
-        self._transpose = tuple(transpose) if transpose is not None else None
+            actual_csi_shape = [actual_csi_shape[i] for i in transpose_axes]
+            self._axis_name = [self._axis_name[i] for i in transpose_axes]
 
-        name = os.path.splitext(os.path.basename(self._path))[0]
-        single_csi_shape = [self._frame_resolution, self._ant_resolution, self._channel_resolution]
-        if self._transpose is not None:
-            actual_csi_shape = [single_csi_shape[ax] for ax in self._transpose] + [single_csi_shape[2]]
+        if not self.view_as_complex:
+            if self.complex_merge_axis is not None:
+                actual_csi_shape[self.complex_merge_axis] *= 2
+                self._axis_name[self.complex_merge_axis] = 'complex/' + self._axis_name[self.complex_merge_axis]
+            else:
+                actual_csi_shape.append(2)
+                self._axis_name.append('complex')
+        
+        self._image_shape = tuple(actual_csi_shape)
+        self._label_dim = 6
+        self._name = "WiDARDataset"
+        # --- End of shape calculation logic ---
+
+        print("Loading and preprocessing data from files...")
+        pool_args = [(fp, ant_size, self._label_dim) for fp in self.file_paths]
+        
+        # imap ensures the order of outputs precisely matches the input order
+        with mp.Pool(processes=min(mp.cpu_count(), 16)) as pool:
+            for csi_data, noise_sigma_data, true_length, label in tqdm(pool.imap(_process_widar_file, pool_args, chunksize=32), total=len(pool_args), desc="Loading files"):
+                csi_data_list.append(csi_data)
+                noise_sigma_list.append(noise_sigma_data)
+                true_length_list.append(true_length)
+                label_list.append(label)
+
+        self.csi_data_list = np.stack(csi_data_list)
+        self.noise_sigma_list = np.stack(noise_sigma_list)
+        self.true_length_list = np.stack(true_length_list)
+        self.label_list = np.stack(label_list)
+
+        self.idx_list = np.arange(len(self.file_paths))
+
+        self.live_idx, self.dead_idx = self.split_datasets(self.idx_list)
+        print("Preprocessing Done")
+
+        self.transpose_collate_fn = TransposeCollateFn(self.transpose)
+        self.complex_view_collate_fn = ComplexViewCollateFn(self.view_as_complex, self.complex_merge_axis)
+        if self.noise_mean_alter_way:
+            self.corruption_collate_fn = AlternativeCorruptionCollateFn(
+                additive_noise_sigma=self.additive_noise_sigma,
+                multiply_noise_sigma=self.multiply_noise_sigma,
+                corruption_probability_per_image=self.corruption_probability_per_image,
+                only_additive_noise=self.only_additive_noise,
+                image_corruption_seed=self.image_corruption_seed,
+                image_noise_seed=self.image_noise_seed,
+            )
         else:
-            actual_csi_shape = single_csi_shape
+            self.corruption_collate_fn = CorruptionCollateFn(
+                additive_noise_sigma=self.additive_noise_sigma,
+                multiply_noise_sigma=self.multiply_noise_sigma,
+                corruption_probability_per_image=self.corruption_probability_per_image,
+                only_additive_noise=self.only_additive_noise,
+                image_corruption_seed=self.image_corruption_seed,
+                image_noise_seed=self.image_noise_seed,
+            )
+        self.noise_mean_collate_fn = NoiseMeanCollateFn(self.noise_mean_flag, self.noise_mean_alter_way)
 
-        if not self._view_as_complex:
-            if self._complex_merge_axis is not None:
-                actual_csi_shape[self._complex_merge_axis] *= 2
-        elif self._complex_merge_axis is not None:
-            import warnings
-            warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
+    def split_antenna_axis(self, csi_data, antenna_num=3):
+        # input csi_data shape : (frame, antenna*channel)
+        # output csi_data shape : (frame, antenna, channel)
 
-        self.image_actual_shape = actual_csi_shape
-        raw_shape = [len(self.data_label_df)] + actual_csi_shape
-
-        self._resolution = raw_shape[-2:]
-        super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
-
-    def _condition_maker(self, label : pd.Series):
-        cond_list = []
-        for key in self.cond_label:
-            value = label[key] - self.min_value[key]
-            value_range = self.max_value[key] - self.min_value[key] + 1
-            cond_frac = np.zeros((value_range))
-            cond_frac[value] = 1
-
-            cond_list.append(cond_frac)
-
-        return np.concatenate(cond_list)
+        csi_data = np.split(csi_data, axis=1, indices_or_sections=antenna_num)
+        return np.stack(csi_data)
 
 
+    def _normalize_data(self, csi_data, noise_sigma_data):
+        csi_data /= self.normalize_value
+        noise_sigma_data /= self.normalize_value
+        return csi_data, noise_sigma_data
 
-    def _load_max_value(self, df, cond_label):
-        max_list = {}
-        for label in cond_label:
-            max_list[label] = max(df[label])
+    def _apply_transpose(self, csi_data, noise_sigma_data, axis_name):
+        if self.transpose is not None:
+            # For WiDAR, label is 1D vector, so we don't transpose it.
+            item = {'image': csi_data, 'label': np.array([]), 'sigma': noise_sigma_data, 'axis_name': axis_name}
+            item = self.transpose_collate_fn([item])[0]
+            csi_data = item['image']
+            noise_sigma_data = item['sigma']
+            axis_name = item['axis_name']
+        return csi_data, noise_sigma_data, axis_name
 
-        return pd.Series(max_list)
+    def _handle_complex_view(self, csi_data, noise_sigma_data, axis_name):
+        # For WiDAR, label is 1D vector, so we don't process it as complex.
+        item = {'image': csi_data, 'label': np.array([]), 'sigma': noise_sigma_data, 'axis_name': axis_name}
+        item = self.complex_view_collate_fn([item])[0]
+        csi_data = item['image']
+        noise_sigma_data = item['sigma']
+        axis_name = item['axis_name']
+        return csi_data, noise_sigma_data, axis_name
+
+    def _apply_corruption(self, csi_data, noise_sigma_data, idx):
+        item = {'image': csi_data, 'sigma': noise_sigma_data, 'idx': idx}
+        item = self.corruption_collate_fn([item])[0]
+        return item['image'], item['sigma'], item['corruption_label']
+
+    def flip_splits(self):
+        tmp = self.live_idx
+        self.live_idx = self.dead_idx
+        self.dead_idx = tmp
     
-    def _load_min_value(self, df, cond_label):
-        min_list = {}
-        for label in cond_label:
-            min_list[label] = min(df[label])
 
-        return pd.Series(min_list)
-
-
-    def _add_room_number(self):
-        data_room_matching = {
-            20181109: 1,
-            20181112: 1,
-            20181115: 1,
-            20181116: 1,
-            20181117: 2,
-            20181118: 2,
-            20181121: 1,
-            20181127: 2,
-            20181128: 2,
-            20181130: 1,
-            20181204: 2,
-            20181205: 2,
-            20181208: 2,
-            20181209: 2,
-            20181211: 3
-        }
-        self.data_label_df["room"] = [data_room_matching[date] for date in self.data_label_df["date"]]
-
-    def _load_label_datafile(self, save_dir) -> pd.DataFrame:
-        data_label_df_list = pd.read_pickle(save_dir+"/labels.pkl")
-        return data_label_df_list
-    
-    @staticmethod
-    def csi_data_loader(data_dir : str) -> np.ndarray:
-        return np.load(data_dir+".npz", allow_pickle=False)
-
-    def __len__(self):
-        return len(self.data_label_df)
-
-    def __getitem__(self, idx):
-        # idx_tuple = self._each_data_idx[idx]
-        # csi_data = self._csi_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
-        #                                                  idx_tuple[2],
-        #                                                  idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value
-        # noise_sigma_data = self._noise_raw_data_list[idx_tuple[0]][idx_tuple[1]: idx_tuple[1]+self._frame_resolution,
-        #                                                      idx_tuple[2],
-        #                                                      idx_tuple[3]: idx_tuple[3]+self._ant_resolution] / self._normalize_value       
-        # # csi_data : (frame, antenna, channel) - complex
-        # # noise_sigma_data : (frame, antenna) - float
-        idx_fname = self.data_label_df.iloc[idx]["file name"]
-        idx_dir = "/".join([self._path, idx_fname])
-        with self.csi_data_loader(idx_dir) as data:
-            csi_data = data["csi"]
-            noise_sigma_data = np.expand_dims(data["noise"], -1)
-            time_data = data["time"]
-        # csi_data : (frame, antenna, channel) - complex
-        # noise_sigma_data : (frame, 1) - float
-
-        if self._transpose is not None:
-            assert noise_sigma_data.ndim == len(self._transpose), f"noise_sigma_data ndim and transpose length mismatch {noise_sigma_data.shape} {len(self._transpose)}"
-            csi_data = np.transpose(csi_data, self._transpose + (2,))
-            noise_sigma_data = np.transpose(noise_sigma_data, self._transpose)
-
-        if not self._view_as_complex:
-            csi_data = np.expand_dims(np.array(csi_data), -1)
-            csi_data = csi_data.view(np.float32)
-
-            if self._complex_merge_axis is not None:
-                csi_data = np.concatenate((np.take(csi_data, 0, axis=-1),
-                                           np.take(csi_data, 1, axis=-1)), axis=self._complex_merge_axis)
+    def filter_files(self, file_paths):
+        filtered_paths = []
         
-        if self._noise_mean_flag:
-            noise_sigma_data = np.mean((noise_sigma_data))
+        must_have = [self.must_have] if isinstance(self.must_have, str) else self.must_have
+        must_not_have = [self.must_not_have] if isinstance(self.must_not_have, str) else self.must_not_have
+        for path in file_paths:
+            os.path.normpath(path)
+            if must_have and not any(fnmatch.fnmatch(path, f'*{feature}*') for feature in must_have):
+                continue
+            if must_not_have and any(fnmatch.fnmatch(path, f'*{feature}*') for feature in must_not_have):
+                continue
+            filtered_paths.append(path)
+        return filtered_paths
+    
+    def split_datasets(self, file_paths):
+        np.random.seed(self.split_seed)
+        np.random.shuffle(file_paths)
+        split_index = int(self.split_ratio * len(file_paths))
+        return file_paths[:split_index], file_paths[split_index:]
+    
+    def get_gesture_num_from_path(self, file_path):
+        # Extract gesture label from file path (assuming format includes '-gestureX-')
+        base_name = os.path.basename(file_path)
+        parts = base_name.split('-')
+        for part in parts:
+            if part.startswith('gesture'):
+                return int(part.replace('gesture', ''))
+        return None  # Return None if no gesture label is found
+    
+    def get_label_from_gesture_num(self, gesture_num):
+        if gesture_num is None:
+            return None
+        
+        label_list = [0, 1, 2, 3, 17, 18]  # Example mapping of gesture numbers to labels
+        label = np.zeros(self._label_dim, dtype=np.float32)
+        if gesture_num in label_list:
+            label[label_list.index(gesture_num)] = 1.0
+        return label
+    
+    def __len__(self):
+        return len(self.live_idx)
+    
+    def __getitem__(self, idx):
+        true_idx = self.live_idx[idx]
+        file_path = self.file_paths[true_idx]
+
+        csi_data = self.csi_data_list[true_idx].copy()
+        noise_sigma_data = self.noise_sigma_list[true_idx].copy()
+        true_length = self.true_length_list[true_idx]
+        label_data = self.label_list[true_idx].copy()
+        axis_name = self._axis_name.copy()
+
+        # 1. Normalize
+        csi_data, noise_sigma_data = self._normalize_data(csi_data, noise_sigma_data)
+        
+        # 2. Transpose
+        csi_data, noise_sigma_data, axis_name = self._apply_transpose(csi_data, noise_sigma_data, axis_name)
+
+        # 3. Handle complex view
+        csi_data, noise_sigma_data, axis_name = self._handle_complex_view(csi_data, noise_sigma_data, axis_name)
+
+        # 4. Apply corruption
+        csi_data, noise_sigma_data, corruption_label = self._apply_corruption(csi_data, noise_sigma_data, idx)
+
+        # 5. Noise mean
+        if self.noise_mean_flag:
+            item = {'sigma': noise_sigma_data}
+            item = self.noise_mean_collate_fn([item])[0]
+            noise_sigma_data = item['sigma']
+
+        if self.view_as_complex:
+            dtype = np.complex64
+        else:
+            dtype = np.float32
 
         return {
-            'image': csi_data.astype(np.float32),
-            "label": np.zeros([self.image_shape[0], 0], dtype=np.float32),
+            'image': csi_data.astype(dtype),
             'sigma': noise_sigma_data.astype(np.float32),
+            'label': label_data.astype(np.float32),
+            'true_length': true_length,
+            'filename': file_path,
             'idx': idx,
-            'filename': idx_fname,
-            "noise": np.random.randn(*csi_data.shape),
+            'corruption_label': corruption_label,
+            'additive_noise_sigma': self.additive_noise_sigma,
+            'complex_merge_axis': self.complex_merge_axis,
+            'axis_name': axis_name,
         }
     
+    @property
+    def __name__(self):
+        return self._name
+
+    @property
+    def image_shape(self):
+        return list(self._image_shape)
+
+    @property
+    def resolution(self):
+        # Returns the shape of the spatial dimensions (all dimensions except the first one).
+        return self.image_shape[1:]
+
     @property
     def name(self):
         return self._name
 
     @property
-    def image_shape(self):
-        return list(self._raw_shape[1:])
+    def label_dim(self):
+        return self._label_dim
 
+    @property
+    def has_labels(self):
+        return True
+    
     @property
     def num_channels(self):
         assert len(self.image_shape) == 3 # CHW
         return self.image_shape[0]
-
-    @property
-    def resolution(self):
-        assert len(self.image_shape) == 3 # CHW
-        return self.image_shape[1:]
-
-    @property
-    def label_shape(self):
-        if self._label_shape is None:
-            raw_labels = self._get_raw_labels()
-            if raw_labels.dtype == np.int64:
-                self._label_shape = [int(np.max(raw_labels)) + 1]
-            else:
-                self._label_shape = raw_labels.shape[1:]
-        return list(self._label_shape)
-
-    @property
-    def label_dim(self):
-        assert len(self.label_shape) == 1
-        return self.label_shape[0]
-
-    @property
-    def has_labels(self):
-        return any(x != 0 for x in self.label_shape)
-
-    @property
-    def has_onehot_labels(self):
-        return self._get_raw_labels().dtype == np.int64
-    
-    @property
-    def get_normalize_value(self):
-        return self._normalize_value
     
     @property
     def calculate_normalized_value(self):
         var_sum = 0.0
         var_count = 0
 
-        for csi_data in self._csi_raw_data_list:
-            var_sum += (np.sum(np.abs(csi_data)**2))
-            var_count += csi_data.size
-
+        for idx in self.live_idx:
+            csi_data = self.csi_data_list[idx]
+            var_sum += (np.sum((csi_data * np.conj(csi_data)).real.flatten()))
+            var_count += csi_data.flatten().size
         return np.sqrt(var_sum / var_count)
 
 
-
 if __name__ == "__main__":
-    pass
+    dataset = WiDARDataset(dir_path="data/widar_preprocess_resized", view_as_complex=True)
+
+    print(dataset.calculate_normalized_value)
