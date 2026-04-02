@@ -1141,7 +1141,7 @@ class WiDARDataset(Dataset):
         self._axis_name = ['antenna', 'frame', 'channel']
         self._label_dim = 6
         self._name = "WiDARDataset"
-        self._image_shape = [3, 512, 30]
+        self._image_shape = [3, 256, 30]
         actual_csi_shape = self._image_shape
 
 

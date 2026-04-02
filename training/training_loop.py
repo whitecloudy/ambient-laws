@@ -214,7 +214,7 @@ def training_loop(
     if task == 'RENEW':  
         interface_kwargs = dict(img_resolution=[16, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_resolution=[16, 32]) # TODO: This is very clumsy. Need to fix ASAP
     elif task == 'WIDAR':
-        interface_kwargs = dict(img_resolution=[512, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_type='classes')
+        interface_kwargs = dict(img_resolution=[256, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_type='classes')
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     with torch.no_grad():

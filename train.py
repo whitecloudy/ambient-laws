@@ -156,12 +156,19 @@ def main(**kwargs):
                                         multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
     elif opts.task == 'WIDAR':
         # dataset_kwargs for WIDAR dataset
+        # TMP: 512 to 256 time scale for now to reduce the computational cost.
         c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
-                                           corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                           only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
-                                           resolution=(3, 512, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
-                                           normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                           multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
+                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
+                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+                                    resolution=(3, 256, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
+                                    normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
+                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
+        # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
+        #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
+        #                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+        #                                    resolution=(3, 512, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
+        #                                    normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
+        #                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
     else:
         raise ValueError(f'Unknown task: {opts.task}')
         
