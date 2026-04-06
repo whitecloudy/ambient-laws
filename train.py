@@ -305,6 +305,7 @@ def main(**kwargs):
         c.run_dir = opts.outdir
     else:
         prev_run_dirs = []
+        opts.outdir = os.path.join(opts.outdir, opts.wandb_group)
         if os.path.isdir(opts.outdir):
             prev_run_dirs = [x for x in os.listdir(opts.outdir) if os.path.isdir(os.path.join(opts.outdir, x))]
         prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
