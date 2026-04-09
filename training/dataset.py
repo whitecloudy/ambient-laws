@@ -1152,6 +1152,7 @@ class WiDARDataset(Dataset):
         csi_data, _, _, _ = _process_widar_file(self.file_paths[self.live_idx[0]], 3, self._label_dim)
 
         self._image_shape = csi_data.shape
+        self._file_image_shape = self._image_shape
 
         if self.transpose is not None:
             actual_csi_shape = self._image_shape
@@ -1207,6 +1208,12 @@ class WiDARDataset(Dataset):
 
 
     def _normalize_data(self, csi_data, noise_sigma_data):
+
+        if self.sigma_norm:
+            # Sigma Normalization
+            csi_data /= np.maximum(noise_sigma_data, 1e-12)
+            noise_sigma_data = np.ones_like(noise_sigma_data)
+
         csi_data /= self.normalize_value
         noise_sigma_data /= self.normalize_value
 
@@ -1214,11 +1221,6 @@ class WiDARDataset(Dataset):
         while len(csi_data.shape) > len(noise_sigma_data.shape):
              noise_sigma_data = np.expand_dims(noise_sigma_data, axis=-1)
         # noise_sigma_data : (frame, antenna, 1) - float
-
-        if self.sigma_norm:
-            # Sigma Normalization
-            csi_data /= np.maximum(noise_sigma_data, 1e-12)
-            noise_sigma_data = np.ones_like(noise_sigma_data)
 
         return csi_data, noise_sigma_data
 
@@ -1299,7 +1301,7 @@ class WiDARDataset(Dataset):
         file_path = self.file_paths[true_idx]
 
         csi_data, noise_sigma_data, true_length, label_data = _process_widar_file(file_path, 3, self._label_dim)
-        assert csi_data.shape == self._image_shape, f"Error: Expected CSI data shape {self._image_shape}, but got {csi_data.shape} for file {file_path}"
+        assert csi_data.shape == self._file_image_shape, f"Error: Expected CSI data shape {self._file_image_shape}, but got {csi_data.shape} for file {file_path}"
         axis_name = self._axis_name.copy()
 
         # 1. Normalize
@@ -1375,7 +1377,8 @@ class WiDARDataset(Dataset):
 
         for idx in tqdm(self.live_idx, desc="Calculating normalized value"):
             file_path = self.file_paths[idx]
-            csi_data, _, _, _ = _process_widar_file(file_path, 3, self._label_dim)
+            csi_data, noise_sigma_data, _, _ = _process_widar_file(file_path, 3, self._label_dim)
+            csi_data, noise_sigma_data = self._normalize_data(csi_data, noise_sigma_data)
             var_sum += (np.sum((csi_data * np.conj(csi_data)).real.flatten()))
             var_count += csi_data.flatten().size
         return np.sqrt(var_sum / var_count)
