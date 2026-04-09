@@ -1267,7 +1267,7 @@ class WiDARDataset(Dataset):
         return filtered_paths
     
     def split_datasets(self, file_paths):
-        split_shuffler = np.random.Generator(seed=self.split_seed)
+        split_shuffler = np.random.default_rng(seed=self.split_seed)
         split_shuffler.shuffle(file_paths)
         split_index = int(self.split_ratio * len(file_paths))
         return file_paths[:split_index], file_paths[split_index:]
@@ -1375,13 +1375,15 @@ class WiDARDataset(Dataset):
 
         for idx in tqdm(self.live_idx, desc="Calculating normalized value"):
             file_path = self.file_paths[idx]
-            csi_data, _, _, _ = _process_widar_file((file_path, 3, self._label_dim))
+            csi_data, _, _, _ = _process_widar_file(file_path, 3, self._label_dim)
             var_sum += (np.sum((csi_data * np.conj(csi_data)).real.flatten()))
             var_count += csi_data.flatten().size
         return np.sqrt(var_sum / var_count)
 
 
 if __name__ == "__main__":
-    dataset = WiDARDataset(dir_path="data/widar_preprocess_resized", view_as_complex=True)
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else "data/widar_preprocess_resized"
+    dataset = WiDARDataset(path=path, view_as_complex=True)
 
     print(dataset.calculate_normalized_value)
