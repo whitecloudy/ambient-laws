@@ -596,7 +596,7 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         out_channels,                       # Number of color channels at output.
         label_dim           = 0,            # Number of class labels, 0 = unconditional.
         label_resolution    = None,         # Label resolution
-        label_type          = 'downlink',
+        label_type          = 'classes',
         augment_dim         = 0,            # Augmentation label dimensionality, 0 = no augmentation.
 
         model_channels      = 128,          # Base multiplier for the number of channels.
@@ -618,7 +618,7 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
         assert decoder_type in ['standard', 'skip']
-        assert label_type in ['downlink', 'classes']
+        assert label_type in ['sigma', 'both', 'classes']
 
         super().__init__()
         self.label_dropout = label_dropout
@@ -638,7 +638,7 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
         if label_dim != 0:
-            if label_type == 'downlink':
+            if label_type == 'sigma':
                 if label_resolution == None:
                     label_resolution = img_resolution
                 flatten_feature_size = label_resolution[0]//4 * label_resolution[1]//4 * model_channels
@@ -658,6 +658,25 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 )
             elif label_type == 'classes':
                 self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init)
+            elif label_type == 'both':
+                if label_resolution == None:
+                    label_resolution = img_resolution
+                flatten_feature_size = label_resolution[0]//4 * label_resolution[1]//4 * model_channels
+                self.map_label = (torch.nn.Sequential(
+                    (OrderedDict([
+                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=kernel_size, **init)),    # RT : (model_channels, label_resolution[0], label_resolution[1])
+                                ("SiLU 1", torch.nn.SiLU()),
+                                ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, **init)),    # RT : (model_channels, label_resolution[0]//2, label_resolution[1]//2)
+                                ("SiLU 2", torch.nn.SiLU()),
+                                ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, **init)),    # RT : (model_channels, label_resolution[0]//4, label_resolution[1]//4)
+                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * label_resolution[0]//4 * label_resolution[1]//4)
+                                ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
+                                ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
+                    ])),
+                ),
+                Linear(in_features=label_dim, out_features=noise_channels, **init))
             else:  
                 assert False, "Unknown label type"
         else:
@@ -731,12 +750,16 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 label_dropout_table = torch.unsqueeze(torch.unsqueeze((torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype), dim=-1), dim=-1)
 
                 tmp = tmp * label_dropout_table
-            if self.label_type == 'downlink':
+            if self.label_type == 'sigma':
                 label_emb = self.map_label(tmp)
                 # emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
                 emb = torch.concatenate([emb, label_emb], dim=1)
             elif self.label_type == 'classes':
                 emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+            elif self.label_type == 'both':
+                emb = emb + self.map_label[1](tmp[1] * np.sqrt(self.map_label[1].in_features))
+                label_emb = self.map_label[0](tmp[0])
+                emb = torch.concatenate([emb, label_emb], dim=1)
             else:
                 assert False, "Unknown label type"
         emb = silu(self.map_layer0(emb))

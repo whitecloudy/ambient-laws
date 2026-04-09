@@ -33,20 +33,30 @@ class EDMLoss:
         self.with_weight = with_weight
         self.with_grad = with_grad
 
-    def __call__(self, net, images, labels=None, current_sigma=0.0, augment_pipe=None):
-
+    def __call__(self, net, images, labels=None, current_sigma=0.0, augment_pipe=None, original_shape=None):
+        current_sigma = torch.tensor(current_sigma)
         # net._set_static_graph()
-        current_sigma = current_sigma.unsqueeze(1).unsqueeze(1).unsqueeze(1)
+        while current_sigma.ndim < images.ndim:
+            current_sigma = current_sigma.unsqueeze(-1)
+        # current_sigma = current_sigma.unsqueeze(1).unsqueeze(1).unsqueeze(1)
 
-        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()        
-        sigma = torch.clamp(sigma, min=current_sigma*1.005)
+        sigma = torch.clamp(sigma, min=current_sigma + 1e-5)
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         
         # add additional noise to reach the level sigma
         n = torch.randn_like(y) * torch.sqrt(sigma ** 2 - current_sigma ** 2)
-        noisy_input = y + n
+        if original_shape is not None:
+            padding_mask = torch.zeros_like(n)
+            for i in range(n.shape[0]):
+                slices = (i,) + tuple(slice(0, int(dim)) for dim in original_shape[i])
+                padding_mask[slices] = 1
+        else:
+            padding_mask = torch.ones_like(y)
+
+        noisy_input = (y + n) * padding_mask
         x0_pred = net(noisy_input, sigma, labels, augment_labels=augment_labels)
         # make it xtn prediction
         D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
@@ -68,16 +78,19 @@ class EDMLoss:
             sigma = sigma[:consistency_batch_size]
             new_sigma = new_sigma[:consistency_batch_size]
             labels = labels[:consistency_batch_size]
+            padding_mask = padding_mask[:consistency_batch_size]
+
             # repeat everything num_primes times
             noisy_input = noisy_input.repeat_interleave(self.num_primes, dim=0)
             sigma = sigma.repeat_interleave(self.num_primes, dim=0)
             new_sigma = new_sigma.repeat_interleave(self.num_primes, dim=0)
             labels = labels.repeat_interleave(self.num_primes, dim=0)
+            padding_mask = padding_mask.repeat_interleave(self.num_primes, dim=0)
 
             # run sampler from sigma -> new_sigma
             with torch.no_grad() if not self.with_grad else torch.enable_grad():
                 x_t_prime = edm_sampler(net, noisy_input, class_labels=labels, num_steps=self.num_consistency_steps, 
-                                        sigma_min=new_sigma, sigma_max=sigma) 
+                                        sigma_min=new_sigma, sigma_max=sigma, padding_mask=padding_mask) 
             # get predictions for x_t_prime
             x0_pred_prime = net(x_t_prime, new_sigma, labels)
             # group together predictions
@@ -88,6 +101,8 @@ class EDMLoss:
             consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
             consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
             loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
+        
+        loss = loss * padding_mask
         return loss, x0_pred, return_sigma
 
 #----------------------------------------------------------------------------

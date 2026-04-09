@@ -291,20 +291,20 @@ def training_loop(
                 if no_asm:
                     current_sigma = torch.zeros_like(current_sigma)
 
-                loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe)
+                loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe, original_shape=original_shape)
                 
-                if original_shape is not None:
-                    # Create a mask to zero out the loss on padded areas.
-                    # loss is expected to be of shape (N, C, H, W)
-                    mask = torch.zeros_like(loss)
-                    for i in range(loss.shape[0]):
-                        # Get original shape for the i-th image
-                        _, h, w = original_shape[i]
-                        # Set mask to 1 for the original image area
-                        mask[i, :, :h, :w] = 1
-                else:
-                    mask = 1
-                loss = loss * mask
+                # if original_shape is not None:
+                #     # Create a mask to zero out the loss on padded areas.
+                #     # loss is expected to be of shape (N, C, H, W)
+                #     mask = torch.zeros_like(loss)
+                #     for i in range(loss.shape[0]):
+                #         # Get original shape for the i-th image
+                #         _, h, w = original_shape[i]
+                #         # Set mask to 1 for the original image area
+                #         mask[i, :, :h, :w] = 1
+                # else:
+                #     mask = 1
+                # loss = loss * mask
                 training_stats.report('Loss/loss', loss)
                 (loss).sum().mul(loss_scaling / batch_gpu_total).backward()
 
