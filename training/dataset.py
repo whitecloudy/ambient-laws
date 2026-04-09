@@ -1031,8 +1031,7 @@ def pad_collate_fn(batch):
 import multiprocessing as mp
 from tqdm import tqdm
 
-def _process_widar_file(args):
-    file_path, ant_size, label_dim = args
+def _process_widar_file(file_path, ant_size, label_dim):
     with np.load(file_path) as file_data:
         csi_data = file_data['csi_data'].astype(np.complex64)
         csi_data = np.split(csi_data, axis=1, indices_or_sections=ant_size)
@@ -1068,6 +1067,7 @@ class WiDARDataset(Dataset):
                  must_contain="regex:gesture(0|1|2|3|17|18)(?!\d)", 
                  must_not_contain=None,
                  normalize_value=1.0,
+                 sigma_norm = False,
                  transpose=None,
                  view_as_complex=False,
                  complex_merge_axis=0,
@@ -1084,7 +1084,7 @@ class WiDARDataset(Dataset):
                  cache = None,
                  sigma = 0.0,
                  only_positive = False,
-                 resolution = None,
+                 resolution = (3, 256, 30),
                  max_size = None,
                  ):
         self.dir_path = path
@@ -1094,6 +1094,7 @@ class WiDARDataset(Dataset):
         self.must_contain = must_contain
         self.must_not_contain = must_not_contain
         self.normalize_value = normalize_value
+        self.sigma_norm = sigma_norm
         self.transpose = tuple(transpose) if transpose is not None else None
         self.view_as_complex = view_as_complex
         self.complex_merge_axis = complex_merge_axis
@@ -1141,9 +1142,16 @@ class WiDARDataset(Dataset):
         self._axis_name = ['antenna', 'frame', 'channel']
         self._label_dim = 6
         self._name = "WiDARDataset"
-        self._image_shape = [3, 256, 30]
+        self._image_shape = resolution 
         actual_csi_shape = self._image_shape
 
+        self.idx_list = np.arange(len(self.file_paths))
+        self.live_idx, self.dead_idx = self.split_datasets(self.idx_list)
+
+        # Load one sample to determine the shape of the csi data.
+        csi_data, _, _, _ = _process_widar_file(self.file_paths[self.live_idx[0]], 3, self._label_dim)
+
+        self._image_shape = csi_data.shape
 
         if self.transpose is not None:
             actual_csi_shape = self._image_shape
@@ -1167,9 +1175,6 @@ class WiDARDataset(Dataset):
         self._name = "WiDARDataset"
         # --- End of shape calculation logic ---
 
-        self.idx_list = np.arange(len(self.file_paths))
-
-        self.live_idx, self.dead_idx = self.split_datasets(self.idx_list)
 
         self.transpose_collate_fn = TransposeCollateFn(self.transpose)
         self.complex_view_collate_fn = ComplexViewCollateFn(self.view_as_complex, self.complex_merge_axis)
@@ -1204,6 +1209,17 @@ class WiDARDataset(Dataset):
     def _normalize_data(self, csi_data, noise_sigma_data):
         csi_data /= self.normalize_value
         noise_sigma_data /= self.normalize_value
+
+        # fit noise_sigma_data shape to csi_data shape for later processing
+        while len(csi_data.shape) > len(noise_sigma_data.shape):
+             noise_sigma_data = np.expand_dims(noise_sigma_data, axis=-1)
+        # noise_sigma_data : (frame, antenna, 1) - float
+
+        if self.sigma_norm:
+            # Sigma Normalization
+            csi_data /= np.maximum(noise_sigma_data, 1e-12)
+            noise_sigma_data = np.ones_like(noise_sigma_data)
+
         return csi_data, noise_sigma_data
 
     def _apply_transpose(self, csi_data, noise_sigma_data, axis_name):
@@ -1251,8 +1267,8 @@ class WiDARDataset(Dataset):
         return filtered_paths
     
     def split_datasets(self, file_paths):
-        np.random.seed(self.split_seed)
-        np.random.shuffle(file_paths)
+        split_shuffler = np.random.Generator(seed=self.split_seed)
+        split_shuffler.shuffle(file_paths)
         split_index = int(self.split_ratio * len(file_paths))
         return file_paths[:split_index], file_paths[split_index:]
     
@@ -1282,7 +1298,8 @@ class WiDARDataset(Dataset):
         true_idx = self.live_idx[idx]
         file_path = self.file_paths[true_idx]
 
-        csi_data, noise_sigma_data, true_length, label_data = _process_widar_file((file_path, 3, self._label_dim))
+        csi_data, noise_sigma_data, true_length, label_data = _process_widar_file(file_path, 3, self._label_dim)
+        assert csi_data.shape == self._image_shape, f"Error: Expected CSI data shape {self._image_shape}, but got {csi_data.shape} for file {file_path}"
         axis_name = self._axis_name.copy()
 
         # 1. Normalize

@@ -99,6 +99,7 @@ def parse_int_list(s):
 @click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
 @click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
 @click.option('--data_norm', help='Data normalization value for the RF data.', type=float, default=1.0, show_default=True)
+@click.option('--sigma_norm', help='Normalize data with sigma',                            is_flag=True)
 @click.option('--flip_aug_ratio', help='Ratio of flip augmentation.', type=float, default=0.0, show_default=True)
 @click.option('--phase_shift_aug_ratio', help='Ratio of phase shift augmentation.', type=float, default=0.0, show_default=True)
 
@@ -162,7 +163,7 @@ def main(**kwargs):
                                     only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
                                     resolution=(3, 256, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                     normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
+                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm)
         # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
         #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
         #                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
