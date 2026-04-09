@@ -17,6 +17,13 @@ from training.sampler import edm_sampler
 # Improved loss function proposed in the paper "Elucidating the Design Space
 # of Diffusion-Based Generative Models" (EDM).
 
+def padding_mask_from_original_shape(original_shape, target_shape):
+    padding_mask = torch.zeros(target_shape, device=original_shape.device)
+    for i in range(target_shape[0]):
+        slices = (i,) + tuple(slice(0, int(dim)) for dim in original_shape[i])
+        padding_mask[slices] = 1
+    return padding_mask
+
 @persistence.persistent_class
 class EDMLoss:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
@@ -49,10 +56,7 @@ class EDMLoss:
         # add additional noise to reach the level sigma
         n = torch.randn_like(y) * torch.sqrt(sigma ** 2 - current_sigma ** 2)
         if original_shape is not None:
-            padding_mask = torch.zeros_like(n)
-            for i in range(n.shape[0]):
-                slices = (i,) + tuple(slice(0, int(dim)) for dim in original_shape[i])
-                padding_mask[slices] = 1
+            padding_mask = padding_mask_from_original_shape(original_shape, n.shape)
         else:
             padding_mask = torch.ones_like(y)
 
@@ -77,14 +81,16 @@ class EDMLoss:
             noisy_input = noisy_input[:consistency_batch_size]
             sigma = sigma[:consistency_batch_size]
             new_sigma = new_sigma[:consistency_batch_size]
-            labels = labels[:consistency_batch_size]
+            if labels is not None:
+                labels = labels[:consistency_batch_size]
             padding_mask = padding_mask[:consistency_batch_size]
 
             # repeat everything num_primes times
             noisy_input = noisy_input.repeat_interleave(self.num_primes, dim=0)
             sigma = sigma.repeat_interleave(self.num_primes, dim=0)
             new_sigma = new_sigma.repeat_interleave(self.num_primes, dim=0)
-            labels = labels.repeat_interleave(self.num_primes, dim=0)
+            if labels is not None:
+                labels = labels.repeat_interleave(self.num_primes, dim=0)
             padding_mask = padding_mask.repeat_interleave(self.num_primes, dim=0)
 
             # run sampler from sigma -> new_sigma

@@ -200,7 +200,9 @@ def training_loop(
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dist.print0('Sampler Loading completed...')
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
-    
+    dataset_item = next(dataset_iterator)
+    dataset_shape = dataset_item["image"].shape
+    dist.print0(f'Dataset image shape: {dataset_shape}')
     # Initialize temporary directory for training state dumps
     if dist.get_rank() == 0:
         run_dir_name = os.path.basename(os.path.normpath(run_dir))
@@ -212,9 +214,9 @@ def training_loop(
     dist.print0('Constructing network...')
     # interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
     if task == 'RENEW':  
-        interface_kwargs = dict(img_resolution=[16, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_resolution=[16, 32]) # TODO: This is very clumsy. Need to fix ASAP
+        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_resolution=dataset_shape[-2:]) # TODO: This is very clumsy. Need to fix ASAP
     elif task == 'WIDAR':
-        interface_kwargs = dict(img_resolution=[256, 32], img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim, label_type='classes')
+        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_type='classes')
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     with torch.no_grad():
