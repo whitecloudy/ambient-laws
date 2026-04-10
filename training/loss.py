@@ -8,6 +8,7 @@
 """Loss functions used in the paper
 "Elucidating the Design Space of Diffusion-Based Generative Models"."""
 
+from numpy import pad
 import torch
 from torch_utils import persistence
 import ambient_utils
@@ -83,7 +84,7 @@ class EDMLoss:
             new_sigma = new_sigma[:consistency_batch_size]
             if labels is not None:
                 labels = labels[:consistency_batch_size]
-            padding_mask = padding_mask[:consistency_batch_size]
+            edm_padding_mask = padding_mask[:consistency_batch_size]
 
             # repeat everything num_primes times
             noisy_input = noisy_input.repeat_interleave(self.num_primes, dim=0)
@@ -91,12 +92,12 @@ class EDMLoss:
             new_sigma = new_sigma.repeat_interleave(self.num_primes, dim=0)
             if labels is not None:
                 labels = labels.repeat_interleave(self.num_primes, dim=0)
-            padding_mask = padding_mask.repeat_interleave(self.num_primes, dim=0)
+            edm_padding_mask = edm_padding_mask.repeat_interleave(self.num_primes, dim=0)
 
             # run sampler from sigma -> new_sigma
             with torch.no_grad() if not self.with_grad else torch.enable_grad():
                 x_t_prime = edm_sampler(net, noisy_input, class_labels=labels, num_steps=self.num_consistency_steps, 
-                                        sigma_min=new_sigma, sigma_max=sigma, padding_mask=padding_mask) 
+                                        sigma_min=new_sigma, sigma_max=sigma, padding_mask=edm_padding_mask) 
             # get predictions for x_t_prime
             x0_pred_prime = net(x_t_prime, new_sigma, labels)
             # group together predictions
