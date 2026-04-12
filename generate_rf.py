@@ -294,11 +294,15 @@ def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_si
         torch.distributed.barrier()
 
     if original_shape is not None:
-        target_shape = net._image_shape
-        padding_mask = padding_mask_from_original_shape(torch.tensor(original_shape), target_shape)
-        dist.print0(f'Using padding mask with original shape {original_shape} and target shape {target_shape}')
+        target_shape = (1, net.img_channels, net.img_resolution[0], net.img_resolution[1])
+        input_original_shape = torch.tensor(original_shape)
+        input_original_shape = input_original_shape.unsqueeze(0) # add batch dimension
+        padding_mask = padding_mask_from_original_shape(input_original_shape, target_shape)
+        dist.print0(f'Using padding mask with original shape {input_original_shape} and target shape {target_shape}')
     else:
         padding_mask = 1
+    
+    padding_mask = torch.tensor(padding_mask, device=device)
 
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
