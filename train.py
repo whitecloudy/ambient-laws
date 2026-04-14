@@ -51,7 +51,7 @@ def parse_int_list(s):
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp_256', 'ddpmpp_192','ddpmpp', 'ncsnpp', 'adm', 'widar_ddpmpp', 'widar_ddpmpp_stem']), default='ddpmpp', show_default=True)
+@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp_256', 'ddpmpp_192','ddpmpp', 'ncsnpp', 'adm', 'widar_ddpmpp', 'widar_ddpmpp_stem256']), default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
@@ -218,7 +218,7 @@ def main(**kwargs):
     elif opts.arch == 'widar_ddpmpp':
         c.network_kwargs.update(model_type='WiDAR_RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[[1,1,1,1],[1,1]], resample_stride=[4,2], model_channels=16, channel_mult=[1,2,2,2], kernel_size = [9,3])
-    elif opts.arch == 'widar_ddpmpp_stem':
+    elif opts.arch == 'widar_ddpmpp_stem256':
         c.network_kwargs.update(model_type='WiDAR_RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,1,2,2], kernel_size=[3,3], stem_stride=[8,1], stem_kernel=[24,3], attn_resolutions=[16, 8])
     elif opts.arch == 'ddpmpp_256':
