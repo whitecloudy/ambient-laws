@@ -896,20 +896,25 @@ class rf_augmentation_collate_fn(object):
                 real_part, imag_part = np.split(img, 2, axis=complex_axis)
                 img = real_part + 1j * imag_part
 
-                real_part, imag_part = np.split(label, 2, axis=complex_axis)
-                label = real_part + 1j * imag_part
+                if label.size > 0:
+                    real_part, imag_part = np.split(label, 2, axis=complex_axis)
+                    label = real_part + 1j * imag_part
 
             # 랜덤한 위상 이동 생성 (0에서 2π 사이)
             random_phase = np.random.uniform(0, 2 * np.pi)
 
             # 이미지에 위상 이동 적용 (복소수 데이터라고 가정)
             shifted_img = img * np.exp(1j * random_phase)
-            shifted_label = label * np.exp(1j * random_phase)
+            if label.size > 0:
+                shifted_label = label * np.exp(1j * random_phase)
+            else:
+                shifted_label = label
 
             if complex_axis is not None:
                 # 다시 실수 형태로 변환
-                shifted_img = np.stack((shifted_img.real, shifted_img.imag), axis=complex_axis)
-                shifted_label = np.stack((shifted_label.real, shifted_label.imag), axis=complex_axis)
+                shifted_img = np.concatenate((shifted_img.real, shifted_img.imag), axis=complex_axis)
+                if shifted_label.size > 0:
+                    shifted_label = np.concatenate((shifted_label.real, shifted_label.imag), axis=complex_axis)
 
             item['image'] = shifted_img
             item['label'] = shifted_label
