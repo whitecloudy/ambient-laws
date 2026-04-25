@@ -169,8 +169,8 @@ def main(**kwargs):
                                 group=opts.wandb_group,
                                 dir=opts.outdir,
                                 id=wandb_id, resume="allow" if wandb_id is not None else 'auto')
-        c.wandb_id = wandb_run.id
-        dist.print0(f"Wandb ID: {c.wandb_id}")
+        wandb_id = wandb_run.id
+        dist.print0(f"Wandb ID: {wandb_id}")
         
 
     if opts.task == 'RENEW':
@@ -355,25 +355,27 @@ def main(**kwargs):
     c.no_asm = opts.no_asm
 
     # Print options.
-    dist.print0()
-    dist.print0('Training options:')
-    # Create a deep copy for JSON serialization
-    c_json = copy.deepcopy(c)
-    # Convert function object to its name for serialization
-    if 'collate_fn' in c_json.data_loader_kwargs and callable(c_json.data_loader_kwargs.collate_fn):
-        c_json.data_loader_kwargs.collate_fn = c_json.data_loader_kwargs.collate_fn.__name__
-    print(c_json.data_loader_kwargs.collate_fn)
-    dist.print0(json.dumps(c_json, indent=2))
-    dist.print0()
-    dist.print0(f'Output directory:        {c.run_dir}')
-    dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
-    dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
-    dist.print0(f'Network architecture:    {opts.arch}')
-    dist.print0(f'Preconditioning & loss:  {opts.precond}')
-    dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
-    dist.print0(f'Batch size:              {c.batch_size}')
-    dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
-    dist.print0()
+    if dist.get_rank() == 0:
+        dist.print0()
+        dist.print0('Training options:')
+        # Create a deep copy for JSON serialization
+        c_json = copy.deepcopy(c)
+        c_json.wandb_id = wandb_id if opts.wandb else None
+        # Convert function object to its name for serialization
+        if 'collate_fn' in c_json.data_loader_kwargs and callable(c_json.data_loader_kwargs.collate_fn):
+            c_json.data_loader_kwargs.collate_fn = c_json.data_loader_kwargs.collate_fn.__name__
+        print(c_json.data_loader_kwargs.collate_fn)
+        dist.print0(json.dumps(c_json, indent=2))
+        dist.print0()
+        dist.print0(f'Output directory:        {c.run_dir}')
+        dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
+        dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
+        dist.print0(f'Network architecture:    {opts.arch}')
+        dist.print0(f'Preconditioning & loss:  {opts.precond}')
+        dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
+        dist.print0(f'Batch size:              {c.batch_size}')
+        dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
+        dist.print0()
 
     # Dry run?
     if opts.dry_run:
