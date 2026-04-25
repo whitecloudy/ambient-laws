@@ -343,6 +343,7 @@ def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_si
 
     # Done.
     torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
     dist.print0('Done.')
 
 #----------------------------------------------------------------------------

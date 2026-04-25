@@ -90,6 +90,7 @@ def parse_int_list(s):
 @click.option('--seed',          help='Random seed  [default: random]', metavar='INT',              type=int)
 @click.option('--transfer',      help='Transfer learning from network pickle', metavar='PKL|URL',   type=str)
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
+@click.option('--resume_options',help='Resume from previous training options', metavar='JSON',      type=str, default=None)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
 
 # RF dataset related
@@ -138,21 +139,38 @@ def main(**kwargs):
     opts = dnnlib.EasyDict(kwargs)
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
+    
+    # Initialize config dict.
+    c = dnnlib.EasyDict()
 
     if opts.debug_test:
         opts.wandb = False
         opts.expr_id = 'debug_test'
         opts.wandb_group = 'debug'
 
+    if dist.get_rank() == 0 and opts.resume_options is not None and opts.resume is not None:
+        with open(opts.resume_options, 'r') as f:
+            resume_options = json.load(f)
+    else:
+        resume_options = None
 
     if dist.get_rank() == 0 and opts.wandb:
-        wandb.init(project="ambient_rf", 
-                   config=opts, name=opts.expr_id,
-                   group=opts.wandb_group,
-                   dir=opts.outdir)
+        # If there is resume_options is exist, and we are resuming from a certain checkpoint, then we will load and search for wandb ID. And if it exists, we will resume the wandb run only.
+        wandb_id = None
+        if resume_options is not None:
+            if 'wandb_id' in resume_options:
+                wandb_id = resume_options['wandb_id']
+                dist.print0(f"Resumed Wandb run with ID: {wandb_id}")
+            else:
+                dist.print0("No Wandb ID found in resume options, starting a new Wandb run.")
 
-    # Initialize config dict.
-    c = dnnlib.EasyDict()
+        wandb_run = wandb.init(project="ambient_rf", 
+                                config=opts, name=opts.expr_id,
+                                group=opts.wandb_group,
+                                dir=opts.outdir,
+                                id=wandb_id, resume="allow" if wandb_id is not None else 'auto')
+        c.wandb_id = wandb_run.id
+        dist.print0(f"Wandb ID: {c.wandb_id}")
         
 
     if opts.task == 'RENEW':
@@ -318,6 +336,9 @@ def main(**kwargs):
         c.run_dir = None
     elif opts.nosubdir:
         c.run_dir = opts.outdir
+    elif resume_options is not None and 'run_dir' in resume_options:
+        c.run_dir = resume_options['run_dir']
+        dist.print0(f"Resuming training run in directory: {c.run_dir}")
     else:
         prev_run_dirs = []
         opts.outdir = os.path.join(opts.outdir, opts.wandb_group)
