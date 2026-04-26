@@ -168,7 +168,7 @@ def main(**kwargs):
                                 config=opts, name=opts.expr_id,
                                 group=opts.wandb_group,
                                 dir=opts.outdir,
-                                id=wandb_id, resume="allow" if wandb_id is not None else 'auto')
+                                id=wandb_id, resume="allow" if wandb_id is not None else 'never')
         wandb_id = wandb_run.id
         dist.print0(f"Wandb ID: {wandb_id}")
         
