@@ -110,6 +110,7 @@ def parse_int_list(s):
 @click.option('--dataset_keep_percentage', help='Limit training samples.', type=float, default=1.0, show_default=True)
 @click.option('--additive_noise_sigma', help='Standard deviation of the additive noise to be added to the clean images during corruption.', type=float, default=0.0, show_default=True)
 @click.option('--multiply_noise_sigma', help='Multiplying factor of the noise to be added to the clean images during corruption.', type=float, default=1.0, show_default=True)
+@click.option('--noise_mean_alter_way', help='Whether to use alternative way to add noise, which is to directly add noise with the given sigma without multiplying with the clean image.', is_flag=True, default=False)
 @click.option('--only_additive_noise', help='Whether to only use additive noise for corruption without natural noise.', is_flag=True)
 
 # Consistency params
@@ -180,7 +181,8 @@ def main(**kwargs):
                                         only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
                                         resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                         normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                        multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
+                                        multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, 
+                                        noise_mean_alter_way=opts.noise_mean_alter_way)
     elif opts.task == 'WIDAR':
         # dataset_kwargs for WIDAR dataset
         # TMP: 512 to 256 time scale for now to reduce the computational cost.
