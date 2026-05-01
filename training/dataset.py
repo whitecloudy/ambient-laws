@@ -791,6 +791,8 @@ class AlternativeCorruptionCollateFn(object):
                 target_noise_sigma = noise_sigma_data * multiply_noise_sigma 
 
                 if self.only_additive_noise:
+                    # sigma_target = sigma/(E[sigma^2]^0.5) * sigma_additive
+                    # sigma/(E[sigma^2]^0.5) : Normalized sigma
                     target_noise_sigma = target_noise_sigma - noise_sigma_data
                     sigma_will_be_added = target_noise_sigma
                     final_noise_sigma = target_noise_sigma

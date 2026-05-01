@@ -24,7 +24,7 @@ def init():
         os.environ['WORLD_SIZE'] = '1'
 
     backend = 'gloo' if os.name == 'nt' else 'nccl'
-    torch.distributed.init_process_group(backend=backend, init_method='env://')
+    torch.distributed.init_process_group(backend=backend, init_method='env://', device_id=int(os.environ.get('LOCAL_RANK', '0')))
     torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 
     sync_device = torch.device('cuda') if get_world_size() > 1 else None
