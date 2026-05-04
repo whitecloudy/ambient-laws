@@ -20,7 +20,7 @@ from torch_utils import distributed as dist
 import joblib
 from huggingface_hub import hf_hub_download
 import json
-from training.loss import padding_mask_from_original_shape
+from training.sampler import padding_mask_from_original_shape
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
 

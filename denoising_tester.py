@@ -9,18 +9,16 @@ import json
 import tqdm
 from training.sampler import inference_edm_sampler as edm_sampler
 from training.sampler import padding_mask_from_original_shape
-from training.dataset import renewRfDataset, renewRfProcessedDataset, widarRfDataset, widar_collate_fn
+from training.dataset import  renewRfProcessedDataset
 
 def _power2ceil(original):
     return int(2**np.ceil(np.log2(original)))
 
-def pad_collate_fn(batch):
+def pad_collate_fn(img, label=None):
     """
     default_collate_fn을 통과하여 텐서 배치 형태(dict)로 묶인 데이터를
     2의 거듭제곱 크기로 패딩합니다.
     """
-    img = batch['image']
-    label = batch['label']
 
     # 배치로 묶인 텐서의 마지막 두 차원을 H, W로 간주 (N, C, H, W)
     h, w = img.shape[-2], img.shape[-1]
@@ -33,18 +31,18 @@ def pad_collate_fn(batch):
 
     # 패딩 전 원래의 형태 정보(C, H, W)를 배치 사이즈(N)만큼 생성하여 저장
     original_shape = torch.tensor(img.shape[1:], dtype=torch.long, device=img.device)
-    batch['original_shape'] = original_shape.unsqueeze(0).expand(img.shape[0], -1).clone()
+    original_shape = original_shape.unsqueeze(0).expand(img.shape[0], -1)
 
     if pad_h > 0 or pad_w > 0:
         # torch.nn.functional.pad는 뒤에서부터 (left, right, top, bottom) 순서로 적용
         pad_width = (0, pad_w, 0, pad_h)
-        batch['image'] = torch.nn.functional.pad(img, pad_width, mode='constant', value=0)
+        img = torch.nn.functional.pad(img, pad_width, mode='constant', value=0)
 
         # image와 label의 shape이 같으면(예: segmentation) label도 동일하게 패딩
-        if img.shape == label.shape:
-            batch['label'] = torch.nn.functional.pad(label, pad_width, mode='constant', value=0)
+        if label is not None and img.shape == label.shape:
+            label = torch.nn.functional.pad(label, pad_width, mode='constant', value=0)
 
-    return batch
+    return img, label, original_shape
 
 
 def dB_to_ratio(dB):
@@ -56,7 +54,7 @@ def ratio_to_dB(ratio):
 
 def _match_axis(source: torch.Tensor, target: torch.Tensor):
     if source.ndim >= target.ndim:
-        print("Warning: we cannot match axis if source ndim is larger than target ndim.")
+        # print(f"Warning: we cannot match axis if source ndim (={source.ndim}) is larger than target ndim (={target.ndim}). ")
         return source
     else:
         return_tensor = source
@@ -104,19 +102,20 @@ def parse_int_list(s):
 
 @click.command()
 @click.option('--batch_size', default=64, help='Batch size for testing the sampler.')
-@click.option('--network_pkl', help='Network pickle filename', metavar='PATH|URL',                     type=str, required=True)
+@click.option('--network_pkl', help='Network pickle filename', metavar='PATH|URL',                                  type=str, required=True)
 @click.option('--config_json',              help='Network config json filename', metavar='PATH|URL',                type=str, default=None, show_default=True)
 @click.option('--seed',                     help='Random seed', metavar='INT',                                      type=int, default=11454, show_default=True)
 @click.option('--subdirs',                  help='Create subdirectory for every 1000 seeds',                        is_flag=True)
+
 @click.option('--data',                     help='Path to the dataset', metavar='ZIP|DIR',                          type=str, required=True)
 @click.option('--data_keep_ratio',          help='How much data keeping ratio', metavar='FLOAT',                    type=float, default=1.0, show_default=True)
 @click.option('--must_contain',             help='Dataset name should contain', metavar='STR',                      type=str, default=None, show_default=True)
 @click.option('--must_not_contain',         help='Dataset name should not contain', metavar='STR',                  type=str, default=None, show_default=True)
 @click.option('--flip_dataset',             help='Whether to flip the dataset to use the removed data',             is_flag=True)
-@click.option('--test_SNR_range',           help='SNR range will be tested',                                        type=str, default='5,20', show_default=True)
-@click.option('--test_SNR_step',            help='SNR step will be tested',                                         type=float, default=1.0, show_default=True)
+@click.option('--test_SNR_range', 'test_SNR_range', help='SNR range will be tested', metavar='STR',                 type=str, default='5,20', show_default=True)
+@click.option('--test_SNR_step', 'test_SNR_step',   help='SNR step will be tested',                                 type=float, default=1.0, show_default=True)
 @click.option('--same_sigma_level',         help='Whether use same sigma level across all signal matrix',           is_flag=True)
-@click.option('--output',                   help='Output directory or file path for saving the CSV results.', type=str, default=None)
+@click.option('--output',                   help='Output directory or file path for saving the CSV results.',       type=str, default=None)
 
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
@@ -127,7 +126,6 @@ def parse_int_list(s):
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
 @click.option('--data_norm',               help='Data normalization value for the RF data.',                        type=float, default=1.0, show_default=True)
-@click.option('--original_shape',          help='Original shape of the RF data before padding, in the format C,H,W. Used to create a padding mask for the loss function.', type=parse_int_list, default=None)
 def main(**kwargs):
     dist.init()
 
@@ -137,6 +135,9 @@ def main(**kwargs):
     # Rank 0 goes first.
     if dist.get_rank() != 0:
         torch.distributed.barrier()
+
+    data_norm = opt.data_norm
+
 
     # Load network.
     dist.print0(f'Loading network from "{opt.network_pkl}"...')
@@ -157,6 +158,10 @@ def main(**kwargs):
         print("non pkl file is not supported yet.")
         exit(1)
 
+    # Other ranks follow.
+    if dist.get_rank() == 0:
+        torch.distributed.barrier()
+
     # opts = opts['dataset_kwargs']
     dataset_kwargs = dnnlib.EasyDict(**train_opts['dataset_kwargs'])
     dataset_kwargs.path = opt.data
@@ -167,8 +172,9 @@ def main(**kwargs):
     if opt.flip_dataset:
         dataset_kwargs.flip_keep_dataset = True
 
+    # We will add noise in this code
     dataset_kwargs.additive_noise_sigma = 0.0
-    dataset_kwargs.multiply_noise_sigma = 0.0
+    dataset_kwargs.multiply_noise_sigma = 1.0
     dataset_kwargs.only_additive_noise = False
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=8, prefetch_factor=4)
@@ -182,23 +188,12 @@ def main(**kwargs):
     test_dataset_size = len(dataset_obj)
     dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False) # type: ignore
     dataloader_obj = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dist_sampler, batch_size=opt.batch_size, **data_loader_kwargs)
-
-    test_SNR_range = [float(x) for x in opt.test_SNR_range.split(',')]
+    test_SNR_range = opt.test_SNR_range
+    test_SNR_range = [float(x) for x in test_SNR_range.split(',')]
     test_SNR_step = opt.test_SNR_step
 
     SNR_steps = np.arange(test_SNR_range[0], test_SNR_range[1] + test_SNR_step, test_SNR_step)
     ratio_SNR_steps = dB_to_ratio(SNR_steps)
-
-    original_shape = opt.original_shape
-
-    if original_shape is not None:
-        target_shape = (1, net.img_channels, net.img_resolution[0], net.img_resolution[1])
-        input_original_shape = torch.tensor(original_shape)
-        input_original_shape = input_original_shape.unsqueeze(0) # add batch dimension
-        padding_mask = padding_mask_from_original_shape(input_original_shape, target_shape)
-        dist.print0(f'Using padding mask with original shape {input_original_shape} and target shape {target_shape}')
-    else:
-        padding_mask = 1
 
     sampler_kwargs = {
         'num_steps': opt.num_steps,
@@ -244,10 +239,12 @@ def main(**kwargs):
                 # complex 축이 지정되지 않은 경우 기존 신호를 그대로 할당합니다.
                 complex_signal = true_signal
 
-            # (Batch)
-            signal_power = torch.mean(torch.real(complex_signal * torch.conj(complex_signal)), dim=tuple(range(1, complex_signal.ndim+1)))
+            complex_signal = complex_signal / data_norm
 
-            normalized_current_sigma = current_sigma / torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim+1)))
+            # (Batch)
+            signal_power = torch.mean(torch.real(complex_signal * torch.conj(complex_signal)), dim=tuple(range(1, complex_signal.ndim)))
+
+            normalized_current_sigma = current_sigma / torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim)))
             
             for idx, ratio_SNR in enumerate(ratio_SNR_steps):
                 # (Batch)
@@ -258,23 +255,40 @@ def main(**kwargs):
                 else:
                     input_sigma = sigma_SNR_steps
 
-                input_signal = true_signal + torch.randn_like(true_signal) * input_sigma
+                input_signal = true_signal / data_norm
+
+                multiply_sigma = _match_axis(input_sigma, input_signal)
+
+                input_signal = input_signal + torch.randn_like(input_signal) * multiply_sigma
+
+                padded_signal, _, original_shape = pad_collate_fn(input_signal)
+
+                target_shape = (1,) + tuple(padded_signal.shape[1:])
+                input_original_shape = torch.tensor(tuple(original_shape[0]))
+                input_original_shape = input_original_shape.unsqueeze(0) # add batch dimension
+
+                padding_mask = padding_mask_from_original_shape(input_original_shape, target_shape)
 
                 denoised_signal, _ =edm_sampler(
                                                     net, 
-                                                    latents=input_signal, 
+                                                    latents=padded_signal, 
                                                     sigma_max=input_sigma, 
                                                     padding_mask=padding_mask,
                                                     latents_already_noisy=True,
                                                     **sampler_kwargs
                                                 )
+                
+                mask_slice = (slice(0, denoised_signal.shape[0]), )+tuple(slice(0, dim) for dim in original_shape[0])
+                denoised_signal = denoised_signal[mask_slice]
+
+                denoised_signal = denoised_signal * data_norm
 
                 predict_SNR_result = cal_SNR(denoised_signal, true_signal, complex_axis=complex_axis)
                 predict_SNR_result_sum_dist_list[idx] += torch.sum(predict_SNR_result)
         
         # End of dataloader
         if dist.get_rank() == 0:
-            collect_predict_SNR_sum_list = [torch.zeros_like(predict_SNR_result_sum_dist_list, dtype=torch.float64, device=device) for _ in range(dist.get_world_size())]
+            collect_predict_SNR_sum_list = [torch.zeros_like(predict_SNR_result_sum_dist_list, dtype=torch.float32, device=device) for _ in range(dist.get_world_size())]
         else:
             collect_predict_SNR_sum_list = None
 
@@ -304,6 +318,8 @@ def main(**kwargs):
                 
                 pd.DataFrame(predict_SNR_result_dict, index=[0]).to_csv(out_path, index=False)
                 dist.print0(f"Saved SNR results to {out_path}")
+
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

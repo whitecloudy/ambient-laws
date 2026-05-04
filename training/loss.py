@@ -12,18 +12,11 @@ from numpy import pad
 import torch
 from torch_utils import persistence
 import ambient_utils
-from training.sampler import edm_sampler
+from training.sampler import edm_sampler, padding_mask_from_original_shape
 
 #----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
 # of Diffusion-Based Generative Models" (EDM).
-
-def padding_mask_from_original_shape(original_shape, target_shape):
-    padding_mask = torch.zeros(target_shape, device=original_shape.device)
-    for i in range(target_shape[0]):
-        slices = (i,) + tuple(slice(0, int(dim)) for dim in original_shape[i])
-        padding_mask[slices] = 1
-    return padding_mask
 
 @persistence.persistent_class
 class EDMLoss:

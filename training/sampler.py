@@ -1,10 +1,14 @@
 import torch
 import numpy as np
-from training.loss import padding_mask_from_original_shape as _padding_mask_from_original_shape
 
 
-def padding_mask_from_original_shape(**argv):
-    return _padding_mask_from_original_shape(**argv)
+def padding_mask_from_original_shape(original_shape, target_shape):
+    padding_mask = torch.zeros(target_shape, device=original_shape.device)
+    for i in range(target_shape[0]):
+        slices = (i,) + tuple(slice(0, int(dim)) for dim in original_shape[i])
+        padding_mask[slices] = 1
+    return padding_mask
+
 
 def edm_sampler(
     net, latents, class_labels=None,
@@ -40,15 +44,18 @@ def inference_edm_sampler(
     stop_sigma=0.0, latents_already_noisy=False, padding_mask=1,
 ):
     batch_size = latents.shape[0]
+    device = latents.device
+
+    padding_mask = torch.tensor(padding_mask, device=device)
 
     # Adjust noise levels based on what's supported by the network.
     if isinstance(sigma_max, torch.Tensor) and sigma_max.ndim == 1:
-        sigma_max = torch.clamp(sigma_max, max=net.sigma_max).view(batch_size, 1)
+        sigma_max = torch.clamp(sigma_max, max=net.sigma_max).view(batch_size, 1).to(device)
     else:
         sigma_max = min(sigma_max, net.sigma_max)
         
     if isinstance(sigma_min, torch.Tensor) and sigma_min.ndim == 1:
-        sigma_min = torch.clamp(sigma_min, min=net.sigma_min).view(batch_size, 1)
+        sigma_min = torch.clamp(sigma_min, min=net.sigma_min).view(batch_size, 1).to(device)
     else:
         sigma_min = max(sigma_min, net.sigma_min)
 
