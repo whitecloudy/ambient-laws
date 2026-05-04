@@ -106,6 +106,7 @@ def parse_int_list(s):
 @click.option('--config_json',              help='Network config json filename', metavar='PATH|URL',                type=str, default=None, show_default=True)
 @click.option('--seed',                     help='Random seed', metavar='INT',                                      type=int, default=11454, show_default=True)
 @click.option('--subdirs',                  help='Create subdirectory for every 1000 seeds',                        is_flag=True)
+@click.option('--output',                   help='Output directory or file path for saving the CSV results.',       type=str, default=None)
 
 @click.option('--data',                     help='Path to the dataset', metavar='ZIP|DIR',                          type=str, required=True)
 @click.option('--data_keep_ratio',          help='How much data keeping ratio', metavar='FLOAT',                    type=float, default=1.0, show_default=True)
@@ -115,7 +116,6 @@ def parse_int_list(s):
 @click.option('--test_SNR_range', 'test_SNR_range', help='SNR range will be tested', metavar='STR',                 type=str, default='5,20', show_default=True)
 @click.option('--test_SNR_step', 'test_SNR_step',   help='SNR step will be tested',                                 type=float, default=1.0, show_default=True)
 @click.option('--same_sigma_level',         help='Whether use same sigma level across all signal matrix',           is_flag=True)
-@click.option('--output',                   help='Output directory or file path for saving the CSV results.',       type=str, default=None)
 
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
@@ -318,6 +318,11 @@ def main(**kwargs):
                 
                 pd.DataFrame(predict_SNR_result_dict, index=[0]).to_csv(out_path, index=False)
                 dist.print0(f"Saved SNR results to {out_path}")
+
+                opt_out_path = out_path.replace('.csv', '_opt.json')
+                with open(opt_out_path, 'w', encoding='utf-8') as f:
+                    json.dump(dict(opt), f, indent=4)
+                dist.print0(f"Saved options to {opt_out_path}")
 
         dist.destroy_process_group()
 
