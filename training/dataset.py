@@ -997,43 +997,59 @@ import torch.nn.functional as F
 def _power2ceil(original):
     return int(2**np.ceil(np.log2(original)))
 
-def pad_collate_fn(batch):
-    """
-    가변 크기의 'image' 텐서를 패딩하여 동일한 크기로 맞춘 후,
-    하나의 배치로 합칩니다.
-    """
-    # 1. 배치 내에서 'image'의 최대 높이와 너비를 찾습니다.
-    # 각 image는 (C, H, W) 형태라고 가정합니다.
-    max_h = max(item['image'].shape[-2] for item in batch)
-    max_w = max(item['image'].shape[-1] for item in batch)
+class pad_collate_fn(object):
+    def __init__(self, dynamic_noise=False):
+        self.dynamic_noise = dynamic_noise
+        self.__name__ = "pad_collate_fn"
 
-    # 2. 높이와 너비를 2의 배수로 올림합니다.
-    target_h = _power2ceil(max_h)
-    target_w = _power2ceil(max_w)
-    # 3. 각 'image'를 목표 크기로 패딩합니다.
-    padded_batch = []
-
-    for item in batch:
-        img = item['image']
-        label = item['label']
-        original_shape = torch.tensor(img.shape)
-        # (padding_left, padding_right, padding_top, padding_bottom)
-        pad_h = target_h - img.shape[1]
-        pad_w = target_w - img.shape[2]
-        # img의 차원 수에 따라 pad_width를 동적으로 생성
-        pad_width = [(0, 0)] * (img.ndim - 2) + [(0, pad_h), (0, pad_w)]
-        padded_img = np.pad(img, pad_width, mode='constant', constant_values=0)
-
-        item['original_shape'] = original_shape
-        item['image'] = padded_img
-
-        if img.shape == label.shape:
-            padded_label = np.pad(label, pad_width, mode='constant', constant_values=0)
-            item['label'] = padded_label
-
-        padded_batch.append(item)
-
-    return padded_batch
+    def __call__(self, batch):
+        """
+        가변 크기의 'image' 텐서를 패딩하여 동일한 크기로 맞춘 후,
+        하나의 배치로 합칩니다.
+        """
+        # 1. 배치 내에서 'image'의 최대 높이와 너비를 찾습니다.
+        # 각 image는 (C, H, W) 형태라고 가정합니다.
+        max_h = max(item['image'].shape[-2] for item in batch)
+        max_w = max(item['image'].shape[-1] for item in batch)
+    
+        # 2. 높이와 너비를 2의 배수로 올림합니다.
+        target_h = _power2ceil(max_h)
+        target_w = _power2ceil(max_w)
+        # 3. 각 'image'를 목표 크기로 패딩합니다.
+        padded_batch = []
+    
+        for item in batch:
+            img = item['image']
+            label = item['label']
+            original_shape = torch.tensor(img.shape)
+            # (padding_left, padding_right, padding_top, padding_bottom)
+            pad_h = target_h - img.shape[-2]
+            pad_w = target_w - img.shape[-1]
+            # img의 차원 수에 따라 pad_width를 동적으로 생성
+            pad_width = [(0, 0)] * (img.ndim - 2) + [(0, pad_h), (0, pad_w)]
+            padded_img = np.pad(img, pad_width, mode='constant', constant_values=0)
+    
+            item['original_shape'] = original_shape
+            item['image'] = padded_img
+    
+            if img.shape == label.shape:
+                padded_label = np.pad(label, pad_width, mode='constant', constant_values=0)
+                item['label'] = padded_label
+                
+            if self.dynamic_noise and 'sigma' in item:
+                sigma = item['sigma']
+                pad_width = []
+                for idx, sigma_dim in enumerate(sigma.shape):
+                    if sigma_dim == padded_img.shape[idx] or sigma_dim == 1:
+                        pad_width.append((0, 0))
+                    else:
+                        pad_width.append((0, padded_img.shape[idx] - sigma_dim))
+                padded_sigma = np.pad(sigma, pad_width, mode='constant', constant_values=0)
+                item['sigma'] = padded_sigma
+    
+            padded_batch.append(item)
+    
+        return padded_batch
 
 import multiprocessing as mp
 from tqdm import tqdm

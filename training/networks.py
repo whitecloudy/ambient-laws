@@ -190,7 +190,8 @@ class UNetBlock(torch.nn.Module):
         num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-5,
         resample_filter=[1,1], resample_stride=2, resample_proj=False, adaptive_scale=True,
         kernel=3,
-        init=dict(), init_zero=dict(init_weight=0), init_attn=None, stride=(1,1)
+        init=dict(), init_zero=dict(init_weight=0), init_attn=None, stride=(1,1),
+        emb_stride=(1,1) # 추가: emb 전용 stride
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -248,6 +249,92 @@ class UNetBlock(torch.nn.Module):
             x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale
         return x
+    
+#----------------------------------------------------------------------------
+# Unified U-Net block with optional up/downsampling and self-attention.
+# Represents the union of all features employed by the DDPM++, NCSN++, and
+# ADM architectures.
+
+@persistence.persistent_class
+class UNetBlock_AS(torch.nn.Module):
+    def __init__(self,
+        in_channels, out_channels, emb_channels, up=False, down=False, attention=False,
+        num_heads=None, channels_per_head=64, dropout=0, skip_scale=1, eps=1e-5,
+        resample_filter=[1,1], resample_stride=2, resample_proj=False, adaptive_scale=True,
+        kernel=3,
+        init=dict(), init_zero=dict(init_weight=0), init_attn=None, stride=(1,1),
+        emb_stride=(1,1) # 유지 호환성을 위해 추가
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.emb_channels = emb_channels
+        self.num_heads = 0 if not attention else num_heads if num_heads is not None else out_channels // channels_per_head
+        self.dropout = dropout
+        self.skip_scale = skip_scale
+        self.adaptive_scale = adaptive_scale
+
+        # emb를 위한 Learnable Downsampling Layer 추가
+        self.emb_stride = emb_stride if isinstance(emb_stride, (tuple, list)) else (emb_stride, emb_stride)
+        if self.emb_stride[0] > 1 or self.emb_stride[1] > 1:
+            self.emb_down = Conv2d(in_channels=emb_channels, out_channels=emb_channels, kernel=self.emb_stride, stride=self.emb_stride, **init)
+        else:
+            self.emb_down = torch.nn.Identity()
+
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        else:
+            stride = tuple(stride)
+
+        if not (up or down):
+            stride = (1, 1)
+
+        self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
+        self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=kernel, up=up, down=down, resample_filter=resample_filter, resample_stride=resample_stride, stride=stride, **init)
+        self.affine = Conv2d(in_channels=emb_channels, out_channels=out_channels*(2 if adaptive_scale else 1), kernel=1, **init)
+        self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
+        self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=kernel, **init_zero)
+
+        self.skip = None
+        has_stride = stride[0] > 1 or stride[1] > 1
+        if out_channels != in_channels or up or down or has_stride:
+            skip_kernel = 1 if resample_proj or out_channels != in_channels or has_stride else 0
+            self.skip = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=skip_kernel, up=up, down=down, resample_filter=resample_filter, resample_stride=resample_stride, stride=stride, **init)
+
+        if self.num_heads:
+            self.norm2 = GroupNorm(num_channels=out_channels, eps=eps)
+            self.qkv = Conv2d(in_channels=out_channels, out_channels=out_channels*3, kernel=1, **(init_attn if init_attn is not None else init))
+            self.proj = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=1, **init_zero)
+
+    def forward(self, x, emb):
+        orig = x
+        x = self.conv0(silu(self.norm0(x)))
+
+        # Conv Layer + Stride를 이용한 emb Downsampling 수행
+        emb_input = self.emb_down(emb)
+        if emb_input.shape[2:] != x.shape[2:]:  # 아주 미세한 반올림 오차 대비용 안전 장치
+            emb_input = torch.nn.functional.interpolate(emb_input, size=x.shape[2:], mode='nearest')
+
+        params = self.affine(emb_input).to(x.dtype)
+
+        if self.adaptive_scale:
+            scale, shift = params.chunk(chunks=2, dim=1)
+            x = silu(torch.addcmul(shift, self.norm1(x), scale + 1))
+        else:
+            x = silu(self.norm1(x.add_(params)))
+
+        x = self.conv1(torch.nn.functional.dropout(x, p=self.dropout, training=self.training))
+        x = x.add_(self.skip(orig) if self.skip is not None else orig)
+        x = x * self.skip_scale
+
+        if self.num_heads:
+            q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
+            w = AttentionOp.apply(q, k)
+            a = torch.einsum('nqk,nck->ncq', w, v)
+            x = self.proj(a.reshape(*x.shape)).add_(x)
+            x = x * self.skip_scale
+        return x
+
 
 #----------------------------------------------------------------------------
 # Timestep embedding used in the DDPM++ and ADM architectures.
@@ -283,6 +370,53 @@ class FourierEmbedding(torch.nn.Module):
         return x
 
 #----------------------------------------------------------------------------
+# Timestep embeddings with Spatial mapping support
+
+@persistence.persistent_class
+class PositionalEmbedding_AS(torch.nn.Module):
+    def __init__(self, num_channels, max_positions=10000, endpoint=False):
+        super().__init__()
+        self.num_channels = num_channels
+        self.max_positions = max_positions
+        self.endpoint = endpoint
+
+    def forward(self, x):
+        freqs = torch.arange(start=0, end=self.num_channels//2, dtype=torch.float32, device=x.device)
+        freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
+        freqs = (1 / self.max_positions) ** freqs
+        
+        if x.ndim >= 3:
+            if x.ndim == 4:
+                # C 차원(안테나 채널)을 RMS(Root Mean Square)로 요약하여 (B, H, W) 형태로 만듭니다.
+                x = torch.sqrt(torch.mean(x**2, dim=1))
+            x = x.unsqueeze(-1) * freqs.to(x.dtype)
+            x = torch.cat([x.cos(), x.sin()], dim=-1)
+            x = x.permute(0, 3, 1, 2)
+        else:
+            x = x.ger(freqs.to(x.dtype))
+            x = torch.cat([x.cos(), x.sin()], dim=1)
+        return x
+
+@persistence.persistent_class
+class FourierEmbedding_AS(torch.nn.Module):
+    def __init__(self, num_channels, scale=16):
+        super().__init__()
+        self.register_buffer('freqs', torch.randn(num_channels // 2) * scale)
+
+    def forward(self, x):
+        if x.ndim >= 3:
+            if x.ndim == 4:
+                x = torch.sqrt(torch.mean(x**2, dim=1))
+            x = x.unsqueeze(-1) * (2 * np.pi * self.freqs).to(x.dtype)
+            x = torch.cat([x.cos(), x.sin()], dim=-1)
+            x = x.permute(0, 3, 1, 2)
+        else:
+            x = x.ger((2 * np.pi * self.freqs).to(x.dtype))
+            x = torch.cat([x.cos(), x.sin()], dim=1)
+        return x
+
+#----------------------------------------------------------------------------
+
 # Reimplementation of the DDPM++ and NCSN++ architectures from the paper
 # "Score-Based Generative Modeling through Stochastic Differential
 # Equations". Equivalent to the original implementation by Song et al.,
@@ -459,6 +593,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
+        dynamic_noise       = False,        # Whether to use dynamic noise labels.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -468,8 +603,14 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         super().__init__()
         self.label_dropout = label_dropout
         self.label_type = label_type
+
+        # dynamic_noise일 경우 Spatial Tensor가 되어 VRAM 소모가 매우 커지므로 기본 embedding 차원을 줄입니다.
+        if dynamic_noise and channel_mult_emb == 4:
+            channel_mult_emb = 1
+
         emb_channels = model_channels * channel_mult_emb
         noise_channels = model_channels * channel_mult_noise
+        self.dynamic_noise = dynamic_noise
         init = dict(init_mode='xavier_uniform')
         init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
         init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
@@ -480,7 +621,10 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         )
 
         # Mapping.
-        self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
+        if self.dynamic_noise:
+            self.map_noise = PositionalEmbedding_AS(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding_AS(num_channels=noise_channels)
+        else:
+            self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
         if label_dim != 0:
             if label_type == 'downlink':
                 if label_resolution == None:
@@ -510,25 +654,36 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
 
         if self.map_label != None and self.label_type == 'downlink':
-            self.map_layer0 = Linear(in_features=noise_channels*3, out_features=emb_channels*2, **init)
-            self.map_layer1 = Linear(in_features=emb_channels*2, out_features=emb_channels, **init)
+            if self.dynamic_noise:
+                self.map_layer0 = Conv2d(in_channels=noise_channels*3, out_channels=emb_channels*2, kernel=1, **init)
+                self.map_layer1 = Conv2d(in_channels=emb_channels*2, out_channels=emb_channels, kernel=1, **init)
+            else:
+                self.map_layer0 = Linear(in_features=noise_channels*3, out_features=emb_channels*2, **init)
+                self.map_layer1 = Linear(in_features=emb_channels*2, out_features=emb_channels, **init)
         else:
-            self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
-            self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
+            if self.dynamic_noise:
+                self.map_layer0 = Conv2d(in_channels=noise_channels, out_channels=emb_channels, kernel=1, **init)
+                self.map_layer1 = Conv2d(in_channels=emb_channels, out_channels=emb_channels, kernel=1, **init)
+            else:
+                self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
+                self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
         cout = in_channels
         caux = in_channels
+        unet_block_class = UNetBlock_AS if self.dynamic_noise else UNetBlock
+
         for level, mult in enumerate(channel_mult):
             H_res = img_resolution[0] >> level
             W_res = img_resolution[1] >> level
+            emb_stride = (img_resolution[0] // max(H_res, 1), img_resolution[1] // max(W_res, 1))
             if level == 0:
                 cin = cout
                 cout = model_channels
                 self.enc[f'{H_res}x{W_res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
             else:
-                self.enc[f'{H_res}x{W_res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                self.enc[f'{H_res}x{W_res}_down'] = unet_block_class(in_channels=cout, out_channels=cout, down=True, emb_stride=emb_stride, **block_kwargs)
                 if encoder_type == 'skip':
                     self.enc[f'{H_res}x{W_res}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter)
                     self.enc[f'{H_res}x{W_res}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
@@ -539,7 +694,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 cin = cout
                 cout = model_channels * mult
                 attn = (W_res in attn_resolutions)
-                self.enc[f'{H_res}x{W_res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                self.enc[f'{H_res}x{W_res}_block{idx}'] = unet_block_class(in_channels=cin, out_channels=cout, attention=attn, emb_stride=emb_stride, **block_kwargs)
         skips = [block.out_channels for name, block in self.enc.items() if 'aux' not in name]
 
         # Decoder.
@@ -547,16 +702,17 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         for level, mult in reversed(list(enumerate(channel_mult))):
             H_res = img_resolution[0] >> level
             W_res = img_resolution[1] >> level            
+            emb_stride = (img_resolution[0] // max(H_res, 1), img_resolution[1] // max(W_res, 1))
             if level == len(channel_mult) - 1:
-                self.dec[f'{H_res}x{W_res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
-                self.dec[f'{H_res}x{W_res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+                self.dec[f'{H_res}x{W_res}_in0'] = unet_block_class(in_channels=cout, out_channels=cout, attention=True, emb_stride=emb_stride, **block_kwargs)
+                self.dec[f'{H_res}x{W_res}_in1'] = unet_block_class(in_channels=cout, out_channels=cout, emb_stride=emb_stride, **block_kwargs)
             else:
-                self.dec[f'{H_res}x{W_res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                self.dec[f'{H_res}x{W_res}_up'] = unet_block_class(in_channels=cout, out_channels=cout, up=True, emb_stride=emb_stride, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
                 attn = (idx == num_blocks and W_res in attn_resolutions)
-                self.dec[f'{H_res}x{W_res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                self.dec[f'{H_res}x{W_res}_block{idx}'] = unet_block_class(in_channels=cin, out_channels=cout, attention=attn, emb_stride=emb_stride, **block_kwargs)
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
                     self.dec[f'{H_res}x{W_res}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter)
@@ -564,27 +720,74 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 self.dec[f'{H_res}x{W_res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
     def forward(self, x, noise_labels, class_labels, augment_labels=None):
-        # Mapping.
+        # [Shape 가정] x: [B, C, H, W], noise_labels: [B, C, H, W], class_labels: [B, K]
+        
+        if self.dynamic_noise:
+            if noise_labels.shape != x.shape:
+                for idx, dim in enumerate(noise_labels.shape):
+                    if noise_labels.shape[idx] == x.shape[idx]:
+                        continue
+                    elif noise_labels.shape[idx] == 1:
+                        continue
+                    else:
+                        pad_amount = x.shape[idx] - noise_labels.shape[idx]
+                        pad_dims = [0] * (2 * (noise_labels.ndim - idx - 1)) + [0, pad_amount]
+                        noise_labels = torch.nn.functional.pad(noise_labels, pad_dims)
+                while noise_labels.ndim < x.ndim:
+                    noise_labels = noise_labels.unsqueeze(-1)
+                noise_labels = noise_labels.expand_as(x)
+            # dynamic_noise=True 일 때 noise_labels 최종 shape: [B, C, H, W]
+        else:   #If not dynamic noise but when we receive dynamic noise label
+            if noise_labels.ndim > 1:   # Expect only [Batch, ]
+                noise_labels = torch.sqrt(torch.mean(torch.flatten(noise_labels, start_dim=1)**2, dim=1))
+            # dynamic_noise=False 일 때 noise_labels 최종 shape: [B]
+
+        # Mapping.    
         emb = self.map_noise(noise_labels)
+        # dynamic_noise=True 일 때 emb shape: [B, noise_channels, H, W]
+        # dynamic_noise=False 일 때 emb shape: [B, noise_channels]
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
         if self.map_augment is not None and augment_labels is not None:
-            emb = emb + self.map_augment(augment_labels)
+            augment_emb = self.map_augment(augment_labels)
+            if self.dynamic_noise:
+                augment_emb = augment_emb.unsqueeze(-1).unsqueeze(-1)
+            emb = emb + augment_emb
         if self.map_label is not None:
             tmp = class_labels
+            # tmp shape: [B, K]
             if self.training and self.label_dropout:
                 label_dropout_table = torch.unsqueeze(torch.unsqueeze((torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype), dim=-1), dim=-1)
-
                 tmp = tmp * label_dropout_table
+                # label_dropout 적용 후 tmp shape: [B, K]
+                
             if self.label_type == 'downlink':
                 label_emb = self.map_label(tmp)
-                # emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+                # label_emb shape: [B, noise_channels * 2] (map_label 설계에 따름)
+                if self.dynamic_noise:
+                    label_emb = label_emb.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, emb.shape[2], emb.shape[3])
+                    # label_emb shape: [B, noise_channels * 2, H, W]
                 emb = torch.concatenate([emb, label_emb], dim=1)
+                # emb shape (dynamic_noise=True): [B, noise_channels * 3, H, W]
+                # emb shape (dynamic_noise=False): [B, noise_channels * 3]
             elif self.label_type == 'classes':
-                emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
+                label_emb = self.map_label(tmp * np.sqrt(self.map_label.in_features))
+                # label_emb shape: [B, noise_channels]
+                if self.dynamic_noise:
+                    label_emb = label_emb.unsqueeze(-1).unsqueeze(-1)
+                    # label_emb shape: [B, noise_channels, 1, 1]
+                emb = emb + label_emb
+                # emb shape (dynamic_noise=True): [B, noise_channels, H, W]
+                # emb shape (dynamic_noise=False): [B, noise_channels]
             else:
                 assert False, "Unknown label type"
         emb = silu(self.map_layer0(emb))
+        # emb shape (label_type='downlink', dynamic_noise=True): [B, emb_channels * 2, H, W]
+        # emb shape (label_type='downlink', dynamic_noise=False): [B, emb_channels * 2]
+        # emb shape (label_type='classes', dynamic_noise=True): [B, emb_channels, H, W]
+        # emb shape (label_type='classes', dynamic_noise=False): [B, emb_channels]
         emb = silu(self.map_layer1(emb))
+        # emb 최종 shape (dynamic_noise=True): [B, emb_channels, H, W]
+        # emb 최종 shape (dynamic_noise=False): [B, emb_channels]
 
         # Encoder.
         skips = []
@@ -597,7 +800,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             elif 'aux_residual' in name:
                 x = skips[-1] = aux = (x + block(aux)) / np.sqrt(2)
             else:
-                x = block(x, emb) if isinstance(block, UNetBlock) else block(x)
+                x = block(x, emb) if (isinstance(block, UNetBlock) or isinstance(block, UNetBlock_AS)) else block(x)
                 skips.append(x)
 
         # Decoder.
@@ -614,7 +817,8 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             else:
                 if x.shape[1] != block.in_channels:
                     x = torch.cat([x, skips.pop()], dim=1)
-                x = block(x, emb)
+                    
+                x = block(x, emb) if (isinstance(block, UNetBlock) or isinstance(block, UNetBlock_AS)) else block(x)
 
         return aux
 
@@ -1147,7 +1351,7 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
 
     def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
         x = x.to(torch.float32)
-        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        sigma = sigma.to(torch.float32)
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
@@ -1156,7 +1360,8 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
-        F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+        print(c_in.shape, c_noise.shape)
+        F_x = self.model((c_in * x).to(dtype), c_noise, class_labels=class_labels, **model_kwargs)
         assert F_x.dtype == dtype
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
         return D_x

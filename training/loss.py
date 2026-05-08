@@ -14,6 +14,10 @@ from torch_utils import persistence
 import ambient_utils
 from training.sampler import edm_sampler, padding_mask_from_original_shape
 
+
+def from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, current_sigma, desired_sigma):
+    return (1 - (desired_sigma / current_sigma) ** 2) * x0_pred + ((desired_sigma / current_sigma) ** 2) * noisy_input
+
 #----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
 # of Diffusion-Based Generative Models" (EDM).
@@ -57,7 +61,8 @@ class EDMLoss:
         noisy_input = (y + n) * padding_mask
         x0_pred = net(noisy_input, sigma, labels, augment_labels=augment_labels)
         # make it xtn prediction
-        D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
+        # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, sigma, current_sigma)
         
         # loss weight depends on sigma
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
@@ -67,7 +72,8 @@ class EDMLoss:
         # consistency loss
         if self.consistency_coeff > 0:
             # sample a new_sigma in [sigma, 0]
-            new_sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+            new_rnd_normal = torch.randn_like(rnd_normal)
+            new_sigma = (new_rnd_normal * self.P_std + self.P_mean).exp()
             new_sigma = torch.clamp(new_sigma, max=sigma)
 
             # we will only keep the first batch_size / self.num_primes part of the batch

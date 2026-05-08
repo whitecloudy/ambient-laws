@@ -71,8 +71,6 @@ def parse_int_list(s):
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
 @click.option('--label_dropout', help='Label dropout probability for classifier-free guidance', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
 
-
-
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
 @click.option('--ls',            help='Loss scaling', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
@@ -110,6 +108,7 @@ def parse_int_list(s):
 @click.option('--dataset_keep_percentage', help='Limit training samples.', type=float, default=1.0, show_default=True)
 @click.option('--additive_noise_sigma', help='Standard deviation of the additive noise to be added to the clean images during corruption.', type=float, default=0.0, show_default=True)
 @click.option('--multiply_noise_sigma', help='Multiplying factor of the noise to be added to the clean images during corruption.', type=float, default=1.0, show_default=True)
+@click.option('--dynamic_noise_sigma', help='Wheteher to use mean noise or not.', is_flag=True, default=False)
 @click.option('--noise_mean_alter_way', help='Whether to use alternative way to add noise, which is to directly add noise with the given sigma without multiplying with the clean image.', is_flag=True, default=False)
 @click.option('--only_additive_noise', help='Whether to only use additive noise for corruption without natural noise.', is_flag=True)
 
@@ -182,7 +181,8 @@ def main(**kwargs):
                                         resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                         normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
                                         multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, 
-                                        noise_mean_alter_way=opts.noise_mean_alter_way)
+                                    noise_mean_alter_way=opts.noise_mean_alter_way,
+                                    noise_mean_flag=not opts.dynamic_noise_sigma)
     elif opts.task == 'WIDAR':
         # dataset_kwargs for WIDAR dataset
         # TMP: 512 to 256 time scale for now to reduce the computational cost.
@@ -205,12 +205,15 @@ def main(**kwargs):
 
     c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(flip_probability=opts.flip_aug_ratio, 
                                                                 phase_shift_probability=opts.phase_shift_aug_ratio, 
-                                                                other_collate_fn=[pad_collate_fn, torch.utils.data.default_collate])
+                                                                other_collate_fn=[pad_collate_fn(dynamic_noise=opts.dynamic_noise_sigma), torch.utils.data.default_collate])
 
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8, weight_decay=opts.weight_decay)
     
+    if opts.dynamic_noise_sigma:
+        c.network_kwargs.update(dynamic_noise=opts.dynamic_noise_sigma)
+
     dist.synchronize()
     # Validate dataset options.
     try:
@@ -234,7 +237,7 @@ def main(**kwargs):
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2])
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], )
     elif opts.arch == 'widar_ddpmpp':
         c.network_kwargs.update(model_type='WiDAR_RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[[1,1,1,1],[1,1]], resample_stride=[4,2], model_channels=16, channel_mult=[1,2,2,2], kernel_size = [9,3])
