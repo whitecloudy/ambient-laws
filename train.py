@@ -52,7 +52,7 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp_256', 'ddpmpp_192','ddpmpp', 'ncsnpp', 'adm', 'widar_ddpmpp', 'widar_ddpmpp_stem256', 'widar_ddpmpp_stem512']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm']), default='edm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',            type=str, default=None, show_default=True)
@@ -210,9 +210,6 @@ def main(**kwargs):
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8, weight_decay=opts.weight_decay)
-    
-    if opts.dynamic_noise_sigma:
-        c.network_kwargs.update(dynamic_noise=opts.dynamic_noise_sigma)
 
     dist.synchronize()
     # Validate dataset options.
@@ -259,6 +256,10 @@ def main(**kwargs):
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
+
+    if opts.dynamic_noise_sigma:
+        c.network_kwargs.update(dynamic_noise=opts.dynamic_noise_sigma)
+
     
     # Select batch size per GPU.
     batch_gpu = opts.batch_gpu
@@ -273,9 +274,12 @@ def main(**kwargs):
     consistency_batch_size_per_gpu = consistency_batch_size_per_gpu_total // num_accumulation_rounds
     assert opts.consistency_batch_size == consistency_batch_size_per_gpu * dist.get_world_size() * num_accumulation_rounds
 
-    assert opts.precond == 'edm'
+    assert opts.precond == 'edm' or opts.precond == 'edm_dynamic'
     c.network_kwargs.class_name = 'training.networks.EDMPrecond'
-    c.loss_kwargs.class_name = 'training.loss.EDMLoss'
+    if opts.precond == 'edm_dynamic':
+        c.loss_kwargs.class_name = 'training.loss.EDMLoss_dynamic_sigma'
+    elif opts.precond == 'edm':
+        c.loss_kwargs.class_name = 'training.loss.EDMLoss'
     c.loss_kwargs.update(consistency_batch_size_per_gpu=consistency_batch_size_per_gpu)
     # whether to use weight for the consistency terms
     c.loss_kwargs.update(with_weight=opts.with_weight)

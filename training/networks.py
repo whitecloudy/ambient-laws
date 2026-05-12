@@ -1349,9 +1349,12 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         self.sigma_data = sigma_data
         self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels, out_channels=img_channels, label_dim=label_dim, **model_kwargs)
 
-    def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
+    def forward(self, x : torch.Tensor, sigma : torch.Tensor, class_labels=None, force_fp32=False, **model_kwargs):
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32)
+        
+        while sigma.ndim < x.ndim:
+            sigma = sigma.unsqueeze(-1)
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
@@ -1360,7 +1363,6 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
-        print(c_in.shape, c_noise.shape)
         F_x = self.model((c_in * x).to(dtype), c_noise, class_labels=class_labels, **model_kwargs)
         assert F_x.dtype == dtype
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
