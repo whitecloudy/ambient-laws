@@ -321,7 +321,7 @@ class UNetBlock_AS(torch.nn.Module):
             scale, shift = params.chunk(chunks=2, dim=1)
             x = silu(torch.addcmul(shift, self.norm1(x), scale + 1))
         else:
-            x = silu(self.norm1(x.add_(params)))
+            x = silu(self.norm1(x) + params)
 
         x = self.conv1(torch.nn.functional.dropout(x, p=self.dropout, training=self.training))
         x = x.add_(self.skip(orig) if self.skip is not None else orig)
@@ -387,11 +387,15 @@ class PositionalEmbedding_AS(torch.nn.Module):
         
         if x.ndim >= 3:
             if x.ndim == 4:
-                # C 차원(안테나 채널)을 RMS(Root Mean Square)로 요약하여 (B, H, W) 형태로 만듭니다.
-                x = torch.sqrt(torch.mean(x**2, dim=1))
-            x = x.unsqueeze(-1) * freqs.to(x.dtype)
-            x = torch.cat([x.cos(), x.sin()], dim=-1)
-            x = x.permute(0, 3, 1, 2)
+                # x: [B, C, H, W]
+                emb = x.unsqueeze(-1) * freqs.to(x.dtype) # [B, C, H, W, F]
+                emb = torch.cat([emb.cos(), emb.sin()], dim=-1) # [B, C, H, W, 2F]
+                emb = emb.permute(0, 4, 1, 2, 3) # [B, 2F, C, H, W]
+                x = torch.mean(emb, dim=2) # [B, 2F, H, W]
+            else: # x.ndim == 3, i.e., [B, H, W]
+                x = x.unsqueeze(-1) * freqs.to(x.dtype)
+                x = torch.cat([x.cos(), x.sin()], dim=-1)
+                x = x.permute(0, 3, 1, 2)
         else:
             x = x.ger(freqs.to(x.dtype))
             x = torch.cat([x.cos(), x.sin()], dim=1)
@@ -405,11 +409,18 @@ class FourierEmbedding_AS(torch.nn.Module):
 
     def forward(self, x):
         if x.ndim >= 3:
+            freqs = (2 * np.pi * self.freqs).to(x.dtype)
             if x.ndim == 4:
-                x = torch.sqrt(torch.mean(x**2, dim=1))
-            x = x.unsqueeze(-1) * (2 * np.pi * self.freqs).to(x.dtype)
-            x = torch.cat([x.cos(), x.sin()], dim=-1)
-            x = x.permute(0, 3, 1, 2)
+                # 각 채널별로 Fourier Encoding을 적용한 후, 채널 축에 대해 평균을 계산합니다.
+                # x: [B, C, H, W]
+                emb = x.unsqueeze(-1) * freqs # [B, C, H, W, F]
+                emb = torch.cat([emb.cos(), emb.sin()], dim=-1) # [B, C, H, W, 2F]
+                emb = emb.permute(0, 4, 1, 2, 3) # [B, 2F, C, H, W]
+                x = torch.mean(emb, dim=2) # [B, 2F, H, W]
+            else: # x.ndim == 3, i.e., [B, H, W]
+                x = x.unsqueeze(-1) * freqs
+                x = torch.cat([x.cos(), x.sin()], dim=-1)
+                x = x.permute(0, 3, 1, 2)
         else:
             x = x.ger((2 * np.pi * self.freqs).to(x.dtype))
             x = torch.cat([x.cos(), x.sin()], dim=1)

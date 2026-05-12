@@ -122,7 +122,7 @@ class EDMLoss_dynamic_sigma:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
                  consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False,
-                 lognorm_dist_mean = -4.259765001665967,
+                 lognorm_dist_mean = 0.11322956881040724,
                  lognorm_dist_loc = -0.3077225803161989,
                  lognorm_dist_sigma = 0.3644639849662781):
         self.P_mean = P_mean
@@ -169,7 +169,7 @@ class EDMLoss_dynamic_sigma:
         # make it xtn prediction
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, sigma, current_sigma)
-        
+
         # loss weight depends on sigma
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         loss = weight * ((D_yn - y) ** 2)
