@@ -150,19 +150,20 @@ class EDMLoss_dynamic_sigma:
             current_sigma = current_sigma.unsqueeze(-1)
         # current_sigma = current_sigma.unsqueeze(1).unsqueeze(1).unsqueeze(1)
 
+        if original_shape is not None:
+            padding_mask = padding_mask_from_original_shape(original_shape, images.shape)
+        else:
+            padding_mask = torch.ones_like(images)
+
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
         sigma_center = (rnd_normal * self.P_std + self.P_mean).exp()        
         sigma = torch.tensor(self.__get_lognormal_values(images.shape), device=images.device, dtype=torch.float32) * sigma_center
-        sigma = torch.clamp(sigma, min=current_sigma + 1e-5)
-        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
-        
+        sigma = torch.clamp(sigma, min=current_sigma + 1e-5) * padding_mask
+        y, augment_labels = (images, None)
+
         # add additional noise to reach the level sigma
         n = torch.randn_like(y) * torch.sqrt(sigma ** 2 - current_sigma ** 2)
-        if original_shape is not None:
-            padding_mask = padding_mask_from_original_shape(original_shape, n.shape)
-        else:
-            padding_mask = torch.ones_like(y)
 
         noisy_input = (y + n) * padding_mask
         x0_pred = net(noisy_input, sigma, labels, augment_labels=augment_labels)

@@ -140,6 +140,9 @@ def main(**kwargs):
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
     
+    # torch.backends.cuda.matmul.allow_tf32 = True
+    # torch.backends.cudnn.allow_tf32 = True
+    
     # Initialize config dict.
     c = dnnlib.EasyDict()
 
