@@ -26,6 +26,27 @@ def weight_init(shape, mode, fan_in, fan_out):
     raise ValueError(f'Invalid init mode "{mode}"')
 
 #----------------------------------------------------------------------------
+# Helpers for padding to power of two.
+
+def pad_to_power_of_two(x):
+    orig_H, orig_W = x.shape[-2], x.shape[-1]
+    target_H = 1 << (orig_H - 1).bit_length() if orig_H > 0 else 0
+    target_W = 1 << (orig_W - 1).bit_length() if orig_W > 0 else 0
+    
+    pad_h = target_H - orig_H
+    pad_w = target_W - orig_W
+    
+    if pad_h > 0 or pad_w > 0:
+        x = torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
+        
+    return x, pad_h, pad_w, orig_H, orig_W
+
+def unpad_from_power_of_two(x, pad_h, pad_w, orig_H, orig_W):
+    if pad_h > 0 or pad_w > 0:
+        return x[..., :orig_H, :orig_W]
+    return x
+
+#----------------------------------------------------------------------------
 # Fully-connected layer.
 
 @persistence.persistent_class
@@ -733,19 +754,17 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
     def forward(self, x, noise_labels, class_labels, augment_labels=None):
         # [Shape 가정] x: [B, C, H, W], noise_labels: [B, C, H, W], class_labels: [B, K]
         
+        x, pad_h, pad_w, orig_H, orig_W = pad_to_power_of_two(x)
+        is_spatial_noise = (noise_labels.ndim >= 3 and noise_labels.shape[-2:] == (orig_H, orig_W))
+        
+        if self.dynamic_noise and is_spatial_noise and (pad_h > 0 or pad_w > 0):
+            noise_labels = torch.nn.functional.pad(noise_labels, (0, pad_w, 0, pad_h), mode='constant', value=0)
+        
         if self.dynamic_noise:
+            while noise_labels.ndim < x.ndim:
+                noise_labels = noise_labels.unsqueeze(-1)
+                
             if noise_labels.shape != x.shape:
-                for idx, dim in enumerate(noise_labels.shape):
-                    if noise_labels.shape[idx] == x.shape[idx]:
-                        continue
-                    elif noise_labels.shape[idx] == 1:
-                        continue
-                    else:
-                        pad_amount = x.shape[idx] - noise_labels.shape[idx]
-                        pad_dims = [0] * (2 * (noise_labels.ndim - idx - 1)) + [0, pad_amount]
-                        noise_labels = torch.nn.functional.pad(noise_labels, pad_dims)
-                while noise_labels.ndim < x.ndim:
-                    noise_labels = noise_labels.unsqueeze(-1)
                 noise_labels = noise_labels.expand_as(x)
             # dynamic_noise=True 일 때 noise_labels 최종 shape: [B, C, H, W]
         else:   #If not dynamic noise but when we receive dynamic noise label
@@ -830,6 +849,8 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                     x = torch.cat([x, skips.pop()], dim=1)
                     
                 x = block(x, emb) if (isinstance(block, UNetBlock) or isinstance(block, UNetBlock_AS)) else block(x)
+
+        aux = unpad_from_power_of_two(aux, pad_h, pad_w, orig_H, orig_W)
 
         return aux
 
@@ -1011,6 +1032,8 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                     self.dec[f'{cur_H}x{cur_W}_aux_conv_stem'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=stem_kernel, **init_zero)
 
     def forward(self, x, noise_labels, class_labels, augment_labels=None):
+        x, pad_h, pad_w, orig_H, orig_W = pad_to_power_of_two(x)
+
         # Mapping.
         emb = self.map_noise(noise_labels)
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
@@ -1023,14 +1046,19 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 
                 tmp = tmp * label_dropout_table
             if self.label_type == 'sigma':
+                if pad_h > 0 or pad_w > 0:
+                    tmp = torch.nn.functional.pad(tmp, (0, pad_w, 0, pad_h), mode='constant', value=0)
                 label_emb = self.map_label(tmp)
                 # emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
                 emb = torch.concatenate([emb, label_emb], dim=1)
             elif self.label_type == 'classes':
                 emb = emb + self.map_label(tmp * np.sqrt(self.map_label.in_features))
             elif self.label_type == 'both':
+                tmp_0 = tmp[0]
+                if pad_h > 0 or pad_w > 0:
+                    tmp_0 = torch.nn.functional.pad(tmp_0, (0, pad_w, 0, pad_h), mode='constant', value=0)
                 emb = emb + self.map_label[1](tmp[1] * np.sqrt(self.map_label[1].in_features))
-                label_emb = self.map_label[0](tmp[0])
+                label_emb = self.map_label[0](tmp_0)
                 emb = torch.concatenate([emb, label_emb], dim=1)
             else:
                 assert False, "Unknown label type"
@@ -1066,6 +1094,8 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 if x.shape[1] != block.in_channels:
                     x = torch.cat([x, skips.pop()], dim=1)
                 x = block(x, emb)
+
+        aux = unpad_from_power_of_two(aux, pad_h, pad_w, orig_H, orig_W)
 
         return aux
 
@@ -1372,7 +1402,9 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
-        c_noise = sigma.log() / 4
+        
+        safe_sigma = torch.where(sigma == 0.0, torch.tensor(1e-8, dtype=sigma.dtype, device=sigma.device), sigma)
+        c_noise = safe_sigma.log() / 4
 
         F_x = self.model((c_in * x).to(dtype), c_noise, class_labels=class_labels, **model_kwargs)
         assert F_x.dtype == dtype

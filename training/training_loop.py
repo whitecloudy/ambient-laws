@@ -169,6 +169,8 @@ def training_loop(
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
     wandb_onoff         = False,    # Enable wandb logging
+    allow_tf32          = False,
+    debug_test          = False,
 ):
     # Initialize.
     start_time = time.time()
@@ -177,10 +179,12 @@ def training_loop(
     torch.manual_seed(np.random.randint(1 << 31))
     torch.backends.cudnn.benchmark = cudnn_benchmark
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    # torch.backends.cudnn.allow_tf32 = True
-    # torch.backends.cuda.matmul.allow_tf32 = True
+    if allow_tf32:
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+    else:
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
 
     # Select batch size per GPU.
@@ -206,11 +210,14 @@ def training_loop(
     dataset_shape = dataset_item["image"].shape
     dist.print0(f'Dataset image shape: {dataset_shape}')
     # Initialize temporary directory for training state dumps
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and not debug_test:
         run_dir_name = os.path.basename(os.path.normpath(run_dir))
         temp_dir_path = tempfile.mkdtemp(prefix='ambient-rf_'+run_dir_name+'_')
         latest_saved_kimg = None
         dist.print0(f'Temporary directory for training state dumps: {temp_dir_path}')
+    else:
+        temp_dir_path = None
+        latest_saved_kimg = None
     
     # Construct network.
     dist.print0('Constructing network...')
@@ -296,7 +303,6 @@ def training_loop(
                     current_sigma = torch.zeros_like(current_sigma)
 
                 loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe, original_shape=original_shape)
-                
                 training_stats.report('Loss/loss', loss)
                 (loss).sum().mul(loss_scaling / batch_gpu_total).backward()
 
@@ -380,18 +386,19 @@ def training_loop(
             stats_jsonl.flush()
 
             # Save a copy of the training state dump to the temporary directory
-            if latest_saved_kimg is not None:   # remove the previous dump
-                os.remove(os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')) 
-                os.remove(os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl'))
+            if temp_dir_path is not None:
+                if latest_saved_kimg is not None:   # remove the previous dump
+                    os.remove(os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')) 
+                    os.remove(os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl'))
 
-            # save the new dump
-            save_training_state(temp_dir_path, net, optimizer, cur_nimg)
-            data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
-            with open(os.path.join(temp_dir_path, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
-                pickle.dump(data, f)
+                # save the new dump
+                save_training_state(temp_dir_path, net, optimizer, cur_nimg)
+                data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+                with open(os.path.join(temp_dir_path, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
+                    pickle.dump(data, f)
             
-            latest_saved_kimg = cur_nimg
-            del data # conserve memory
+                latest_saved_kimg = cur_nimg
+                del data # conserve memory
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
         # Update state.
@@ -402,7 +409,7 @@ def training_loop(
         if done:
             break
         
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and temp_dir_path is not None and latest_saved_kimg is not None:
         os.remove(os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')) 
         os.remove(os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl'))
         os.removedirs(temp_dir_path)    

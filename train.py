@@ -73,6 +73,7 @@ def parse_int_list(s):
 
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
+@click.option('--allow_tf32',    help='allowing tf32', metavar='BOOL',                              is_flag=True)
 @click.option('--ls',            help='Loss scaling', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=1, show_default=True)
 @click.option('--bench',         help='Enable cuDNN benchmarking', metavar='BOOL',                  type=bool, default=True, show_default=True)
 @click.option('--cache',         help='Cache dataset in CPU memory', metavar='BOOL',                type=bool, default=True, show_default=True)
@@ -147,6 +148,8 @@ def main(**kwargs):
         opts.wandb = False
         opts.expr_id = 'debug_test'
         opts.wandb_group = 'debug'
+        opts.outdir = 'debug_test'
+        opts.nosubdir = True
 
     if dist.get_rank() == 0 and opts.resume_options is not None and opts.resume is not None:
         with open(opts.resume_options, 'r') as f:
@@ -205,7 +208,8 @@ def main(**kwargs):
 
     c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(flip_probability=opts.flip_aug_ratio, 
                                                                 phase_shift_probability=opts.phase_shift_aug_ratio, 
-                                                                other_collate_fn=[pad_collate_fn(dynamic_noise=opts.dynamic_noise_sigma), torch.utils.data.default_collate])
+                                                                other_collate_fn=[torch.utils.data.default_collate, ])
+                                                                # other_collate_fn=[pad_collate_fn(dynamic_noise=opts.dynamic_noise_sigma), torch.utils.data.default_collate])
 
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
@@ -309,6 +313,7 @@ def main(**kwargs):
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
     c.update(wandb_onoff=opts.wandb)
     c.update(task=opts.task)
+    c.update(allow_tf32=opts.allow_tf32)
 
     # Random seed.
     if opts.seed is not None:
@@ -362,6 +367,7 @@ def main(**kwargs):
         assert not os.path.exists(c.run_dir)
     
     c.no_asm = opts.no_asm
+    c.debug_test = opts.debug_test
 
     # Print options.
     if dist.get_rank() == 0:

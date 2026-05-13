@@ -44,29 +44,42 @@ class EDMLoss:
         # net._set_static_graph()
         while current_sigma.ndim < images.ndim:
             current_sigma = current_sigma.unsqueeze(-1)
+        current_sigma = current_sigma.expand_as(images)
         # current_sigma = current_sigma.unsqueeze(1).unsqueeze(1).unsqueeze(1)
 
+        if original_shape is not None:
+            padding_mask = padding_mask_from_original_shape(original_shape, images.shape)
+        else:
+            padding_mask = torch.ones_like(images)
+
+        current_sigma = current_sigma * padding_mask
+        
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()        
         sigma = torch.clamp(sigma, min=current_sigma + 1e-5)
-        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        y, augment_labels = (images, None)
         
         # add additional noise to reach the level sigma
         n = torch.randn_like(y) * torch.sqrt(sigma ** 2 - current_sigma ** 2)
-        if original_shape is not None:
-            padding_mask = padding_mask_from_original_shape(original_shape, n.shape)
-        else:
-            padding_mask = torch.ones_like(y)
 
         noisy_input = (y + n) * padding_mask
         x0_pred = net(noisy_input, sigma, labels, augment_labels=augment_labels)
         # make it xtn prediction
+
+        # sigma가 0으로 남아있는걸 제거해서 nan 생성 방지
+        if isinstance(sigma, torch.Tensor):
+            nonzero_sigma = torch.where(sigma == 0.0, torch.tensor(1e-8, dtype=sigma.dtype, device=sigma.device), sigma)
+        elif sigma == 0.0:
+            nonzero_sigma = 1e-8
+        else:
+            nonzero_sigma = sigma
+
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
-        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, sigma, current_sigma)
-        
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
+
         # loss weight depends on sigma
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
         loss = weight * ((D_yn - y) ** 2)
         return_sigma = sigma
     
@@ -148,13 +161,16 @@ class EDMLoss_dynamic_sigma:
         # net._set_static_graph()
         while current_sigma.ndim < images.ndim:
             current_sigma = current_sigma.unsqueeze(-1)
+        current_sigma = current_sigma.expand_as(images)
         # current_sigma = current_sigma.unsqueeze(1).unsqueeze(1).unsqueeze(1)
 
         if original_shape is not None:
             padding_mask = padding_mask_from_original_shape(original_shape, images.shape)
         else:
             padding_mask = torch.ones_like(images)
-
+        
+        current_sigma = current_sigma * padding_mask
+        
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
         sigma_center = (rnd_normal * self.P_std + self.P_mean).exp()        
@@ -168,11 +184,19 @@ class EDMLoss_dynamic_sigma:
         noisy_input = (y + n) * padding_mask
         x0_pred = net(noisy_input, sigma, labels, augment_labels=augment_labels)
         # make it xtn prediction
-        # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
-        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, sigma, current_sigma)
 
+        # sigma가 0으로 남아있는걸 제거해서 nan 생성 방지
+        if isinstance(sigma, torch.Tensor):
+            nonzero_sigma = torch.where(sigma == 0.0, torch.tensor(1e-8, dtype=sigma.dtype, device=sigma.device), sigma)
+        elif sigma == 0.0:
+            nonzero_sigma = 1e-8
+        else:
+            nonzero_sigma = sigma
+
+        # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
         # loss weight depends on sigma
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
         loss = weight * ((D_yn - y) ** 2)
         return_sigma = sigma
     
@@ -214,6 +238,7 @@ class EDMLoss_dynamic_sigma:
             # check difference to x0_pred
             consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
             consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
+            
             loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
         
         loss = loss * padding_mask
