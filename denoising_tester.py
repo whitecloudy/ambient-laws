@@ -63,14 +63,14 @@ def _match_axis(source: torch.Tensor, target: torch.Tensor):
         return return_tensor
     
 def cal_SNR(predict : torch.Tensor, truth : torch.Tensor, complex_axis=None):
-    if complex_axis != None:
+    if complex_axis is not None:
         assert predict.dtype != torch.complex and truth.dtype != torch.complex, "\'complex axis\' is given while dtype is already complex!"
         # Handling batch axis
         if complex_axis >= 0:
             complex_axis += 1
 
-        predict_split = torch.split(predict, 2, dim=complex_axis)
-        truth_split = torch.split(truth, 2, dim=complex_axis)
+        predict_split = torch.chunk(predict, 2, dim=complex_axis)
+        truth_split = torch.chunk(truth, 2, dim=complex_axis)
 
         predict = predict_split[0] + 1j * predict_split[1]
         truth = truth_split[0] + 1j * truth_split[1]
@@ -184,6 +184,7 @@ def main(**kwargs):
     dataset_kwargs.additive_noise_sigma = 0.0
     dataset_kwargs.multiply_noise_sigma = 1.0
     dataset_kwargs.only_additive_noise = False
+    dataset_kwargs.noise_mean_flag = opt.same_sigma_level
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=8, prefetch_factor=4)
         
@@ -247,16 +248,21 @@ def main(**kwargs):
                 # complex 축이 지정되지 않은 경우 기존 신호를 그대로 할당합니다.
                 complex_signal = true_signal
 
-            complex_signal = complex_signal / data_norm
-
             # (Batch)
             signal_power = torch.mean(torch.real(complex_signal * torch.conj(complex_signal)), dim=tuple(range(1, complex_signal.ndim)))
 
-            normalized_current_sigma = current_sigma / torch.sqrt(torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim))))
+            sigma_power = torch.sqrt(torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim))))
+            sigma_power = _match_axis(sigma_power, current_sigma)
+
+            normalized_current_sigma = current_sigma / sigma_power
             
             for idx, ratio_SNR in enumerate(ratio_SNR_steps):
                 # (Batch)
-                sigma_SNR_steps = (1/ratio_SNR * signal_power) ** 0.5
+                if complex_axis is not None:
+                    sigma_SNR_steps = (1 / (ratio_SNR * 2) * signal_power) ** 0.5
+                else:
+                    sigma_SNR_steps = (1 / ratio_SNR * signal_power) ** 0.5
+
                 if not opt.same_sigma_level:
                     sigma_SNR_steps = _match_axis(sigma_SNR_steps, normalized_current_sigma)
                     input_sigma = normalized_current_sigma * sigma_SNR_steps
@@ -264,6 +270,7 @@ def main(**kwargs):
                     input_sigma = sigma_SNR_steps
 
                 input_signal = true_signal / data_norm
+                input_sigma = input_sigma / data_norm
 
                 multiply_sigma = _match_axis(input_sigma, input_signal)
 
@@ -292,6 +299,7 @@ def main(**kwargs):
                                                     latents_already_noisy=True,
                                                     **sampler_kwargs
                                                 )
+                # denoised_signal = padded_signal
                 
                 mask_slice = (slice(0, denoised_signal.shape[0]), )+tuple(slice(0, dim) for dim in original_shape[0])
                 denoised_signal = denoised_signal[mask_slice]
@@ -299,6 +307,7 @@ def main(**kwargs):
                 denoised_signal = denoised_signal * data_norm
 
                 predict_SNR_result = cal_SNR(denoised_signal, true_signal, complex_axis=complex_axis)
+                # predict_SNR_result = cal_SNR(denoised_signal, true_signal, complex_axis=None)
                 predict_SNR_result_sum_dist_list[idx] += torch.sum(predict_SNR_result)
         
         # End of dataloader
