@@ -1,3 +1,6 @@
+from turtle import st
+
+from matplotlib.pyplot import step
 import torch
 import numpy as np
 
@@ -50,11 +53,13 @@ def inference_edm_sampler(
     # Adjust noise levels based on what's supported by the network.
     if isinstance(sigma_max, torch.Tensor) and sigma_max.ndim == 1:
         sigma_max = torch.clamp(sigma_max, max=net.sigma_max).view(batch_size, 1).to(device)
+        sigma_max = sigma_max.expand([num_steps, ]+([-1, ]*(len(sigma_max.shape))))
     else:
         sigma_max = min(sigma_max, net.sigma_max)
         
     if isinstance(sigma_min, torch.Tensor) and sigma_min.ndim == 1:
         sigma_min = torch.clamp(sigma_min, min=net.sigma_min).view(batch_size, 1).to(device)
+        sigma_min = sigma_min.expand([num_steps, ]+([-1, ]*(len(sigma_min.shape))))
     else:
         sigma_min = max(sigma_min, net.sigma_min)
 
@@ -62,12 +67,13 @@ def inference_edm_sampler(
 
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    if isinstance(sigma_max, torch.Tensor):
+        for i in range(abs(sigma_max.ndim - step_indices.ndim)):
+            step_indices = step_indices.unsqueeze(-1)
+
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     
-    if t_steps.ndim == 1:
-        t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
-    else:
-        t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:, :1])], dim=1) # t_N = 0
+    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])], dim=0) # t_N = 0
 
     def expand_t(t):
         if isinstance(t, torch.Tensor) and t.ndim > 0:
@@ -87,12 +93,8 @@ def inference_edm_sampler(
     
     for i in range(num_steps): # 0, ..., N-1
         x_cur = x_next
-        if t_steps.ndim == 1:
-            t_cur = t_steps[i]
-            t_next = t_steps[i+1]
-        else:
-            t_cur = t_steps[:, i]
-            t_next = t_steps[:, i+1]
+        t_cur = t_steps[i]
+        t_next = t_steps[i+1]
 
         # Increase noise temporarily.
         if isinstance(t_cur, torch.Tensor) and t_cur.ndim > 0:
@@ -110,7 +112,7 @@ def inference_edm_sampler(
         x_hat = (x_cur + expand_t(step_noise_scale) * S_noise * randn_like(x_cur)) * padding_mask
 
         # Euler step.
-        denoised = net(x_hat, t_hat.expand(batch_size), class_labels).to(torch.float64) * padding_mask
+        denoised = net(x_hat, t_hat, class_labels).to(torch.float64) * padding_mask
         x_list.append(denoised.clone().detach())
         
         # Stop if variance is below threshold
@@ -126,7 +128,7 @@ def inference_edm_sampler(
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
-            denoised = net(x_next, t_next.expand(batch_size), class_labels).to(torch.float64) * padding_mask
+            denoised = net(x_next, t_next, class_labels).to(torch.float64) * padding_mask
             x_list.append(denoised.clone().detach())
             d_prime = (x_next - denoised) / expand_t(t_next)
             x_next = x_hat + expand_t(t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)

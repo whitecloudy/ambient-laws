@@ -9,7 +9,7 @@ import json
 import tqdm
 from training.sampler import inference_edm_sampler as edm_sampler
 from training.sampler import padding_mask_from_original_shape
-from training.dataset import  renewRfProcessedDataset
+from training.dataset import renewRfProcessedDataset
 
 def _power2ceil(original):
     return int(2**np.ceil(np.log2(original)))
@@ -116,6 +116,7 @@ def parse_int_list(s):
 @click.option('--test_SNR_range', 'test_SNR_range', help='SNR range will be tested', metavar='STR',                 type=str, default='5,20', show_default=True)
 @click.option('--test_SNR_step', 'test_SNR_step',   help='SNR step will be tested',                                 type=float, default=1.0, show_default=True)
 @click.option('--same_sigma_level',         help='Whether use same sigma level across all signal matrix',           is_flag=True)
+@click.option('--padding_power2',           is_flag=True)
 
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
@@ -126,6 +127,7 @@ def parse_int_list(s):
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
 @click.option('--data_norm',               help='Data normalization value for the RF data.',                        type=float, default=1.0, show_default=True)
+@click.option('--allow_tf32',              is_flag=True)
 def main(**kwargs):
     dist.init()
 
@@ -136,8 +138,14 @@ def main(**kwargs):
     if dist.get_rank() != 0:
         torch.distributed.barrier()
 
-    data_norm = opt.data_norm
+    if opt.allow_tf32:
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+    else:
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
 
+    data_norm = opt.data_norm
 
     # Load network.
     dist.print0(f'Loading network from "{opt.network_pkl}"...')
@@ -244,7 +252,7 @@ def main(**kwargs):
             # (Batch)
             signal_power = torch.mean(torch.real(complex_signal * torch.conj(complex_signal)), dim=tuple(range(1, complex_signal.ndim)))
 
-            normalized_current_sigma = current_sigma / torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim)))
+            normalized_current_sigma = current_sigma / torch.sqrt(torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim))))
             
             for idx, ratio_SNR in enumerate(ratio_SNR_steps):
                 # (Batch)
@@ -261,13 +269,20 @@ def main(**kwargs):
 
                 input_signal = input_signal + torch.randn_like(input_signal) * multiply_sigma
 
-                padded_signal, _, original_shape = pad_collate_fn(input_signal)
+                if opt.padding_power2:
+                    padded_signal, _, original_shape = pad_collate_fn(input_signal)
+                else:
+                    padded_signal = input_signal
+                    original_shape = input_signal.shape[1:]
 
                 target_shape = (1,) + tuple(padded_signal.shape[1:])
                 input_original_shape = torch.tensor(tuple(original_shape[0]))
                 input_original_shape = input_original_shape.unsqueeze(0) # add batch dimension
 
-                padding_mask = padding_mask_from_original_shape(input_original_shape, target_shape)
+                if opt.padding_power2:
+                    padding_mask = padding_mask_from_original_shape(input_original_shape, target_shape)
+                else:
+                    padding_mask = 1
 
                 denoised_signal, _ =edm_sampler(
                                                     net, 
@@ -302,7 +317,7 @@ def main(**kwargs):
             for idx, snr_db in enumerate(SNR_steps):
                 mean_snr_ratio = total_predict_SNR_sum[idx] / test_dataset_size
                 predict_SNR_result_dict[snr_db] = ratio_to_dB(mean_snr_ratio.item())
-                dist.print0(f"Input SNR: {snr_db:>5.1f} dB  ->  Mean Output SNR (Ratio): {predict_SNR_result_dict[snr_db]:>8.4f} (approx {ratio_to_dB(predict_SNR_result_dict[snr_db]):>7.4f} dB)")
+                dist.print0(f"Input SNR: {snr_db:>5.1f} dB  ->  Mean Output SNR (Ratio): {dB_to_ratio(predict_SNR_result_dict[snr_db]):>8.4f} ({(predict_SNR_result_dict[snr_db]):>7.4f} dB)")
 
         
         if dist.get_rank() == 0:
