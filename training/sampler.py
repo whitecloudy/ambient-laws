@@ -12,8 +12,6 @@ def fit_shape(s, t):
     else:
         return s
 
-
-
 def padding_mask_from_original_shape(original_shape, target_shape):
     padding_mask = torch.zeros(target_shape, device=original_shape.device)
     for i in range(target_shape[0]):
@@ -61,12 +59,14 @@ def inference_edm_sampler(
 
     # Adjust noise levels based on what's supported by the network.
     if isinstance(sigma_max, torch.Tensor):
-        sigma_max = torch.clamp(sigma_max, max=net.sigma_max).to(device)
+        sigma_max = torch.clamp(sigma_max, max=net.sigma_max).unsqueeze(0).to(device)
+        sigma_max = sigma_max.expand([num_steps, ]+([-1, ]*(len(sigma_max.shape))))
     else:
         sigma_max = min(sigma_max, net.sigma_max)
         
     if isinstance(sigma_min, torch.Tensor):
-        sigma_min = torch.clamp(sigma_min, min=net.sigma_min).to(device)
+        sigma_min = torch.clamp(sigma_min, min=net.sigma_min).unsqueeze(0).to(device)
+        sigma_min = sigma_min.expand([num_steps, ]+([-1, ]*(len(sigma_min.shape))))
     else:
         sigma_min = max(sigma_min, net.sigma_min)
 
