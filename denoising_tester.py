@@ -280,7 +280,7 @@ def main(**kwargs):
                     padded_signal, _, original_shape = pad_collate_fn(input_signal)
                 else:
                     padded_signal = input_signal
-                    original_shape = input_signal.shape[1:]
+                    original_shape = [input_signal.shape[1:] for _ in range(input_signal.shape[0])]
 
                 target_shape = (1,) + tuple(padded_signal.shape[1:])
                 input_original_shape = torch.tensor(tuple(original_shape[0]))
