@@ -5,7 +5,7 @@ import torch
 import numpy as np
 
 def fit_shape(s, t):
-    if isinstance(s, torch.Tensor):
+    if isinstance(s, torch.Tensor) and isinstance(t, torch.Tensor):
         while s.ndim < t.ndim:
             s = s.unsqueeze(-1)
         return s
@@ -74,7 +74,8 @@ def inference_edm_sampler(
 
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
-    step_indices = fit_shape(step_indices, latents)
+    step_indices = fit_shape(step_indices, sigma_max)
+    step_indices = fit_shape(step_indices, sigma_min)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])], dim=0) # t_N = 0
