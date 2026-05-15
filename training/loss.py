@@ -167,7 +167,7 @@ class EDMLoss_dynamic_sigma:
         if original_shape is not None:
             padding_mask = padding_mask_from_original_shape(original_shape, images.shape)
         else:
-            padding_mask = torch.ones_like(images)
+            padding_mask = 1
         
         current_sigma = current_sigma * padding_mask
         
@@ -176,6 +176,7 @@ class EDMLoss_dynamic_sigma:
         sigma_center = (rnd_normal * self.P_std + self.P_mean).exp()        
         sigma = torch.tensor(self.__get_lognormal_values(images.shape), device=images.device, dtype=torch.float32) * sigma_center
         sigma = torch.clamp(sigma, min=current_sigma + 1e-5) * padding_mask
+
         y, augment_labels = (images, None)
 
         # add additional noise to reach the level sigma
