@@ -73,10 +73,7 @@ def inference_edm_sampler(
 
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
-    if isinstance(sigma_max, torch.Tensor):
-        for i in range(abs(sigma_max.ndim - step_indices.ndim)):
-            step_indices = step_indices.unsqueeze(-1)
-
+    step_indices =fit_shape(step_indices, latents)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])], dim=0) # t_N = 0
