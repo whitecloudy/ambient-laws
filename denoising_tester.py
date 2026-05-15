@@ -283,7 +283,7 @@ def main(**kwargs):
                     original_shape = input_signal.shape[1:]
 
                 target_shape = (1,) + tuple(padded_signal.shape[1:])
-                input_original_shape = torch.tensor(tuple(original_shape[0]))
+                input_original_shape = torch.tensor(tuple(original_shape))
                 input_original_shape = input_original_shape.unsqueeze(0) # add batch dimension
 
                 if opt.padding_power2:
