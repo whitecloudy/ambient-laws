@@ -848,7 +848,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 if x.shape[1] != block.in_channels:
                     x = torch.cat([x, skips.pop()], dim=1)
                     
-                x = block(x, emb) if (isinstance(block, UNetBlock) or isinstance(block, UNetBlock_AS)) else block(x)
+                x = block(x, emb)
 
         aux = unpad_from_power_of_two(aux, pad_h, pad_w, orig_H, orig_W)
 
