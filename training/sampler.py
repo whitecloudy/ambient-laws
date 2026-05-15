@@ -129,6 +129,10 @@ def inference_edm_sampler(
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
+            if isinstance(t_next, torch.Tensor) and t_hat.ndim == x_hat.ndim:
+                if t_next.shape != x_next.shape:
+                    t_next = t_hat.expand_as(x_next)
+
             denoised = net(x_next, t_next, class_labels).to(torch.float64) * padding_mask
             x_list.append(denoised.clone().detach())
             d_prime = (x_next - denoised) / fit_shape(t_next, x_cur)
