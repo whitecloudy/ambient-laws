@@ -25,9 +25,23 @@ def edm_sampler(
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7, padding_mask=1):
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device).view(-1, *[1]*latents.ndim)
-    sigma_max_exp = sigma_max.unsqueeze(0)
-    sigma_min_exp = sigma_min.unsqueeze(0)
-    t_steps = (sigma_max_exp ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min_exp ** (1 / rho) - sigma_max_exp ** (1 / rho))) ** rho
+    # Adjust noise levels based on what's supported by the network.
+    if isinstance(sigma_max, torch.Tensor):
+        sigma_max = sigma_max.unsqueeze(0)
+        sigma_max = sigma_max.expand([num_steps, ]+([-1, ]*(len(sigma_max.shape)-1)))
+    else:
+        sigma_max = min(sigma_max, net.sigma_max)
+        
+    if isinstance(sigma_min, torch.Tensor):
+        sigma_min = sigma_min.unsqueeze(0)
+        sigma_min = sigma_min.expand([num_steps, ]+([-1, ]*(len(sigma_min.shape)-1)))
+    else:
+        sigma_min = max(sigma_min, net.sigma_min)
+        
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    step_indices = fit_shape(step_indices, sigma_max)
+    step_indices = fit_shape(step_indices, sigma_min)
+    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     
     x_next = latents
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
