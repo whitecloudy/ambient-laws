@@ -106,9 +106,13 @@ def inference_edm_sampler(
             
         t_hat = net.round_sigma(t_cur + gamma * t_cur)
         step_noise_scale = (t_hat ** 2 - t_cur ** 2).clamp(min=0).sqrt()
-        x_hat = (x_cur + fit_shape(step_noise_scale, x_cur) * S_noise * randn_like(x_cur)) * padding_mask
+        step_noise_scale = fit_shape(step_noise_scale, x_cur)
+        x_hat = (x_cur + step_noise_scale * S_noise * randn_like(x_cur)) * padding_mask
 
         # Euler step.
+        if isinstance(t_hat, torch.Tensor) and t_hat.ndim == x_hat.ndim:
+            if t_hat.shape != x_hat.shape:
+                t_hat = t_hat.expand_as(x_hat)
         denoised = net(x_hat, t_hat, class_labels).to(torch.float64) * padding_mask
         x_list.append(denoised.clone().detach())
         
