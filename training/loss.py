@@ -207,29 +207,35 @@ class EDMLoss_dynamic_sigma:
             new_rnd_normal = torch.randn_like(rnd_normal)
             new_sigma_center = (new_rnd_normal * self.P_std + self.P_mean).exp()
             new_sigma = torch.tensor(self.__get_lognormal_values(images.shape), device=images.device, dtype=torch.float32) * new_sigma_center
-            new_sigma = torch.clamp(new_sigma, max=sigma)
+
+            new_sigma = torch.clamp(new_sigma, max=nonzero_sigma)
+            new_sigma = torch.clamp(new_sigma, min=1e-8)
 
             # we will only keep the first batch_size / self.num_primes part of the batch
             consistency_batch_size = self.consistency_batch_size
             noisy_input = noisy_input[:consistency_batch_size]
-            sigma = sigma[:consistency_batch_size]
+            sigma_for_sampler = nonzero_sigma[:consistency_batch_size]
             new_sigma = new_sigma[:consistency_batch_size]
             if labels is not None:
                 labels = labels[:consistency_batch_size]
-            edm_padding_mask = padding_mask[:consistency_batch_size]
+            if isinstance(padding_mask, torch.Tensor):
+                edm_padding_mask = padding_mask[:consistency_batch_size]
+            else:
+                edm_padding_mask = padding_mask
 
             # repeat everything num_primes times
             noisy_input = noisy_input.repeat_interleave(self.num_primes, dim=0)
-            sigma = sigma.repeat_interleave(self.num_primes, dim=0)
+            sigma_for_sampler = sigma_for_sampler.repeat_interleave(self.num_primes, dim=0)
             new_sigma = new_sigma.repeat_interleave(self.num_primes, dim=0)
             if labels is not None:
                 labels = labels.repeat_interleave(self.num_primes, dim=0)
-            edm_padding_mask = edm_padding_mask.repeat_interleave(self.num_primes, dim=0)
+            if isinstance(edm_padding_mask, torch.Tensor):
+                edm_padding_mask = edm_padding_mask.repeat_interleave(self.num_primes, dim=0)
 
             # run sampler from sigma -> new_sigma
             with torch.no_grad() if not self.with_grad else torch.enable_grad():
                 x_t_prime = edm_sampler(net, noisy_input, class_labels=labels, num_steps=self.num_consistency_steps, 
-                                        sigma_min=new_sigma, sigma_max=sigma, padding_mask=edm_padding_mask) 
+                                        sigma_min=new_sigma, sigma_max=sigma_for_sampler, padding_mask=edm_padding_mask) 
             # get predictions for x_t_prime
             x0_pred_prime = net(x_t_prime, new_sigma, labels)
             # group together predictions
@@ -239,7 +245,6 @@ class EDMLoss_dynamic_sigma:
             # check difference to x0_pred
             consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
             consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
-            
             loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
         
         loss = loss * padding_mask
