@@ -110,6 +110,7 @@ def parse_int_list(s):
 @click.option('--additive_noise_sigma', help='Standard deviation of the additive noise to be added to the clean images during corruption.', type=float, default=0.0, show_default=True)
 @click.option('--multiply_noise_sigma', help='Multiplying factor of the noise to be added to the clean images during corruption.', type=float, default=1.0, show_default=True)
 @click.option('--dynamic_noise_sigma', help='Wheteher to use mean noise or not.', is_flag=True, default=False)
+@click.option('--not_dynamic_noise_sigma_model', help='The model used to predict with dynamic noise sigma for each sample.', is_flag=True, default=False)
 @click.option('--noise_mean_alter_way', help='Whether to use alternative way to add noise, which is to directly add noise with the given sigma without multiplying with the clean image.', is_flag=True, default=False)
 @click.option('--only_additive_noise', help='Whether to only use additive noise for corruption without natural noise.', is_flag=True)
 
@@ -261,9 +262,11 @@ def main(**kwargs):
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
 
-    if opts.dynamic_noise_sigma:
-        c.network_kwargs.update(dynamic_noise=opts.dynamic_noise_sigma)
-
+    if not opts.not_dynamic_noise_sigma_model:
+        if (opts.arch in ['ddpmpp', 'ddpmpp_256', 'ddpmpp_192']):
+            c.network_kwargs.update(dynamic_noise=True)
+        else:
+            raise ValueError(f'Dynamic noise sigma model is only supported for ddpmpp architectures for now, but got {opts.arch}')
     
     # Select batch size per GPU.
     batch_gpu = opts.batch_gpu

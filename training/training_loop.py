@@ -304,6 +304,9 @@ def training_loop(
 
                 loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe, original_shape=original_shape)
                 training_stats.report('Loss/loss', loss)
+                if debug_test:
+                    with torch.no_grad():
+                        dist.print0(f'loss: {torch.mean(loss).item()}')
                 (loss).sum().mul(loss_scaling / batch_gpu_total).backward()
 
         # Update weights.
