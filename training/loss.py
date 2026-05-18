@@ -294,7 +294,7 @@ class EDMLoss_boosted_sigma:
         normalized_current_sigma = (current_sigma / (torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim)), keepdim=True)**0.5)).to(torch.float64).to(images.device)
 
         if self.no_asm:
-            current_sigma = torch.tensor(0.0)
+            current_sigma = 0.0
         
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
