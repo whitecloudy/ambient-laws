@@ -299,7 +299,7 @@ def training_loop(
                 else:
                     original_shape = None
 
-                if no_asm:
+                if (loss_kwargs.class_name != 'training.loss.EDMLoss_boosted_sigma') and no_asm:
                     current_sigma = torch.zeros_like(current_sigma)
 
                 loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe, original_shape=original_shape)
