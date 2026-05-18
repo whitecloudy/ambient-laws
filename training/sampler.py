@@ -69,6 +69,11 @@ def inference_edm_sampler(
     batch_size = latents.shape[0]
     device = latents.device
 
+    if isinstance(padding_mask, float) and padding_mask == 1:
+        padding_exist = False
+    else:
+        padding_exist = True
+
     padding_mask = torch.tensor(padding_mask, device=device)
 
     # Adjust noise levels based on what's supported by the network.
@@ -117,40 +122,79 @@ def inference_edm_sampler(
             )
         else:
             gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
-            
-        t_hat = net.round_sigma(t_cur + gamma * t_cur)
-        step_noise_scale = (t_hat ** 2 - t_cur ** 2).clamp(min=0).sqrt()
+
+        t_cur_dynamic = t_cur
+        t_hat_dynamic = net.round_sigma(t_cur_dynamic + gamma * t_cur_dynamic)
+        t_next_dynamic = t_next
+        step_noise_scale = (t_hat_dynamic ** 2 - t_cur_dynamic ** 2).clamp(min=0).sqrt()
         step_noise_scale = fit_shape(step_noise_scale, x_cur)
+
+        if isinstance(step_noise_scale, torch.Tensor) and step_noise_scale.shape != x_cur.shape and padding_exist:
+            pad_width = []
+            for dim_idx in range(x_cur.ndim - 1, -1, -1):
+                if step_noise_scale.shape[dim_idx] == 1 or step_noise_scale.shape[dim_idx] == x_cur.shape[dim_idx]:
+                    pad_width.extend([0, 0])
+                else:
+                    pad_width.extend([0, max(0, x_cur.shape[dim_idx] - step_noise_scale.shape[dim_idx])])
+            step_noise_scale = torch.nn.functional.pad(step_noise_scale, tuple(pad_width))
         x_hat = (x_cur + step_noise_scale * S_noise * randn_like(x_cur)) * padding_mask
 
         # Euler step.
-        if isinstance(t_hat, torch.Tensor) and t_hat.ndim == x_hat.ndim:
-            if t_hat.shape != x_hat.shape:
-                t_hat = t_hat.expand_as(x_hat)
-        denoised = net(x_hat, t_hat, class_labels).to(torch.float64) * padding_mask
+        t_hat_net = t_hat_dynamic
+        if padding_exist:
+            t_hat_net = torch.mean(t_hat_dynamic, dim=list(range(1, t_hat_dynamic.ndim)), keepdim=True)
+        elif isinstance(t_hat_net, torch.Tensor) and t_hat_net.ndim == x_hat.ndim:
+            if t_hat_net.shape != x_hat.shape:
+                t_hat_net = t_hat_net.expand_as(x_hat)
+        denoised = net(x_hat, t_hat_net, class_labels).to(torch.float64) * padding_mask
         x_list.append(denoised.clone().detach())
         
         # Stop if variance is below threshold
-        if isinstance(t_next, torch.Tensor) and t_next.ndim > 0:
-            if (t_next < stop_sigma).all():
+        if isinstance(t_next_dynamic, torch.Tensor) and t_next_dynamic.ndim > 0:
+            if (t_next_dynamic < stop_sigma).all():
                 return denoised, x_list
         else:
-            if t_next < stop_sigma:
+            if t_next_dynamic < stop_sigma:
                 return denoised, x_list
 
-        d_cur = (x_hat - denoised) / fit_shape(t_hat, x_cur)
-        x_next = x_hat + fit_shape(t_next - t_hat, x_cur) * d_cur
+        d_cur = (x_hat - denoised) / fit_shape(t_hat_net, x_cur)
+        step_noise_scale = fit_shape(t_next_dynamic - t_hat_dynamic, x_cur)
+        if isinstance(step_noise_scale, torch.Tensor) and step_noise_scale.shape != x_cur.shape and padding_exist:
+            pad_width = []
+            for dim_idx in range(x_cur.ndim - 1, -1, -1):
+                if step_noise_scale.shape[dim_idx] == 1 or step_noise_scale.shape[dim_idx] == x_cur.shape[dim_idx]:
+                    pad_width.extend([0, 0])
+                else:
+                    pad_width.extend([0, max(0, x_cur.shape[dim_idx] - step_noise_scale.shape[dim_idx])])
+            step_noise_scale = torch.nn.functional.pad(step_noise_scale, tuple(pad_width))
+
+        x_pred = x_hat + step_noise_scale * d_cur * padding_mask
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
-            if isinstance(t_next, torch.Tensor) and t_hat.ndim == x_hat.ndim:
-                if t_next.shape != x_next.shape:
-                    t_next = t_next.expand_as(x_next)
+            t_next_net = t_next_dynamic
+            if padding_exist:
+                t_next_net = torch.mean(t_next_dynamic, dim=list(range(1, t_next_dynamic.ndim)), keepdim=True)
+            elif isinstance(t_next_net, torch.Tensor) and t_next_net.ndim == x_pred.ndim:
+                if t_next_net.shape != x_pred.shape:
+                    t_next_net = t_next_net.expand_as(x_pred)
 
-            denoised = net(x_next, t_next, class_labels).to(torch.float64) * padding_mask
-            x_list.append(denoised.clone().detach())
-            d_prime = (x_next - denoised) / fit_shape(t_next, x_cur)
-            x_next = x_hat + fit_shape(t_next - t_hat, x_cur) * (0.5 * d_cur + 0.5 * d_prime)
-        
+            denoised_prime = net(x_pred, t_next_net, class_labels).to(torch.float64) * padding_mask
+            x_list.append(denoised_prime.clone().detach())
+            d_prime = (x_pred - denoised_prime) / fit_shape(t_next_net, x_cur)
+            
+            step_noise_scale = fit_shape(t_next_dynamic - t_hat_dynamic, x_hat)
+            if isinstance(step_noise_scale, torch.Tensor) and step_noise_scale.shape != x_hat.shape and padding_exist:
+                pad_width = []
+                for dim_idx in range(x_cur.ndim - 1, -1, -1):
+                    if step_noise_scale.shape[dim_idx] == 1 or step_noise_scale.shape[dim_idx] == x_hat.shape[dim_idx]:
+                        pad_width.extend([0, 0])
+                    else:
+                        pad_width.extend([0, max(0, x_hat.shape[dim_idx] - step_noise_scale.shape[dim_idx])])
+                step_noise_scale = torch.nn.functional.pad(step_noise_scale, tuple(pad_width))
+
+            x_next = x_hat + step_noise_scale * (0.5 * d_cur + 0.5 * d_prime)
+        else:
+            x_next = x_pred
 
     return x_next, x_list
