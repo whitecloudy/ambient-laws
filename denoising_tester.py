@@ -80,6 +80,51 @@ def cal_SNR(predict : torch.Tensor, truth : torch.Tensor, complex_axis=None):
     ratio = PS / PN
     return ratio
 
+def static_noise_generator(input_signal : torch.Tensor, current_sigma, target_sigma : torch.Tensor):
+    device = input_signal.device
+    dtype = input_signal.dtype
+
+    target_sigma = _match_axis(target_sigma, input_signal)
+    noise_sigma = target_sigma.to(dtype).to(device)
+
+    noise = torch.randn_like(input_signal) * noise_sigma
+
+    return input_signal + noise, noise, noise_sigma
+
+def dynamic_noise_generator(input_signal : torch.Tensor, current_sigma, target_sigma : torch.Tensor):
+    lognorm_dist_mean = 0.11322956881040724
+    lognorm_dist_loc = -0.3077225803161989
+    lognorm_dist_sigma = 0.3644639849662781
+    def __get_lognormal_values(size):
+        noise_sigma = np.random.lognormal(lognorm_dist_mean, lognorm_dist_sigma, size) + lognorm_dist_loc
+        return noise_sigma
+    
+    device = input_signal.device
+    dtype = input_signal.dtype
+    
+    target_sigma = _match_axis(target_sigma, input_signal)
+    
+    noise_sigma = torch.from_numpy(__get_lognormal_values(input_signal.shape)).to(device) * target_sigma
+    noise_sigma = noise_sigma.to(dtype).to(device)
+
+    noise = torch.randn_like(input_signal) * noise_sigma
+    
+    return input_signal + noise, noise, noise_sigma
+
+def boosted_noise_generator(input_signal : torch.Tensor, current_sigma : torch.Tensor, target_sigma : torch.Tensor):
+    device = input_signal.device
+    dtype = input_signal.dtype
+
+    target_sigma = _match_axis(target_sigma, input_signal)
+    current_sigma = _match_axis(current_sigma, input_signal)
+
+    normalized_current_sigma = current_sigma / torch.sqrt(torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim)), keepdim=True))
+    noise_sigma = normalized_current_sigma * target_sigma
+    noise_sigma = noise_sigma.to(dtype).to(device)
+
+    noise = torch.randn_like(input_signal) * noise_sigma
+
+    return input_signal + noise, noise, noise_sigma
 
 #----------------------------------------------------------------------------
 # Parse a comma separated list of numbers or ranges and return a list of ints.
@@ -115,8 +160,10 @@ def parse_int_list(s):
 @click.option('--flip_dataset',             help='Whether to flip the dataset to use the removed data',             is_flag=True)
 @click.option('--test_SNR_range', 'test_SNR_range', help='SNR range will be tested', metavar='STR',                 type=str, default='5,20', show_default=True)
 @click.option('--test_SNR_step', 'test_SNR_step',   help='SNR step will be tested',                                 type=float, default=1.0, show_default=True)
-@click.option('--same_sigma_level',         help='Whether use same sigma level across all signal matrix',           is_flag=True)
+# @click.option('--same_sigma_level',         help='Whether use same sigma level across all signal matrix',           is_flag=True)
 @click.option('--padding_power2',           is_flag=True)
+
+@click.option('--noise_type',               help='Noise distribution type',     metavar='static|dynamic|boosted',   type=click.Choice(['static', 'dynamic', 'boosted']), default='static', show_default=True)
 
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
@@ -144,6 +191,22 @@ def main(**kwargs):
     else:
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cuda.matmul.allow_tf32 = False
+
+    noise_type = opt.noise_type
+
+    noise_generator = None
+
+    if noise_type == 'static':
+        same_sigma_level = True
+        noise_generator = static_noise_generator
+    elif noise_type == 'dynamic':
+        same_sigma_level = False
+        noise_generator = dynamic_noise_generator
+    elif noise_type == 'boosted':
+        same_sigma_level = False
+        noise_generator = boosted_noise_generator
+    else:
+        raise ValueError(f"Unsupported noise type: {noise_type}")
 
     data_norm = opt.data_norm
 
@@ -184,7 +247,7 @@ def main(**kwargs):
     dataset_kwargs.additive_noise_sigma = 0.0
     dataset_kwargs.multiply_noise_sigma = 1.0
     dataset_kwargs.only_additive_noise = False
-    dataset_kwargs.noise_mean_flag = opt.same_sigma_level
+    dataset_kwargs.noise_mean_flag = False
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=8, prefetch_factor=4)
         
@@ -250,11 +313,6 @@ def main(**kwargs):
 
             # (Batch)
             signal_power = torch.mean(torch.real(complex_signal * torch.conj(complex_signal)), dim=tuple(range(1, complex_signal.ndim)))
-
-            sigma_power = torch.sqrt(torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim))))
-            sigma_power = _match_axis(sigma_power, current_sigma)
-
-            normalized_current_sigma = current_sigma / sigma_power
             
             for idx, ratio_SNR in enumerate(ratio_SNR_steps):
                 # (Batch)
@@ -263,18 +321,12 @@ def main(**kwargs):
                 else:
                     sigma_SNR_steps = (1 / ratio_SNR * signal_power) ** 0.5
 
-                if not opt.same_sigma_level:
-                    sigma_SNR_steps = _match_axis(sigma_SNR_steps, normalized_current_sigma)
-                    input_sigma = normalized_current_sigma * sigma_SNR_steps
-                else:
-                    input_sigma = sigma_SNR_steps
-
+                input_signal, added_noise, input_sigma = noise_generator(true_signal, 
+                                                                         current_sigma, 
+                                                                         sigma_SNR_steps)
+                
                 input_signal = true_signal / data_norm
                 input_sigma = input_sigma / data_norm
-
-                multiply_sigma = _match_axis(input_sigma, input_signal)
-
-                input_signal = input_signal + torch.randn_like(input_signal) * multiply_sigma
 
                 if opt.padding_power2:
                     padded_signal, _, original_shape = pad_collate_fn(input_signal)
