@@ -105,11 +105,12 @@ def dynamic_noise_generator(input_signal : torch.Tensor, current_sigma, target_s
     target_sigma = _match_axis(target_sigma, input_signal)
     
     noise_sigma = torch.from_numpy(__get_lognormal_values(input_signal.shape)).to(device) * target_sigma
+    noise_sigma =torch.clamp(noise_sigma, min=1e-5)
     noise_sigma = noise_sigma.to(dtype).to(device)
 
     noise = torch.randn_like(input_signal) * noise_sigma
     
-    return input_signal + noise, noise, noise_sigma
+    return (input_signal + noise), noise, noise_sigma
 
 def boosted_noise_generator(input_signal : torch.Tensor, current_sigma : torch.Tensor, target_sigma : torch.Tensor):
     device = input_signal.device
@@ -325,7 +326,7 @@ def main(**kwargs):
                                                                          current_sigma, 
                                                                          sigma_SNR_steps)
                 
-                input_signal = true_signal / data_norm
+                input_signal = input_signal / data_norm
                 input_sigma = input_sigma / data_norm
 
                 if opt.padding_power2:
