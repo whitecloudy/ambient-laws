@@ -52,7 +52,7 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp_256', 'ddpmpp_192','ddpmpp', 'ncsnpp', 'adm', 'widar_ddpmpp', 'widar_ddpmpp_stem256', 'widar_ddpmpp_stem512']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic']), default='edm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',            type=str, default=None, show_default=True)
@@ -281,12 +281,14 @@ def main(**kwargs):
     consistency_batch_size_per_gpu = consistency_batch_size_per_gpu_total // num_accumulation_rounds
     assert opts.consistency_batch_size == consistency_batch_size_per_gpu * dist.get_world_size() * num_accumulation_rounds
 
-    assert opts.precond == 'edm' or opts.precond == 'edm_dynamic'
+    assert opts.precond == 'edm' or opts.precond == 'edm_dynamic' or opts.precond == 'edm_boosted_sigma', f"Only edm, edm_dynamic, and edm_boosted_sigma are supported for now, but got {opts.precond}"
     c.network_kwargs.class_name = 'training.networks.EDMPrecond'
     if opts.precond == 'edm_dynamic':
         c.loss_kwargs.class_name = 'training.loss.EDMLoss_dynamic_sigma'
     elif opts.precond == 'edm':
         c.loss_kwargs.class_name = 'training.loss.EDMLoss'
+    elif opts.precond == 'edm_boosted_sigma':
+        c.loss_kwargs.class_name = 'training.loss.EDMLoss_boosted_sigma'
     c.loss_kwargs.update(consistency_batch_size_per_gpu=consistency_batch_size_per_gpu)
     # whether to use weight for the consistency terms
     c.loss_kwargs.update(with_weight=opts.with_weight)
@@ -295,6 +297,7 @@ def main(**kwargs):
     c.loss_kwargs.update(num_consistency_steps=opts.num_consistency_steps)
     c.loss_kwargs.update(num_primes=opts.num_primes)
     c.loss_kwargs.update(consistency_coeff=opts.consistency_coeff)
+    c.loss_kwargs.update(no_asm=opts.no_asm)
 
     # Network options.
     if opts.cbase is not None:
