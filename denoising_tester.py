@@ -279,8 +279,6 @@ def main(**kwargs):
     }
     sampler_kwargs = {k: v for k, v in sampler_kwargs.items() if v is not None}
 
-    predict_SNR_result_dict = {}
-
     with torch.inference_mode(True):
         predict_SNR_result_sum_dist_list = torch.zeros(ratio_SNR_steps.shape[0], device=device)
         for dataset_item in tqdm.tqdm(dataloader_obj, unit='iter', disable=(dist.get_rank() != 0)):
@@ -371,6 +369,8 @@ def main(**kwargs):
 
         torch.distributed.gather(predict_SNR_result_sum_dist_list, gather_list=collect_predict_SNR_sum_list, dst=0)
 
+        predict_SNR_result_dict = []
+
         if dist.get_rank() == 0:
             # 모든 GPU에서 계산된 합계를 더함
             total_predict_SNR_sum = sum(collect_predict_SNR_sum_list)
@@ -378,8 +378,9 @@ def main(**kwargs):
             dist.print0("\n=== Denoising Test Results ===")
             for idx, snr_db in enumerate(SNR_steps):
                 mean_snr_ratio = total_predict_SNR_sum[idx] / test_dataset_size
-                predict_SNR_result_dict[snr_db] = ratio_to_dB(mean_snr_ratio.item())
-                dist.print0(f"Input SNR: {snr_db:>5.1f} dB  ->  Mean Output SNR (Ratio): {dB_to_ratio(predict_SNR_result_dict[snr_db]):>8.4f} ({(predict_SNR_result_dict[snr_db]):>7.4f} dB)")
+                
+                predict_SNR_result_dict.append({"Input SNR": snr_db, "Output SNR": ratio_to_dB(mean_snr_ratio.item())})
+                dist.print0(f"Input SNR: {snr_db:>5.1f} dB  ->  Mean Output SNR (Ratio): {dB_to_ratio(predict_SNR_result_dict[-1]['Output SNR']):>8.4f} ({predict_SNR_result_dict[-1]['Output SNR']:>7.4f} dB)")
 
         
         if dist.get_rank() == 0:
@@ -393,7 +394,7 @@ def main(**kwargs):
                     os.makedirs(out_path, exist_ok=True)
                     out_path = os.path.join(out_path, 'predict_SNR_result.csv')
                 
-                pd.DataFrame(predict_SNR_result_dict, index=[0]).to_csv(out_path, index=False)
+                pd.DataFrame(predict_SNR_result_dict).to_csv(out_path, index=False)
                 dist.print0(f"Saved SNR results to {out_path}")
 
                 opt_out_path = out_path.replace('.csv', '_opt.json')
