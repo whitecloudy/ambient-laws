@@ -386,7 +386,7 @@ def training_loop(
             dist.print0('Aborting...')
 
         # Run validation.
-        if validation_on_off and validation_dataset_iterator is not None and (validation_interval_tick > 0) and (cur_tick % validation_interval_tick == 0):
+        if validation_on_off and validation_dataset_iterator is not None and (validation_interval_tick > 0) and ((cur_tick+1) % validation_interval_tick == 0):
             ddp.eval()
             with torch.no_grad():
                 with tqdm.tqdm(total=validation_kwargs.validation_iterations * len(validation_dataset_iterator), desc="Validation", disable=not dist.get_rank() == 0) as pbar:

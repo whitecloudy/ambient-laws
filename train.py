@@ -124,8 +124,8 @@ def parse_int_list(s):
 
 # Validation params
 @click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='KIMG', type=click.IntRange(min=-1), default=50, show_default=True)
-@click.option('--validation_iterations', help='Number of iterations to run for validation.', metavar='INT', type=click.IntRange(min=1), default=1, show_default=True)
-@click.option('--validation_batch_size', help='Batch size for validation.', metavar='INT', type=click.IntRange(min=1), default=32, show_default=True)
+@click.option('--validation_iterations', help='Number of iterations to run for validation.', metavar='INT', type=click.IntRange(min=1), default=5, show_default=True)
+@click.option('--validation_batch_size', help='Batch size for validation.', metavar='INT', type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--validation_data', help='Path to the validation data. If not specified, portion of the training data will be used.', metavar='ZIP|DIR', type=str, default=None)
 
 # Wandb related
