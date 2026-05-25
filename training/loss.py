@@ -94,6 +94,8 @@ class EDMLoss:
 
             # we will only keep the first batch_size / self.num_primes part of the batch
             consistency_batch_size = self.consistency_batch_size
+            if noisy_input.shape[0] < consistency_batch_size:
+                consistency_batch_size = noisy_input.shape[0]
             noisy_input = noisy_input[:consistency_batch_size]
             sigma = sigma[:consistency_batch_size]
             new_sigma = new_sigma[:consistency_batch_size]

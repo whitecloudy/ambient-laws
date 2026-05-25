@@ -157,6 +157,8 @@ def main(**kwargs):
         opts.wandb_group = 'debug'
         opts.outdir = 'debug_test'
         opts.nosubdir = True
+        opts.validation_interval = 1
+        opts.validation_iterations = 1
 
     if dist.get_rank() == 0 and opts.resume_options is not None and opts.resume is not None:
         with open(opts.resume_options, 'r') as f:
