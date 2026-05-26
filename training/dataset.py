@@ -898,7 +898,7 @@ class rf_augmentation_collate_fn(object):
                 real_part, imag_part = np.split(img, 2, axis=complex_axis)
                 img = real_part + 1j * imag_part
 
-                if label.size > 0:
+                if label.size > 0 and len(label.shape) > complex_axis:
                     real_part, imag_part = np.split(label, 2, axis=complex_axis)
                     label = real_part + 1j * imag_part
 
@@ -915,7 +915,7 @@ class rf_augmentation_collate_fn(object):
             if complex_axis is not None:
                 # 다시 실수 형태로 변환
                 shifted_img = np.concatenate((shifted_img.real, shifted_img.imag), axis=complex_axis)
-                if shifted_label.size > 0:
+                if shifted_label.size > 0 and len(shifted_label.shape) > complex_axis:
                     shifted_label = np.concatenate((shifted_label.real, shifted_label.imag), axis=complex_axis)
 
             item['image'] = shifted_img
@@ -980,7 +980,7 @@ class rf_augmentation_collate_fn(object):
                         item['sigma'] = np.take(noise_sigma, flip_idx, axis=ant_axis)
                     else:
                         warnings.warn(f"Sigma shape {noise_sigma.shape} does not match expected antenna axis size {ant_axis_size}, skipping sigma flip")
-                if label.shape[0] != 0:
+                if label.shape[0] != 0 and len(label.shape) > ant_axis:
                     item['label'] = np.take(label, flip_idx, axis=ant_axis)
                 item['flip_aug'] = 1
 
