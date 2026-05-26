@@ -111,14 +111,17 @@ class MLPConditionEmbedding(nn.Module):
 class PositionEmbedding(nn.Module):
     def __init__(self, max_len, input_dim, hidden_dim):
         super().__init__()
-        self.register_buffer('embedding', self._build_embedding(
-            max_len, hidden_dim), persistent=False)
+        # self.register_buffer('embedding', self._build_embedding(
+        #     max_len, hidden_dim), persistent=False)
+        embedding_tensor = self._build_embedding(max_len, hidden_dim)
+        self.embedding = nn.Parameter(embedding_tensor, requires_grad=False)
         self.projection = cm.ComplexLinear(input_dim, hidden_dim)
         self.apply(init_weight_xavier)
 
     def forward(self, x): 
         x = self.projection(x)
-        return cm.complex_mul(x, self.embedding.to(x.device))
+        rt = cm.complex_mul(x, self.embedding.to(x.device).clone())
+        return rt
 
     def _build_embedding(self, max_len, hidden_dim):
         steps = torch.arange(max_len).unsqueeze(1)  # [P,1]
@@ -216,7 +219,7 @@ class FinalLayer(nn.Module):
 #         self.embed_dim = params.embed_dim  # E
 #         self.cond_dim = params.cond_dim[-1]  # C
 #         self.dropout = params.dropout
-#         self.task_id = params.task_id
+#         self.task_id = [params.task_id]
 #         self.mlp_ratio = params.mlp_ratio
 #         self.p_embed = PositionEmbedding(
 #             self.input_len, self.input_dim, self.hidden_dim)

@@ -54,11 +54,13 @@ class ComplexDropout(nn.Module):
         self.p = p
 
     def forward(self, X):
-        device = X.device
-        dtype = X.dtype
-        mask = torch.ones(*X.shape[-3:], device=device, dtype=dtype)
-        mask = F.dropout1d(mask, p=0.5, training=self.training)
-        return torch.mul(X, mask)
+        if self.p == 0.0 or not self.training:
+            return X
+        mask_shape = list(X.shape)
+        mask_shape[-1] = 1
+        mask = torch.ones(mask_shape, device=X.device, dtype=X.dtype)
+        mask = F.dropout(mask, p=self.p, training=True)
+        return X * mask
 
 
 class ComplexGELU(nn.Module):

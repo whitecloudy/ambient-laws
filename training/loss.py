@@ -124,7 +124,11 @@ class EDMLoss:
             # check difference to x0_pred
             consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
             consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
-            loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
+            # loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
+            
+            # In-place 연산 방지
+            loss_consistency_part = self.consistency_coeff * consistency_weight * consistency_loss
+            loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
         
         loss = loss * padding_mask
         return loss, x0_pred, return_sigma
@@ -250,7 +254,11 @@ class EDMLoss_dynamic_sigma:
             # check difference to x0_pred
             consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
             consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
-            loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
+            # loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
+            
+            # In-place 연산 방지
+            loss_consistency_part = self.consistency_coeff * consistency_weight * consistency_loss
+            loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
         
         loss = loss * padding_mask
         return loss, x0_pred, return_sigma
@@ -372,7 +380,11 @@ class EDMLoss_boosted_sigma:
             # check difference to x0_pred
             consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
             consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
-            loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
+            # loss[:consistency_batch_size] += self.consistency_coeff * consistency_weight * consistency_loss
+            
+            # In-place 연산 방지
+            loss_consistency_part = self.consistency_coeff * consistency_weight * consistency_loss
+            loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
         
         loss = loss * padding_mask
         return loss, x0_pred, return_sigma
