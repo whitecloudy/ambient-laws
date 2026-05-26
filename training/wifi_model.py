@@ -81,11 +81,12 @@ class PositionalEmbedding(torch.nn.Module):
         self.endpoint = endpoint
 
     def forward(self, x):
-        freqs = torch.arange(start=0, end=self.num_channels//2, dtype=torch.float32, device=x.device)
-        freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
+        freqs = torch.arange(start=0, end=self.num_channels, dtype=torch.float32, device=x.device)
+        freqs = freqs / (self.num_channels - (1 if self.endpoint else 0))
         freqs = (1 / self.max_positions) ** freqs
+        x = x.view(-1)
         x = x.ger(freqs.to(x.dtype))
-        x = torch.cat([x.cos(), x.sin()], dim=1)
+        x = torch.stack([x.cos(), x.sin()], dim=-1)
         return x
 
 
@@ -344,13 +345,15 @@ class tfdiff_WiFi(nn.Module):
         hidden_dim=128,
         num_heads=8,
         sample_rate=512,
-        max_step=1000,
+        max_step=10000,
         embed_dim=256,
         cond_dim=6,
         num_block=32,
         learn_tfdiff=False,
         dropout=0.0,
         mlp_ratio=4,
+        label_dropout=0.0,
+        dynamic_noise=False,
     ):
         super().__init__()
         self.learn_tfdiff = learn_tfdiff
@@ -360,6 +363,7 @@ class tfdiff_WiFi(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.mlp_ratio = mlp_ratio
+        self.dynamic_noise = dynamic_noise
         self.p_embed = PositionEmbedding(
             sample_rate, input_dim, hidden_dim)
         self.t_embed = DiffusionEmbedding(
@@ -372,7 +376,46 @@ class tfdiff_WiFi(nn.Module):
         ])
         self.final_layer = FinalLayer(self.hidden_dim, self.output_dim)
 
-    def forward(self, x, t, c):
+    def forward(self, x, noise_labels, class_labels, augment_labels=None):
+        """
+        Args:
+            x: Input tensor of shape [Batch_size, Sequence_length, Feature_dimension]
+               or [Batch_size, Antenna, Sequence_length, Feature_dimension].
+               (예: [B, sample_rate, input_dim] 또는 [B, A, sample_rate, F] 형태의 torch.complex64 텐서.
+               4차원일 경우 Antenna 차원을 Feature_dimension으로 병합하여 [B, sample_rate, A * F]로 변환됨)
+            noise_labels: Noise labels tensor.
+            class_labels: Class labels tensor.
+        """
+        x = x
+        
+        antenna_reshape = False
+
+        if x.ndim == 5:
+            B, A, S, F, C = x.shape
+            # [B, A, S, F] -> [B, S, A, F] -> [B, S, A * F]
+            x = x.permute(0, 2, 1, 3, 4).reshape(B, S, A * F, C)
+            antenna_reshape = True
+            if noise_labels.shape == (B, A, S, F, C):
+                noise_labels = noise_labels.permute(0, 2, 1, 3, 4).reshape(B, S, A * F, C)
+        
+        if self.dynamic_noise:
+            while noise_labels.ndim < x.ndim:
+                noise_labels = noise_labels.unsqueeze(-1)
+                
+            if noise_labels.shape != x.shape:
+                noise_labels = noise_labels.expand_as(x)
+            # dynamic_noise=True 일 때 noise_labels 최종 shape: [B, C, H, W]
+        else:   #If not dynamic noise but when we receive dynamic noise label
+            if noise_labels.ndim > 1:   # Expect only [Batch, ]
+                noise_labels = torch.sqrt(torch.mean(torch.flatten(noise_labels, start_dim=1)**2, dim=1))
+            # dynamic_noise=False 일 때 noise_labels 최종 shape: [B]
+
+        t = noise_labels
+        c = class_labels
+
+        if c.ndim == 2:
+            c = torch.stack([c, torch.zeros_like(c)], dim=-1)
+
         x = self.p_embed(x)
         t = self.t_embed(t)
         c = self.c_embed(c)
@@ -380,4 +423,9 @@ class tfdiff_WiFi(nn.Module):
         for block in self.blocks:
             x = block(x, c)
         x = self.final_layer(x, c)
+
+        if antenna_reshape:
+            # [B, S, A * F] -> [B, S, A, F] -> [B, A, S, F]
+            x = x.view(B, S, A, F, 2).permute(0, 2, 1, 3, 4)
+        
         return x

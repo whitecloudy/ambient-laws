@@ -1236,6 +1236,10 @@ class WiDARDataset(Dataset):
             # Sigma Normalization
             csi_data /= np.maximum(noise_sigma_data, 1e-12)
             noise_sigma_data = np.ones_like(noise_sigma_data)
+        else:
+            mean_sigma = np.sqrt(np.mean(noise_sigma_data**2))
+            csi_data /= mean_sigma
+            noise_sigma_data /= mean_sigma
 
         csi_data /= self.normalize_value
         noise_sigma_data /= self.normalize_value
@@ -1349,6 +1353,11 @@ class WiDARDataset(Dataset):
             dtype = np.complex64
         else:
             dtype = np.float32
+        
+        if self.complex_merge_axis is None:
+            return_complex_merge_axis = -1
+        else:
+            return_complex_merge_axis = self.complex_merge_axis
 
         return {
             'image': csi_data.astype(dtype),
@@ -1359,7 +1368,7 @@ class WiDARDataset(Dataset):
             'idx': idx,
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
-            'complex_merge_axis': self.complex_merge_axis,
+            'complex_merge_axis': return_complex_merge_axis,
             'axis_name': axis_name,
         }
     

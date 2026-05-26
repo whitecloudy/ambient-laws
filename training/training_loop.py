@@ -250,7 +250,7 @@ def training_loop(
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     with torch.no_grad():
-        images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device)
+        images = torch.zeros(dataset_shape, device=device)
         sigma = torch.ones([batch_gpu], device=device)
         if net.model.label_type == 'downlink':
             labels = torch.zeros([batch_gpu, net.label_dim, net.img_resolution[0], net.img_resolution[1]], device=device)

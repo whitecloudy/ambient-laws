@@ -51,7 +51,7 @@ def parse_int_list(s):
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp_256', 'ddpmpp_192','ddpmpp', 'ncsnpp', 'adm', 'widar_ddpmpp', 'widar_ddpmpp_stem256', 'widar_ddpmpp_stem512']), default='ddpmpp', show_default=True)
+@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp_256', 'ddpmpp_192','ddpmpp', 'ncsnpp', 'adm', 'widar_ddpmpp', 'widar_ddpmpp_stem256', 'widar_ddpmpp_stem512', 'rf_transformer_default', 'rf_transformer_default_256']), default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
@@ -94,7 +94,7 @@ def parse_int_list(s):
 
 # RF dataset related
 @click.option('--view_as_complex', help='Whether to view the data as complex numbers.', type=bool, default=False, show_default=True)
-@click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to None to not merge.', type=int, default=0, show_default=True)
+@click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to None to not merge.', type=int, default=None, show_default=True)
 @click.option('--transpose', help='Transpose the data axes according to the given order. Provide a list of two integers representing the new order of the first two axes (frame_resolution and ant_resolution). Set to None to not transpose.', type=str, default="0,1", show_default=True)
 @click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
 @click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
@@ -280,6 +280,10 @@ def main(**kwargs):
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
+    elif opts.arch == 'rf_transformer_default':
+        c.network_kwargs.update(model_type='RF_transformer')
+    elif opts.arch == 'rf_transformer_default_256':
+        c.network_kwargs.update(model_type='RF_transformer', sample_rate=256)
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])

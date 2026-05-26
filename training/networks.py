@@ -1099,6 +1099,16 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 
         return aux
 
+from .wifi_model import tfdiff_WiFi
+
+class RF_transformer(tfdiff_WiFi):
+    def __init__(self, img_resolution, in_channels, label_dim, label_type, out_channels, *args, **kwargs):
+        self.img_resolution = img_resolution
+        self.in_channels = in_channels
+        self.label_dim = label_dim
+        self.label_type = label_type
+        self.out_channels = out_channels
+        super().__init__(*args, **kwargs)
 
 
 #----------------------------------------------------------------------------
