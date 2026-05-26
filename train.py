@@ -122,6 +122,12 @@ def parse_int_list(s):
 @click.option("--num_primes", help="Number of primes for the consistency loss.", type=int, default=6)
 @click.option("--consistency_coeff", help="Coefficient for the consistency loss.", type=float, default=0.0)
 
+# Validation params
+@click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='KIMG', type=click.IntRange(min=-1), default=50, show_default=True)
+@click.option('--validation_iterations', help='Number of iterations to run for validation.', metavar='INT', type=click.IntRange(min=1), default=5, show_default=True)
+@click.option('--validation_batch_size', help='Batch size for validation.', metavar='INT', type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--validation_data', help='Path to the validation data. If not specified, portion of the training data will be used.', metavar='ZIP|DIR', type=str, default=None)
+
 # Wandb related
 @click.option('--wandb', help='Use wandb to log training progress',  type=bool, default=True)
 @click.option('--wandb_group', help='Wandb group name',                   type=str, default='Test')
@@ -151,6 +157,8 @@ def main(**kwargs):
         opts.wandb_group = 'debug'
         opts.outdir = 'debug_test'
         opts.nosubdir = True
+        opts.validation_interval = 1
+        opts.validation_iterations = 1
 
     if dist.get_rank() == 0 and opts.resume_options is not None and opts.resume is not None:
         with open(opts.resume_options, 'r') as f:
@@ -211,6 +219,20 @@ def main(**kwargs):
                                                                 phase_shift_probability=opts.phase_shift_aug_ratio, 
                                                                 other_collate_fn=[torch.utils.data.default_collate, ])
                                                                 # other_collate_fn=[pad_collate_fn(dynamic_noise=opts.dynamic_noise_sigma), torch.utils.data.default_collate])
+    validation_on_off = False
+    # Determine whether to turn on validation
+    if opts.validation_interval == -1:  # If validation_interval is -1, we will turn off validation regardless of other options.
+        validation_on_off = False
+    elif opts.validation_data is None and opts.dataset_keep_percentage >= 1.0: # If validation_data is not specified and we are using the whole dataset for training, we will turn off validation.
+        validation_on_off = False
+    else:
+        validation_on_off = True
+
+    c.validation_kwargs = dnnlib.EasyDict(validation_on_off=validation_on_off, 
+                                          validation_interval=opts.validation_interval, 
+                                          validation_iterations=opts.validation_iterations, 
+                                          validation_batch_size=opts.validation_batch_size, 
+                                          validation_data=opts.validation_data)
 
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()

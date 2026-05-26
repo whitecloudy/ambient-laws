@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import dnnlib
+import tqdm
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
@@ -149,6 +150,7 @@ def training_loop(
     network_kwargs      = {},       # Options for model and preconditioning.
     loss_kwargs         = {},       # Options for loss function.
     optimizer_kwargs    = {},       # Options for optimizer.
+    validation_kwargs   = {},       # Options for validation, including whether to turn on validation, validation interval, validation iterations, validation batch size, and validation data.
     augment_kwargs      = None,     # Options for augmentation pipeline, None = disable.
     task                = 'RENEW',  # Current task
     seed                = 0,        # Global random seed.
@@ -200,6 +202,25 @@ def training_loop(
         dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
     elif task == 'WIDAR':
         dataset_obj = WiDARDataset(**dataset_kwargs)
+    else:
+        raise ValueError(f'Unsupported task: {task}')
+    validation_on_off = validation_kwargs.validation_on_off
+    if validation_on_off:
+        validation_dataset_kwargs = dataset_kwargs.copy()
+        if validation_kwargs.validation_data is not None:
+            validation_dataset_kwargs['data'] = validation_kwargs.validation_data
+            validation_dataset_kwargs['keep_percentage'] = 1.0
+        else:
+            validation_dataset_kwargs['flip_keep_dataset'] = True
+        
+        validation_dataset_obj = dataset_obj.__class__(**validation_dataset_kwargs)
+        validation_dataset_sampler = misc.FiniteSampler(dataset=validation_dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=False, seed=seed)
+        validation_dataset_iterator = torch.utils.data.DataLoader(dataset=validation_dataset_obj, sampler=validation_dataset_sampler, batch_size=validation_kwargs.validation_batch_size, **data_loader_kwargs)
+        validation_interval_tick = validation_kwargs.validation_interval
+    else:
+        validation_dataset_iterator = None
+        validation_interval_tick = -1
+
     ## using This sampler is way way way~~~ too slow for every epoch renewal
     # dataset_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=True, seed=seed)
     dist.print0('Dataset Loading completed...')
@@ -352,11 +373,40 @@ def training_loop(
         torch.cuda.reset_peak_memory_stats()
         dist.print0(' '.join(fields))
 
+        if dist.get_rank() == 0 and wandb_onoff and wandb.run is not None:
+            wandb.run.summary['Progress/tick'] = cur_tick
+            wandb.run.summary['Progress/kimg'] = cur_nimg / 1e3
+            wandb.run.summary['ETA time'] = eta_seconds
+            wandb.run.summary['Estimated end date_time'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + eta_seconds))
+
         # Check for abort.
         if (not done) and dist.should_stop():
             done = True
             dist.print0()
             dist.print0('Aborting...')
+
+        # Run validation.
+        if validation_on_off and validation_dataset_iterator is not None and (validation_interval_tick > 0) and ((cur_tick+1) % validation_interval_tick == 0):
+            ddp.eval()
+            with torch.no_grad():
+                with tqdm.tqdm(total=validation_kwargs.validation_iterations * len(validation_dataset_iterator), desc="Validation", disable=not dist.get_rank() == 0) as pbar:
+                    for val_iter in range(validation_kwargs.validation_iterations):
+                        for val_dataset_item in validation_dataset_iterator:
+                            val_images = val_dataset_item["image"].to(device)
+                            val_labels = val_dataset_item["label"].to(device)
+                            val_current_sigma = val_dataset_item["sigma"].to(device)
+
+                            if "original_shape" in val_dataset_item:
+                                val_original_shape = val_dataset_item["original_shape"].to(device)
+                            else:
+                                val_original_shape = None
+
+                            val_loss, _, _ = loss_fn(net=ddp, images=val_images, labels=val_labels, current_sigma=val_current_sigma, augment_pipe=None, original_shape=val_original_shape)
+                            
+                            training_stats.report('Validation/loss', val_loss.clone().detach())
+                            pbar.update(1)
+                    pbar.close()
+            ddp.train()
 
         # Save network snapshot.
         if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
