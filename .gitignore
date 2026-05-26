@@ -173,3 +173,4 @@ spectrograms/
 *.gif
 *.npz
 *.npy
+debug_test/*
