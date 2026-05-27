@@ -137,31 +137,27 @@ def save_images_with_sigmas(images, image_path, sigmas=None, num_rows=None, num_
 
 
 import threading
+import io
 
 def save_training_state(dir, net, optimizer, cur_nimg):
-    start_time = time.time()
     if dist.get_rank() != 0:
         return None
-        
-    # GPU 메모리(VRAM) 낭비 없이 텐서를 시스템 RAM(CPU)으로 바로 복사(격리)
-    net_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+
+    # 1. DDP 래퍼 해제 (에러 방지)
+    unwrapped_net = net.module if hasattr(net, 'module') else net
+    buffer = io.BytesIO()
     
-    opt_state = {}
-    for k, v in optimizer.state_dict().items():
-        if isinstance(v, dict):
-            opt_state[k] = {sub_k: (sub_v.detach().cpu().clone() if isinstance(sub_v, torch.Tensor) else sub_v) for sub_k, sub_v in v.items()}
-        elif isinstance(v, torch.Tensor):
-            opt_state[k] = v.detach().cpu().clone()
-        else:
-            opt_state[k] = v
-            
-    # 무거운 직렬화(torch.save) 및 파일 쓰기는 쓰레드에서 전담 처리
-    def _save_to_disk(n_st, o_st, path):
-        torch.save(dict(net=n_st, optimizer_state=o_st, nimg=cur_nimg), path)
-        del n_st, o_st # conserve memory
-            
+    torch.save(dict(net=unwrapped_net, optimizer_state=optimizer.state_dict(), nimg=cur_nimg), buffer)
+
     file_path = os.path.join(dir, f'training-state-{cur_nimg//1000:06d}.pt')
-    t = threading.Thread(target=_save_to_disk, args=(net_state, opt_state, file_path))
+
+    # 3. 백그라운드 쓰레드: 메모리에 굳혀진 바이트 데이터를 디스크(파일)로 기록
+    def _write_to_disk(buf, path):
+        with open(path, 'wb') as f:
+            f.write(buf.getvalue())
+        buf.close()  # 파일 쓰기 완료 후 RAM 메모리 반환
+        
+    t = threading.Thread(target=_write_to_disk, args=(buffer, file_path))
     t.start()
 
     return t
