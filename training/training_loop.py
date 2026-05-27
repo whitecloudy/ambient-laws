@@ -136,8 +136,61 @@ def save_images_with_sigmas(images, image_path, sigmas=None, num_rows=None, num_
         wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(grid_image)})
 
 
+import threading
+
 def save_training_state(dir, net, optimizer, cur_nimg):
-    torch.save(dict(net=net, optimizer_state=optimizer.state_dict(), nimg=cur_nimg), os.path.join(dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+    start_time = time.time()
+    if dist.get_rank() != 0:
+        return None
+        
+    # GPU 메모리(VRAM) 낭비 없이 텐서를 시스템 RAM(CPU)으로 바로 복사(격리)
+    net_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+    
+    opt_state = {}
+    for k, v in optimizer.state_dict().items():
+        if isinstance(v, dict):
+            opt_state[k] = {sub_k: (sub_v.detach().cpu().clone() if isinstance(sub_v, torch.Tensor) else sub_v) for sub_k, sub_v in v.items()}
+        elif isinstance(v, torch.Tensor):
+            opt_state[k] = v.detach().cpu().clone()
+        else:
+            opt_state[k] = v
+            
+    # 무거운 직렬화(torch.save) 및 파일 쓰기는 쓰레드에서 전담 처리
+    def _save_to_disk(n_st, o_st, path):
+        torch.save(dict(net=n_st, optimizer_state=o_st, nimg=cur_nimg), path)
+        del n_st, o_st # conserve memory
+            
+    file_path = os.path.join(dir, f'training-state-{cur_nimg//1000:06d}.pt')
+    t = threading.Thread(target=_save_to_disk, args=(net_state, opt_state, file_path))
+    t.start()
+
+    return t
+
+def save_network_snapshot(dir, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg, check_ddp=True):
+    data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+    for key, value in data.items():
+        if isinstance(value, torch.nn.Module):
+            # deepcopy를 수행하므로 학습 루프의 모델 객체와는 완전히 분리됨
+            value = copy.deepcopy(value).eval().requires_grad_(False)
+            if check_ddp:
+                misc.check_ddp_consistency(value)
+
+            data[key] = value.cpu()
+        
+    if dist.get_rank() != 0 or dir is None:
+        return None
+    # 독립된 복사본(snapshot_data)을 쓰레드로 전달
+    def _save(snapshot_data):
+        for key, value in snapshot_data.items():
+            if isinstance(value, torch.nn.Module):
+                snapshot_data[key] = value.cpu()
+        with open(os.path.join(dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
+            pickle.dump(snapshot_data, f)
+        del snapshot_data # conserve memory
+            
+    t = threading.Thread(target=_save, args=(data,))
+    t.start()
+    return t
 
 
 #----------------------------------------------------------------------------
@@ -303,6 +356,8 @@ def training_loop(
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
 
+    bg_threads = []
+
     # LOOP STARTS HERE.
     while True:
         # Accumulate gradients.
@@ -410,24 +465,34 @@ def training_loop(
 
         # Save network snapshot.
         if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
-            data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
-            for key, value in data.items():
-                if isinstance(value, torch.nn.Module):
-                    value = copy.deepcopy(value).eval().requires_grad_(False)
-                    misc.check_ddp_consistency(value)
-                    data[key] = value.cpu()
-                del value # conserve memory
-            if dist.get_rank() == 0:
-                with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
-                    pickle.dump(data, f)
-            del data # conserve memory
+            t = save_network_snapshot(run_dir, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg)
+            if t is not None: bg_threads.append(t)
+            # data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            # for key, value in data.items():
+            #     if isinstance(value, torch.nn.Module):
+            #         value = copy.deepcopy(value).eval().requires_grad_(False)
+            #         misc.check_ddp_consistency(value)
+            #         data[key] = value.cpu()
+            #     del value # conserve memory
+            # if dist.get_rank() == 0:
+            #     with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
+            #         pickle.dump(data, f)
+            # del data # conserve memory
 
         # Save full dump of the training state.
         if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
-            save_training_state(run_dir, net, optimizer, cur_nimg)
-
+            t = save_training_state(run_dir, net, optimizer, cur_nimg)
+            if t is not None: bg_threads.append(t)
+        
         # Update logs.
         training_stats.default_collector.update()
+
+        # 완료된 쓰레드는 리스트에서 제거하여 메모리 누수 방지
+        finished_threads = [t for t in bg_threads if not t.is_alive()]
+        bg_threads = [t for t in bg_threads if t not in finished_threads]
+        for t in finished_threads:
+            t.join()
+
         if dist.get_rank() == 0:
             if stats_jsonl is None:
                 stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
@@ -441,17 +506,25 @@ def training_loop(
             # Save a copy of the training state dump to the temporary directory
             if temp_dir_path is not None:
                 if latest_saved_kimg is not None:   # remove the previous dump
+                    # 이전 파일 삭제 전, 디스크 쓰기가 진행 중이라면 대기하여 충돌 방지 (Back-pressure)
+                    for t in bg_threads:
+                        t.join()
+                    bg_threads.clear()
+
                     os.remove(os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')) 
                     os.remove(os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl'))
-
                 # save the new dump
-                save_training_state(temp_dir_path, net, optimizer, cur_nimg)
-                data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
-                with open(os.path.join(temp_dir_path, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
-                    pickle.dump(data, f)
+                t1 = save_training_state(temp_dir_path, net, optimizer, cur_nimg)
+                t2 = save_network_snapshot(temp_dir_path, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg, check_ddp=False)
+                if t1 is not None: bg_threads.append(t1)
+                if t2 is not None: bg_threads.append(t2)
+                # data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+                # with open(os.path.join(temp_dir_path, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
+                #     pickle.dump(data, f)
             
                 latest_saved_kimg = cur_nimg
-                del data # conserve memory
+        dist.synchronize()
+
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
         # Update state.
@@ -461,7 +534,16 @@ def training_loop(
         maintenance_time = tick_start_time - tick_end_time
         if done:
             break
-        
+    # End of main training loop.
+    
+    # Cleanup all background threads before exiting to ensure all files are properly written and resources are released
+    if dist.get_rank() == 0:
+        if len(bg_threads) > 0:
+            dist.print0('Waiting for background save threads to finish...')
+            for t in bg_threads:
+                t.join()
+
+    # Remove the temporary directory and its contents if it exists
     if dist.get_rank() == 0 and temp_dir_path is not None and latest_saved_kimg is not None:
         os.remove(os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')) 
         os.remove(os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl'))
