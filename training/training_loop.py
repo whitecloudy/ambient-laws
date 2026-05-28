@@ -25,6 +25,8 @@ import ambient_utils
 import wandb
 import tempfile
 from training.dataset import renewRfProcessedDataset, WiDARDataset
+import torch.multiprocessing as mp
+import io
 
 
 def infiniteloop(dataloader):
@@ -136,59 +138,157 @@ def save_images_with_sigmas(images, image_path, sigmas=None, num_rows=None, num_
         wandb.log({"images/" + image_path.split("/")[-1]: wandb.Image(grid_image)})
 
 
-import threading
-import io
+# -------------------------------------------------------------------
+# [핵심 변경 사항 1] 저장 함수를 Global 영역으로 분리
+# - multiprocessing은 타겟 함수를 pickle할 수 있어야 하므로 최상단에 위치해야 합니다.
+# -------------------------------------------------------------------
+def _mp_save_training_state(net_state, opt_state, nimg, cache_net, path):
+    # 1. 껍데기 복사
+    cpu_net = copy.deepcopy(cache_net)
+    
+    # 2. 메인 프로세스(학습 루프)와 공유된 메모리 텐서들을 덮어씀
+    cpu_net.load_state_dict(net_state)
+    
+    # 3. 디스크 직렬화 (이 작업은 완벽히 독립된 프로세스에서 실행되므로 GIL에 영향을 주지 않음)
+    torch.save(dict(net=cpu_net, optimizer_state=opt_state, nimg=nimg), path)
+
 
 def save_training_state(dir, net, optimizer, cur_nimg):
     if dist.get_rank() != 0:
         return None
 
-    # 1. DDP 래퍼 해제 (에러 방지)
     unwrapped_net = net.module if hasattr(net, 'module') else net
-    buffer = io.BytesIO()
     
-    torch.save(dict(net=unwrapped_net, optimizer_state=optimizer.state_dict(), nimg=cur_nimg), buffer)
+    # -------------------------------------------------------------------
+    # [핵심 변경 사항 2] CPU 복사본 생성 후 share_memory_() 호출
+    # - 프로세스 간 통신(IPC) 시 텐서 데이터가 복사되는 병목을 원천 차단합니다.
+    # -------------------------------------------------------------------
+    net_state_cpu = {}
+    for k, v in unwrapped_net.state_dict().items():
+        t = v.detach().cpu().clone()
+        t.share_memory_()  # 다른 프로세스에서 읽을 수 있도록 공유 메모리에 등록
+        net_state_cpu[k] = t
+    
+    def _tensors_to_cpu_shared(obj):
+        if torch.is_tensor(obj):
+            t = obj.detach().cpu().clone()
+            t.share_memory_()
+            return t
+        elif isinstance(obj, dict):
+            return {k: _tensors_to_cpu_shared(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_tensors_to_cpu_shared(v) for v in obj]
+        else:
+            return obj
+            
+    opt_state_cpu = _tensors_to_cpu_shared(optimizer.state_dict())
+    
+    # -------------------------------------------------------------------
+    # CPU 모델 껍데기 캐싱 (기존과 동일하게 최초 1회만 동작)
+    # -------------------------------------------------------------------
+    if not hasattr(save_training_state, "_cpu_net_cache"):
+        temp_buf = io.BytesIO()
+        torch.save(unwrapped_net, temp_buf)
+        temp_buf.seek(0)
+        save_training_state._cpu_net_cache = torch.load(temp_buf, map_location='cpu', weights_only=False)
+        save_training_state._cpu_net_cache.eval().requires_grad_(False)
+        temp_buf.close()
 
     file_path = os.path.join(dir, f'training-state-{cur_nimg//1000:06d}.pt')
 
-    # 3. 백그라운드 쓰레드: 메모리에 굳혀진 바이트 데이터를 디스크(파일)로 기록
-    def _write_to_disk(buf, path):
-        with open(path, 'wb') as f:
-            f.write(buf.getvalue())
-        buf.close()  # 파일 쓰기 완료 후 RAM 메모리 반환
-        
-    t = threading.Thread(target=_write_to_disk, args=(buffer, file_path))
-    t.start()
+    # -------------------------------------------------------------------
+    # Background Process 생성 및 실행 (Thread 대신 Process 사용)
+    # -------------------------------------------------------------------
+    p = mp.Process(
+        target=_mp_save_training_state, 
+        args=(net_state_cpu, opt_state_cpu, cur_nimg, save_training_state._cpu_net_cache, file_path)
+    )
+    p.start()
 
-    return t
+    return p
+
+# -------------------------------------------------------------------
+# [핵심 1] 프로세스 타겟 함수 최상단(Global) 분리
+# -------------------------------------------------------------------
+def _mp_save_network_snapshot(safe_data, tensor_states, cache, path):
+    # safe_data: GPU 객체가 배제된 순수 딕셔너리 (dataset_kwargs 등)
+    final_dict = dict(safe_data)
+    
+    # 텐서 상태가 존재하는 키(nn.Module 객체들)에 대해서만 모델 재조립
+    for k in tensor_states.keys():
+        # 1. 순수 CPU 껍데기 모델 복사
+        cpu_model = copy.deepcopy(cache[k])
+        # 2. 공유 메모리로 넘어온 텐서 덮어쓰기
+        cpu_model.load_state_dict(tensor_states[k])
+        # 3. 최종 저장 딕셔너리에 삽입
+        final_dict[k] = cpu_model
+            
+    with open(path, 'wb') as f:
+        pickle.dump(final_dict, f)
+
 
 def save_network_snapshot(dir, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg, check_ddp=True):
     data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+    
+    # -------------------------------------------------------------------
+    # [핵심 2] GPU 텐서 추출 및 공유 메모리(Shared Memory) 등록
+    # -------------------------------------------------------------------
+    tensor_snapshots = {}
+    safe_data = {}  # Multiprocessing IPC 통신을 위한 안전한 딕셔너리
+    
     for key, value in data.items():
         if isinstance(value, torch.nn.Module):
-            # deepcopy를 수행하므로 학습 루프의 모델 객체와는 완전히 분리됨
-            value = copy.deepcopy(value).eval().requires_grad_(False)
             if check_ddp:
                 misc.check_ddp_consistency(value)
-
-            data[key] = value.cpu()
-        
+            
+            # 텐서를 CPU로 내리고 프로세스 간 공유 활성화 (복사 오버헤드 0)
+            state_dict_shared = {}
+            for k, v in value.state_dict().items():
+                t = v.detach().cpu().clone()
+                t.share_memory_()
+                state_dict_shared[k] = t
+                
+            tensor_snapshots[key] = state_dict_shared
+            
+            # GPU 모델 본체는 프로세스 인자로 넘기면 안 되므로 None으로 처리
+            safe_data[key] = None 
+        else:
+            # nn.Module이 아닌 일반 데이터(dict 등)는 그대로 전달
+            safe_data[key] = value 
+            
+    torch.cuda.empty_cache()
+    
     if dist.get_rank() != 0 or dir is None:
         return None
-    # 독립된 복사본(snapshot_data)을 쓰레드로 전달
-    def _save(snapshot_data):
-        for key, value in snapshot_data.items():
-            if isinstance(value, torch.nn.Module):
-                snapshot_data[key] = value.cpu()
-        with open(os.path.join(dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
-            pickle.dump(snapshot_data, f)
-        del snapshot_data # conserve memory
-            
-    t = threading.Thread(target=_save, args=(data,))
-    t.start()
-    return t
 
+    # -------------------------------------------------------------------
+    # [핵심 3] CPU 모델 껍데기 캐싱 (최초 1회만)
+    # -------------------------------------------------------------------
+    if not hasattr(save_network_snapshot, "_cpu_model_cache"):
+        save_network_snapshot._cpu_model_cache = {}
+        
+    for key, value in data.items():
+        if isinstance(value, torch.nn.Module) and key not in save_network_snapshot._cpu_model_cache:
+            temp_buf = io.BytesIO()
+            torch.save(value, temp_buf)
+            temp_buf.seek(0)
+            cpu_value = torch.load(temp_buf, map_location='cpu', weights_only=False)
+            save_network_snapshot._cpu_model_cache[key] = cpu_value.eval().requires_grad_(False)
+            temp_buf.close()
 
+    file_path = os.path.join(dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
+
+    # -------------------------------------------------------------------
+    # [핵심 4] 독립 프로세스(Process) 생성 및 직렬화 위임
+    # -------------------------------------------------------------------
+    # data 원본 대신 GPU 객체가 제거된 safe_data를 전달해야 에러가 나지 않습니다.
+    p = mp.Process(
+        target=_mp_save_network_snapshot, 
+        args=(safe_data, tensor_snapshots, save_network_snapshot._cpu_model_cache, file_path)
+    )
+    p.start()
+    
+    return p
 #----------------------------------------------------------------------------
 
 
@@ -281,6 +381,7 @@ def training_loop(
     dist.print0(f'Dataset image shape: {dataset_shape}')
     # Initialize temporary directory for training state dumps
     if dist.get_rank() == 0 and not debug_test:
+    # if dist.get_rank() == 0:
         run_dir_name = os.path.basename(os.path.normpath(run_dir))
         temp_dir_path = tempfile.mkdtemp(prefix='ambient-rf_'+run_dir_name+'_')
         latest_saved_kimg = None
@@ -320,15 +421,15 @@ def training_loop(
     # Resume training from previous snapshot.
     if resume_pkl is not None:
         dist.print0(f'Loading network weights from "{resume_pkl}"...')
-        if dist.get_rank() != 0:
-            torch.distributed.barrier() # rank 0 goes first
-        with dnnlib.util.open_url(resume_pkl, verbose=(dist.get_rank() == 0)) as f:
-            data = pickle.load(f)
         if dist.get_rank() == 0:
-            torch.distributed.barrier() # other ranks follow
-        misc.copy_params_and_buffers(src_module=data['ema'], dst_module=net, require_all=False)
-        misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=False)
-        del data # conserve memory
+            with dnnlib.util.open_url(resume_pkl, verbose=True) as f:
+                data = pickle.load(f)
+            misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=False)
+            del data # conserve memory
+        
+        if dist.get_world_size() > 1:
+            for param in misc.params_and_buffers(ema):
+                torch.distributed.broadcast(param, src=0)
     if resume_state_dump:
         dist.print0(f'Loading training state from "{resume_state_dump}"...')
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'), weights_only=False)
@@ -341,6 +442,7 @@ def training_loop(
     # Train.
     dist.print0(f'Training for {total_kimg} kimg...')
     dist.print0()
+    mp.set_sharing_strategy('file_system')
     if nimg is not None:
         cur_nimg = nimg
     else:
@@ -488,6 +590,8 @@ def training_loop(
         bg_threads = [t for t in bg_threads if t not in finished_threads]
         for t in finished_threads:
             t.join()
+            if hasattr(t, 'close'):
+                t.close()
 
         if dist.get_rank() == 0:
             if stats_jsonl is None:
@@ -505,10 +609,16 @@ def training_loop(
                     # 이전 파일 삭제 전, 디스크 쓰기가 진행 중이라면 대기하여 충돌 방지 (Back-pressure)
                     for t in bg_threads:
                         t.join()
+                        if hasattr(t, 'close'):
+                            t.close()
                     bg_threads.clear()
 
-                    os.remove(os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')) 
-                    os.remove(os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl'))
+                    training_state_path = os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')
+                    network_snapshot_path = os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl')
+                    if os.path.exists(training_state_path):
+                        os.remove(training_state_path)
+                    if os.path.exists(network_snapshot_path):
+                        os.remove(network_snapshot_path)
                 # save the new dump
                 t1 = save_training_state(temp_dir_path, net, optimizer, cur_nimg)
                 t2 = save_network_snapshot(temp_dir_path, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg, check_ddp=False)
@@ -538,6 +648,8 @@ def training_loop(
             dist.print0('Waiting for background save threads to finish...')
             for t in bg_threads:
                 t.join()
+                if hasattr(t, 'close'):
+                    t.close()
 
     # Remove the temporary directory and its contents if it exists
     if dist.get_rank() == 0 and temp_dir_path is not None and latest_saved_kimg is not None:
