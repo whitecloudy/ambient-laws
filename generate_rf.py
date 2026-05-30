@@ -254,7 +254,7 @@ def load_hf_checkpoint(repo_id):
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
-@click.option('--stop_variance', help="Early stop generation at this variance", type=float, default=0.0)
+@click.option('--stop_sigma', help="Early stop generation at this variance", type=float, default=0.0)
 
 
 def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_size, original_shape, device=torch.device('cuda'), **sampler_kwargs):
