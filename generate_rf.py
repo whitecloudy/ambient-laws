@@ -256,8 +256,9 @@ def load_hf_checkpoint(repo_id):
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 @click.option('--stop_sigma', help="Early stop generation at this variance", type=float, default=0.0)
 
+@click.option('--allow_tf32',              is_flag=True)
 
-def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_size, original_shape, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_size, original_shape, allow_tf32, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -277,6 +278,14 @@ def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_si
     num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
     all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
     rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
+
+    if allow_tf32:
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+    else:
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+
 
     # Rank 0 goes first.
     if dist.get_rank() != 0:
