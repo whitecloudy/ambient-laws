@@ -295,16 +295,17 @@ def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_si
     if dist.get_rank() == 0:
         torch.distributed.barrier()
 
-    if original_shape is not None:
-        target_shape = (1, net.img_channels, net.img_resolution[0], net.img_resolution[1])
-        input_original_shape = torch.tensor(original_shape)
-        input_original_shape = input_original_shape.unsqueeze(0) # add batch dimension
-        padding_mask = padding_mask_from_original_shape(input_original_shape, target_shape)
-        dist.print0(f'Using padding mask with original shape {input_original_shape} and target shape {target_shape}')
-    else:
-        padding_mask = 1
-    
-    padding_mask = torch.tensor(padding_mask, device=device)
+    # if original_shape is not None:
+    #     target_shape = (1, net.img_channels, net.img_resolution[0], net.img_resolution[1])
+    #     input_original_shape = torch.tensor(original_shape)
+    #     input_original_shape = input_original_shape.unsqueeze(0) # add batch dimension
+    #     padding_mask = padding_mask_from_original_shape(input_original_shape, target_shape)
+    #     dist.print0(f'Using padding mask with original shape {input_original_shape} and target shape {target_shape}')
+    # else:
+    #     padding_mask = 1
+    # 
+    # padding_mask = torch.tensor(padding_mask, device=device)
+    padding_mask = 1
 
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
@@ -316,7 +317,8 @@ def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_si
 
         # Pick latents and labels.
         rnd = StackedRandomGenerator(device, batch_seeds)
-        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device)
+        # latents = rnd.randn([batch_size, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device)
+        latents = rnd.randn([batch_size, ]+[3, 256, 30, 2], device=device)
         class_labels = None
         if net.label_dim:
             classes = rnd.randint(net.label_dim, size=[batch_size], device=device)
@@ -329,7 +331,7 @@ def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_si
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, padding_mask=padding_mask, **sampler_kwargs)
+        images, images_inprocess = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, padding_mask=padding_mask, **sampler_kwargs)
         images = images * data_norm # de-normalize the RF data if a normalization value is provided
 
         # Save images.
