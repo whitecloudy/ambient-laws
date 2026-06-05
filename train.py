@@ -16,7 +16,7 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
-from training.dataset import renewRfProcessedDataset, pad_collate_fn, rf_augmentation_collate_fn, WiDARDataset
+from training.dataset import renewRfProcessedDataset, pad_collate_fn, rf_augmentation_collate_fn, WiDARDataset, XRF55Dataset
 import ambient_utils
 import warnings
 import wandb
@@ -51,7 +51,7 @@ def parse_int_list(s):
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp_256', 'ddpmpp_192','ddpmpp', 'ncsnpp', 'adm', 'widar_ddpmpp', 'widar_ddpmpp_stem256', 'widar_ddpmpp_stem512', 'rf_transformer_default', 'rf_transformer_default_256']), default='ddpmpp', show_default=True)
+@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
@@ -210,10 +210,19 @@ def main(**kwargs):
         #                                    resolution=(3, 512, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
         #                                    normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
         #                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
+    elif opts.task == 'XRF55':
+                c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
+                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
+                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+                                    transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
+                                    normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
+                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm)
+
+
     else:
         raise ValueError(f'Unknown task: {opts.task}')
         
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=4, persistent_workers=True)
 
     c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(flip_probability=opts.flip_aug_ratio, 
                                                                 phase_shift_probability=opts.phase_shift_aug_ratio, 
@@ -246,6 +255,8 @@ def main(**kwargs):
         elif opts.task == 'WIDAR':
             c.dataset_kwargs.must_contain = "regex:gesture(0|1|2|3|17|18)(?!\d)"
             dataset_obj = WiDARDataset(**c.dataset_kwargs)
+        elif opts.task == 'XRF55':
+            dataset_obj = XRF55Dataset(**c.dataset_kwargs)
         else:
             raise ValueError(f'Unknown task: {opts.task}')
         dataset_name = copy.copy(dataset_obj.name)
@@ -284,6 +295,9 @@ def main(**kwargs):
         c.network_kwargs.update(model_type='RF_transformer')
     elif opts.arch == 'rf_transformer_default_256':
         c.network_kwargs.update(model_type='RF_transformer', sample_rate=256)
+    elif opts.arch == 'rf_transformer_default_xrf_500':
+        c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55)
+
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])

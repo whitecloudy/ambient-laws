@@ -24,7 +24,7 @@ from torch_utils import misc
 import ambient_utils
 import wandb
 import tempfile
-from training.dataset import renewRfProcessedDataset, WiDARDataset
+from training.dataset import renewRfProcessedDataset, WiDARDataset, XRF55Dataset
 import torch.multiprocessing as mp
 import io
 
@@ -351,6 +351,8 @@ def training_loop(
         dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
     elif task == 'WIDAR':
         dataset_obj = WiDARDataset(**dataset_kwargs)
+    elif task == 'XRF55':
+        dataset_obj = XRF55Dataset(**dataset_kwargs)
     else:
         raise ValueError(f'Unsupported task: {task}')
     validation_on_off = validation_kwargs.validation_on_off
@@ -397,6 +399,8 @@ def training_loop(
         interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_resolution=dataset_shape[-2:]) # TODO: This is very clumsy. Need to fix ASAP
     elif task == 'WIDAR':
         interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_type='classes')
+    elif task == 'XRF55':
+        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_type='classes')
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     with torch.no_grad():
@@ -438,6 +442,7 @@ def training_loop(
         if 'nimg' in data:
             nimg = int(data['nimg'])
         del data # conserve memory
+    torch.cuda.empty_cache()
 
     # Train.
     dist.print0(f'Training for {total_kimg} kimg...')
