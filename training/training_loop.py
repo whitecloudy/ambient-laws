@@ -494,7 +494,12 @@ def training_loop(
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+            
+        grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1000)
+        training_stats.report('Loss/grad_norm', grad_norm.item())
+
         optimizer.step()
+
 
         # Update EMA.
         ema_halflife_nimg = ema_halflife_kimg * 1000
