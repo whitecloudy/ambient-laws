@@ -28,6 +28,12 @@ def init_weight_xavier(module):
         nn.init.xavier_uniform_(module.weight)
         if module.bias is not None:
             nn.init.constant_(module.bias, 0)
+    elif isinstance(module, cm.ComplexLinear):
+        nn.init.xavier_uniform_(module.l_r.weight)
+        nn.init.xavier_uniform_(module.l_i.weight)
+        if module.l_r.bias is not None:
+            nn.init.constant_(module.l_r.bias, 0)
+            nn.init.constant_(module.l_i.bias, 0)
 
 
 @torch.jit.script
@@ -193,153 +199,6 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
-
-# class SpatialDiffusion(nn.Module):
-#     """
-#     Process each sample of a sequence.
-#     Take CSI diffusion as an example.
-#     - Input:\\
-#       x, [B, S, A, 2], \\
-#       t, [B], \\
-#       c, [B, C, 2], \\
-#     - Output:
-#       n, [B, S*A, 2]
-#     """
-
-#     def __init__(self, params):
-#         super().__init__()
-#         self.learn_tfdiff = params.learn_tfdiff
-#         self.num_block = params.num_spatial_block
-#         self.input_dim = params.extra_dim[-1]  # A
-#         self.input_len = params.extra_dim[-2]  # S
-#         self.output_dim = self.input_dim * self.input_len  # S*A
-#         self.hidden_dim = params.spatial_hidden_dim  # D
-#         self.num_heads = params.num_heads  # H
-#         self.max_step = params.max_step  # T
-#         self.embed_dim = params.embed_dim  # E
-#         self.cond_dim = params.cond_dim[-1]  # C
-#         self.dropout = params.dropout
-#         self.task_id = [params.task_id]
-#         self.mlp_ratio = params.mlp_ratio
-#         self.p_embed = PositionEmbedding(
-#             self.input_len, self.input_dim, self.hidden_dim)
-#         self.t_embed = DiffusionEmbedding(
-#             self.max_step, self.embed_dim, self.hidden_dim)
-#         self.c_embed = MLPConditionEmbedding(self.cond_dim, self.hidden_dim)
-#         # A series of concatenated DiA blocks.
-#         self.blocks = nn.ModuleList([
-#             DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(self.num_block)
-#         ])
-#         self.adaMLP = nn.Sequential(
-#             # Flatten [B, S, A, 2] to [B, S*A, 2]
-#             nn.Flatten(start_dim=1, end_dim=-2),
-#             cm.ComplexLinear(self.input_len*self.hidden_dim, self.output_dim),
-#             cm.ComplexSiLU(),
-#             cm.ComplexLinear(self.output_dim, self.output_dim),
-#         )
-#         self.adaMLP.apply(init_weight_xavier)
-
-#     def forward(self, x, t, c):
-#         self.p_embed = self.p_embed.to(x.device)
-#         self.t_embed = self.t_embed.to(x.device)
-#         self.c_embed = self.c_embed.to(x.device)
-#         x = self.p_embed(x)
-#         t = self.t_embed(t)
-#         c = self.c_embed(c)
-#         for block in self.blocks:
-#             block = block.to(x.device)
-#             x = block(x, t, c)
-#         self.adaMLP = self.adaMLP.to(x.device)
-#         x = self.adaMLP(x)
-#         return x
-
-
-# class TimeFrequencyDiffusion(nn.Module):
-#     """
-#     Process the whole sequence.
-#     Take CSI diffusion as an example.
-#     - Input:\\
-#       x, [B, N, S*A, 2], \\
-#       t, [B], \\
-#       c, [B, N, C, 2], \\
-#     - Output:
-#       n, [B, N, S*A, 2]
-#     """
-
-#     def __init__(self, params):
-#         super().__init__()
-#         self.learn_tfdiff = params.learn_tfdiff
-#         self.num_block = params.num_tf_block
-#         self.batch_size = params.batch_size
-#         self.input_dim = np.prod(params.extra_dim)  # S*A
-#         self.input_len = params.sample_rate  # N
-#         self.output_dim = self.input_dim  # S*A
-#         self.hidden_dim = params.tf_hidden_dim  # D
-#         self.num_heads = params.num_heads  # H
-#         self.max_step = params.max_step  # T
-#         self.embed_dim = params.embed_dim  # E
-#         self.cond_dim = np.prod(params.cond_dim)  # C
-#         self.dropout = params.dropout
-#         self.task_id = params.task_id
-#         self.mlp_ratio = params.mlp_ratio
-#         self.p_embed = PositionEmbedding(
-#             self.input_len, self.input_dim, self.hidden_dim)
-#         self.t_embed = DiffusionEmbedding(
-#             self.max_step, self.embed_dim, self.hidden_dim)
-#         self.c_embed = MLPConditionEmbedding(self.cond_dim, self.hidden_dim)
-#         self.blocks = nn.ModuleList([
-#             DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(self.num_block)
-#         ])
-#         self.final_layer = FinalLayer(
-#             self.hidden_dim, self.output_dim)
-
-#     def forward(self, x, t, c):
-#         x = self.p_embed(x)
-#         t = self.t_embed(t)
-#         if self.task_id == 0:
-#             c = c.reshape([self.batch_size, self.input_len, -1, 2])
-#         if self.task_id == 1:
-#             c = c.reshape([self.batch_size, self.input_len, -1, 2])
-#         c = self.c_embed(c)
-#         for block in self.blocks:
-#             x = block(x, t, c)
-#         x = self.final_layer(x, t)
-#         return x
-
-
-# class tfdiff_WiFi(nn.Module):
-#     """
-#     Signal Modulation and Augmentation via Generative Diffusion Model.
-#     Take CSI diffusion as an example.
-#     - Input:\\
-#       x, [B, N, S, A, 2], \\
-#       t, [B], \\
-#       c, [B, N, C, 2], \\
-#     - Output:
-#       n, [B, N, S, A, 2]
-#     """
-
-#     def __init__(self, params):
-#         super().__init__()
-#         self.params = params
-#         self.task_id = params.task_id
-#         self.sample_rate = params.sample_rate
-#         self.extra_dim = params.extra_dim
-#         self.cond_dim = params.cond_dim
-#         self.batch_size = params.batch_size
-#         self.spatial_dim = np.prod(self.extra_dim)
-#         # N parallel SpatialDiffusion blocks.
-#         self.spatial_block = SpatialDiffusion(self.params)
-#         self.tf_block = TimeFrequencyDiffusion(self.params)
-
-#     def forward(self, x, t, c):
-#         x_s = x.reshape([-1]+self.extra_dim+[2])  # [B*N, S, A, 2]
-#         x_s = self.spatial_block(x_s, t.repeat(self.sample_rate), c.repeat(self.sample_rate))
-#         x = x_s.reshape([-1, self.sample_rate]+[self.spatial_dim, 2])  # [B, N, S*A, 2]
-#         x = self.tf_block(x, t, c)  # [B, N, S*A, 2]
-#         x = x.reshape([-1, self.sample_rate]+self.extra_dim+[2])  # [B, N, S, A, 2]
-#         return x
-    
 
 class tfdiff_WiFi(nn.Module):
     def __init__(

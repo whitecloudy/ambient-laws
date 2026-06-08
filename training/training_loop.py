@@ -496,7 +496,11 @@ def training_loop(
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
             
         grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1000)
-        training_stats.report('Loss/grad_norm', grad_norm.item())
+        with torch.no_grad():
+            training_stats.report('Loss/grad_norm', grad_norm.item())
+        if debug_test:
+            with torch.no_grad():
+                dist.print0(f'grad_norm: {grad_norm.item()}')
 
         optimizer.step()
 

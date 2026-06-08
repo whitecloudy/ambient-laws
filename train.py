@@ -297,6 +297,9 @@ def main(**kwargs):
         c.network_kwargs.update(model_type='RF_transformer', sample_rate=256)
     elif opts.arch == 'rf_transformer_default_xrf_500':
         c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55)
+    elif opts.arch == 'rf_transformer_default_xrf_500_large':
+        c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55, hidden_dim=512, num_block=16)
+
 
     else:
         assert opts.arch == 'adm'
