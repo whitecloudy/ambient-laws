@@ -1476,6 +1476,7 @@ class XRF55Dataset(Dataset):
         self.image_noise_seed = image_noise_seed
         self.noise_mean_flag = noise_mean_flag
         self.noise_mean_alter_way = noise_mean_alter_way
+        self.use_labels = use_labels
         self.file_paths = []
 
         if isinstance(self.dir_path, str):
@@ -1663,6 +1664,8 @@ class XRF55Dataset(Dataset):
         file_path = self.file_paths[true_idx]
 
         csi_data, noise_sigma_data, _, label_data = _process_xrf55_file(file_path, 3, self._label_dim)
+        if not self._use_labels:
+            label_data = np.zeros_like(label_data)
         assert csi_data.shape == self._file_image_shape, f"Error: Expected CSI data shape {self._file_image_shape}, but got {csi_data.shape} for file {file_path}"
         axis_name = self._axis_name.copy()
 

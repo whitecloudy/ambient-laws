@@ -232,6 +232,7 @@ def load_hf_checkpoint(repo_id):
 #----------------------------------------------------------------------------
 
 @click.command()
+@click.option('--task',                     help='Current task',         metavar='STR',                        type=str, required=True, show_default=True, default='RENEW')
 @click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
 @click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
 @click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
@@ -254,11 +255,11 @@ def load_hf_checkpoint(repo_id):
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
-@click.option('--stop_sigma', help="Early stop generation at this variance", type=float, default=0.0)
+@click.option('--stop_sigma',              help="Early stop generation at this variance", type=float, default=0.0)
 
 @click.option('--allow_tf32',              is_flag=True)
 
-def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_size, original_shape, allow_tf32, device=torch.device('cuda'), **sampler_kwargs):
+def main(task, network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_size, original_shape, allow_tf32, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -326,8 +327,14 @@ def main(network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_batch_si
 
         # Pick latents and labels.
         rnd = StackedRandomGenerator(device, batch_seeds)
-        # latents = rnd.randn([batch_size, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device)
-        latents = rnd.randn([batch_size, ]+[3, 256, 30, 2], device=device)
+        if task == 'RENEW':
+            latents = rnd.randn([batch_size, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device, dtype=torch.float32)
+        elif task == 'WIDAR':
+            latents = rnd.randn([batch_size, ]+[3, 256, 30, 2], device=device, dtype=torch.float32)
+        elif task == 'XRF55':
+            latents = rnd.randn([batch_size, ]+[3, 500, 90, 2], device=device, dtype=torch.float32)
+        else:
+            raise ValueError(f'Unknown task {task}')
         class_labels = None
         if net.label_dim:
             classes = rnd.randint(net.label_dim, size=[batch_size], device=device)
