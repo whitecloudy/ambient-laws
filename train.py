@@ -94,7 +94,7 @@ def parse_int_list(s):
 
 # RF dataset related
 @click.option('--view_as_complex', help='Whether to view the data as complex numbers.', type=bool, default=False, show_default=True)
-@click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to None to not merge.', type=int, default=None, show_default=True)
+@click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to None to not merge.', type=int, default=0, show_default=True)
 @click.option('--transpose', help='Transpose the data axes according to the given order. Provide a list of two integers representing the new order of the first two axes (frame_resolution and ant_resolution). Set to None to not transpose.', type=str, default="0,1", show_default=True)
 @click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
 @click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)

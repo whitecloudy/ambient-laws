@@ -661,17 +661,21 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             if label_type == 'downlink':
                 if label_resolution == None:
                     label_resolution = img_resolution
-                flatten_feature_size = label_resolution[0]//4 * label_resolution[1]//4 * model_channels
+                # Apply padding size
+                padded_label_H = 1 << (label_resolution[0] - 1).bit_length() if label_resolution[0] > 0 else 0
+                padded_label_W = 1 << (label_resolution[1] - 1).bit_length() if label_resolution[1] > 0 else 0
+                
+                flatten_feature_size = padded_label_H//4 * padded_label_W//4 * model_channels
                 self.map_label = torch.nn.Sequential(
                     (OrderedDict([
-                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=3, **init)),    # RT : (model_channels, label_resolution[0], label_resolution[1])
+                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=3, **init)),    # RT : (model_channels, padded_label_H, padded_label_W)
                                 ("SiLU 1", torch.nn.SiLU()),
                                 ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, label_resolution[0]//2, label_resolution[1]//2)
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
                                 ("SiLU 2", torch.nn.SiLU()),
                                 ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, label_resolution[0]//4, label_resolution[1]//4)
-                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * label_resolution[0]//4 * label_resolution[1]//4)
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
+                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * padded_label_H//4 * padded_label_W//4)
                                 ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
                                 ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
                     ]))
@@ -755,6 +759,12 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         # [Shape 가정] x: [B, C, H, W], noise_labels: [B, C, H, W], class_labels: [B, K]
         
         x, pad_h, pad_w, orig_H, orig_W = pad_to_power_of_two(x)
+        if self.label_type == 'downlink':
+            class_labels, c_pad_h, c_pad_w, c_orig_H, c_orig_W = pad_to_power_of_two(class_labels)
+
+            if pad_h != c_pad_h or pad_w != c_pad_w:
+                print("WARNING, Input class and x have different shape")
+        
         is_spatial_noise = (noise_labels.ndim >= 3 and noise_labels.shape[-2:] == (orig_H, orig_W))
         
         if self.dynamic_noise and is_spatial_noise and (pad_h > 0 or pad_w > 0):
@@ -917,19 +927,22 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 if label_resolution == None:
                     label_resolution = img_resolution
                 
+                padded_label_H = 1 << (label_resolution[0] - 1).bit_length() if label_resolution[0] > 0 else 0
+                padded_label_W = 1 << (label_resolution[1] - 1).bit_length() if label_resolution[1] > 0 else 0
+
                 total_stride_0 = resample_stride[0] * stride[0]
                 total_stride_1 = resample_stride[1] * stride[1]
-                flatten_feature_size = (label_resolution[0] // (total_stride_0**2)) * (label_resolution[1] // (total_stride_1**2)) * model_channels
+                flatten_feature_size = (padded_label_H // (total_stride_0**2)) * (padded_label_W // (total_stride_1**2)) * model_channels
                 self.map_label = torch.nn.Sequential(
                     (OrderedDict([
-                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=kernel_size, **init)),    # RT : (model_channels, label_resolution[0], label_resolution[1])
+                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=kernel_size, **init)),    # RT : (model_channels, padded_label_H, padded_label_W)
                                 ("SiLU 1", torch.nn.SiLU()),
                                 ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, label_resolution[0]//2, label_resolution[1]//2)
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
                                 ("SiLU 2", torch.nn.SiLU()),
                                 ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, label_resolution[0]//4, label_resolution[1]//4)
-                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * label_resolution[0]//4 * label_resolution[1]//4)
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
+                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * padded_label_H//4 * padded_label_W//4)
                                 ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
                                 ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
                     ]))
@@ -940,19 +953,22 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 if label_resolution == None:
                     label_resolution = img_resolution
                 
+                padded_label_H = 1 << (label_resolution[0] - 1).bit_length() if label_resolution[0] > 0 else 0
+                padded_label_W = 1 << (label_resolution[1] - 1).bit_length() if label_resolution[1] > 0 else 0
+
                 total_stride_0 = resample_stride[0] * stride[0]
                 total_stride_1 = resample_stride[1] * stride[1]
-                flatten_feature_size = (label_resolution[0] // (total_stride_0**2)) * (label_resolution[1] // (total_stride_1**2)) * model_channels
+                flatten_feature_size = (padded_label_H // (total_stride_0**2)) * (padded_label_W // (total_stride_1**2)) * model_channels
                 self.map_label = torch.nn.ModuleList([torch.nn.Sequential(
                     (OrderedDict([
-                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=kernel_size, **init)),    # RT : (model_channels, label_resolution[0], label_resolution[1])
+                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=kernel_size, **init)),    # RT : (model_channels, padded_label_H, padded_label_W)
                                 ("SiLU 1", torch.nn.SiLU()),
                                 ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, label_resolution[0]//2, label_resolution[1]//2)
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
                                 ("SiLU 2", torch.nn.SiLU()),
                                 ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, label_resolution[0]//4, label_resolution[1]//4)
-                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * label_resolution[0]//4 * label_resolution[1]//4)
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
+                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * padded_label_H//4 * padded_label_W//4)
                                 ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
                                 ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
                     ]))
@@ -1099,7 +1115,7 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 
         return aux
 
-from .wifi_model import tfdiff_WiFi
+from training.wifi_model import tfdiff_WiFi
 
 class RF_transformer(tfdiff_WiFi):
     def __init__(self, img_resolution, in_channels, label_dim, label_type, out_channels, *args, **kwargs):

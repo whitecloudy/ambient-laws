@@ -318,48 +318,49 @@ def main(task, network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_ba
     padding_mask = 1
 
     # Loop over batches.
-    dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
-    for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
-        batch_size = len(batch_seeds)
-        if batch_size == 0:
-            continue
+    with torch.inference_mode():
+        dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
+        for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
+            torch.distributed.barrier()
+            batch_size = len(batch_seeds)
+            if batch_size == 0:
+                continue
 
-        # Pick latents and labels.
-        rnd = StackedRandomGenerator(device, batch_seeds)
-        if task == 'RENEW':
-            latents = rnd.randn([batch_size, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device, dtype=torch.float32)
-        elif task == 'WIDAR':
-            latents = rnd.randn([batch_size, ]+[3, 256, 30, 2], device=device, dtype=torch.float32)
-        elif task == 'XRF55':
-            latents = rnd.randn([batch_size, ]+[3, 500, 90, 2], device=device, dtype=torch.float32)
-        else:
-            raise ValueError(f'Unknown task {task}')
-        class_labels = None
-        if net.label_dim:
-            classes = rnd.randint(net.label_dim, size=[batch_size], device=device)
-            class_labels = torch.eye(net.label_dim, device=device)[classes]
-        if class_idx is not None:
-            class_labels[:, :] = 0
-            class_labels[:, class_idx] = 1
+            # Pick latents and labels.
+            rnd = StackedRandomGenerator(device, batch_seeds)
+            if task == 'RENEW':
+                latents = rnd.randn([batch_size, net.img_channels, net.img_resolution[0], net.img_resolution[1]], device=device, dtype=torch.float32)
+            elif task == 'WIDAR':
+                latents = rnd.randn([batch_size, ]+[3, 256, 30, 2], device=device, dtype=torch.float32)
+            elif task == 'XRF55':
+                latents = rnd.randn([batch_size, ]+[3, 500, 90, 2], device=device, dtype=torch.float32)
+            else:
+                raise ValueError(f'Unknown task {task}')
+            class_labels = None
+            if net.label_dim:
+                classes = rnd.randint(net.label_dim, size=[batch_size], device=device)
+                class_labels = torch.eye(net.label_dim, device=device)[classes]
+            if class_idx is not None:
+                class_labels[:, :] = 0
+                class_labels[:, class_idx] = 1
 
-        # Generate images.
-        sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
-        have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images, images_inprocess = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, padding_mask=padding_mask, **sampler_kwargs)
-        images = images * data_norm # de-normalize the RF data if a normalization value is provided
+            # Generate images.
+            sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
+            have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
+            sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
+            images, images_inprocess = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, padding_mask=padding_mask, **sampler_kwargs)
+            images = images * data_norm # de-normalize the RF data if a normalization value is provided
 
-        # Save images.
-        images_np = images.cpu().numpy()
-        original_shape_slice = tuple(slice(0, dim) for dim in original_shape) if original_shape is not None else (slice(None),)
+            # Save images.
+            images_np = images.cpu().to(torch.float32).numpy()
+            original_shape_slice = tuple(slice(0, dim) for dim in original_shape) if original_shape is not None else (slice(None),)
 
-        classes_np = classes.cpu().numpy() if classes is not None else [None for _ in range(len(images_np))]
-        for seed, image_np, classes_np in zip(batch_seeds, images_np, classes_np):
-            image_dir = os.path.join(outdir, f'{seed-seed%1000:06d}') if subdirs else outdir
-            os.makedirs(image_dir, exist_ok=True)
-            image_path = os.path.join(image_dir, f'{seed:06d}.npz')
-            np.savez_compressed(image_path, csi=image_np[original_shape_slice], cls=classes_np)
+            classes_np = classes.cpu().numpy() if classes is not None else [None for _ in range(len(images_np))]
+            for seed, image_np, classes_np in zip(batch_seeds, images_np, classes_np):
+                image_dir = os.path.join(outdir, f'{seed-seed%1000:06d}') if subdirs else outdir
+                os.makedirs(image_dir, exist_ok=True)
+                image_path = os.path.join(image_dir, f'{seed:06d}.npz')
+                np.savez_compressed(image_path, csi=image_np[original_shape_slice], cls=classes_np)
 
     # Done.
     torch.distributed.barrier()
