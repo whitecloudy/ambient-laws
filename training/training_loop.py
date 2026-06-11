@@ -410,6 +410,8 @@ def training_loop(
             labels = torch.zeros([batch_gpu, net.label_dim, net.img_resolution[0], net.img_resolution[1]], device=device)
         elif net.model.label_type == 'classes':
             labels = torch.zeros([batch_gpu, net.label_dim], device=device)
+        elif net.model.label_type == 'no_label':
+            labels = None
         misc.print_module_summary(net, [images, sigma, labels], max_nesting=2, verbose=dist.get_rank() == 0)
 
     # Setup optimizer.
