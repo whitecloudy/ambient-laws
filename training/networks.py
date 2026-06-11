@@ -823,7 +823,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             elif self.label_type == 'no_label':
                 pass
             else:
-                assert False, "Unknown label type
+                assert False, "Unknown label type"
         emb = silu(self.map_layer0(emb))
         # emb shape (label_type='downlink', dynamic_noise=True): [B, emb_channels * 2, H, W]
         # emb shape (label_type='downlink', dynamic_noise=False): [B, emb_channels * 2]
