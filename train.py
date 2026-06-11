@@ -272,7 +272,7 @@ def main(**kwargs):
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], )
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
     elif opts.arch == 'widar_ddpmpp':
         c.network_kwargs.update(model_type='WiDAR_RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[[1,1,1,1],[1,1]], resample_stride=[4,2], model_channels=16, channel_mult=[1,2,2,2], kernel_size = [9,3])
@@ -284,10 +284,10 @@ def main(**kwargs):
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], kernel_size=[3,3], stem_stride=[16,1], stem_kernel=[48,3], attn_resolutions=[16, 8])
     elif opts.arch == 'ddpmpp_256':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2])
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
     elif opts.arch == 'ddpmpp_192':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[1,2,2,2])
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
@@ -299,8 +299,6 @@ def main(**kwargs):
         c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55)
     elif opts.arch == 'rf_transformer_default_xrf_500_large':
         c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55, hidden_dim=512, num_block=16)
-
-
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])

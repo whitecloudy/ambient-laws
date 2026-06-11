@@ -630,7 +630,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
         assert decoder_type in ['standard', 'skip']
-        assert label_type in ['downlink', 'classes']
+        assert label_type in ['downlink', 'classes', 'no_label']
 
         super().__init__()
         self.label_dropout = label_dropout
@@ -658,7 +658,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         else:
             self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
         if label_dim != 0:
-            if label_type == 'downlink':
+            if self.label_type == 'downlink':
                 if label_resolution == None:
                     label_resolution = img_resolution
                 # Apply padding size
@@ -680,8 +680,10 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                                 ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
                     ]))
                 )
-            elif label_type == 'classes':
+            elif self.label_type == 'classes':
                 self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init)
+            elif self.label_type == 'no_label':
+                self.map_label = None
             else:  
                 assert False, "Unknown label type"
         else:
@@ -795,7 +797,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         if self.map_label is not None:
             tmp = class_labels
             # tmp shape: [B, K]
-            if self.training and self.label_dropout:
+            if self.training and self.label_dropout and self.label_type != 'no_label':
                 label_dropout_table = torch.unsqueeze(torch.unsqueeze((torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype), dim=-1), dim=-1)
                 tmp = tmp * label_dropout_table
                 # label_dropout 적용 후 tmp shape: [B, K]
@@ -818,8 +820,10 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 emb = emb + label_emb
                 # emb shape (dynamic_noise=True): [B, noise_channels, H, W]
                 # emb shape (dynamic_noise=False): [B, noise_channels]
+            elif self.label_type == 'no_label':
+                pass
             else:
-                assert False, "Unknown label type"
+                assert False, "Unknown label type
         emb = silu(self.map_layer0(emb))
         # emb shape (label_type='downlink', dynamic_noise=True): [B, emb_channels * 2, H, W]
         # emb shape (label_type='downlink', dynamic_noise=False): [B, emb_channels * 2]
