@@ -39,7 +39,7 @@ def infiniteloop(dataloader):
 # [핵심 변경 사항 1] 저장 함수를 Global 영역으로 분리
 # - multiprocessing은 타겟 함수를 pickle할 수 있어야 하므로 최상단에 위치해야 합니다.
 # -------------------------------------------------------------------
-def _mp_save_training_state(net_state, opt_state, nimg, cache_net, path):
+def _mp_save_training_state(net_state, opt_state, nimg, cache_net, path, remove_path=None):
     # 1. 껍데기 복사
     cpu_net = copy.deepcopy(cache_net)
     
@@ -49,8 +49,14 @@ def _mp_save_training_state(net_state, opt_state, nimg, cache_net, path):
     # 3. 디스크 직렬화 (이 작업은 완벽히 독립된 프로세스에서 실행되므로 GIL에 영향을 주지 않음)
     torch.save(dict(net=cpu_net, optimizer_state=opt_state, nimg=nimg), path)
 
+    # 4. 저장이 완료된 후 이전 파일 삭제
+    if remove_path is not None and os.path.exists(remove_path):
+        try:
+            os.remove(remove_path)
+        except OSError:
+            pass
 
-def save_training_state(dir, net, optimizer, cur_nimg):
+def save_training_state(dir, net, optimizer, cur_nimg, remove_path=None):
     if dist.get_rank() != 0:
         return None
 
@@ -98,7 +104,7 @@ def save_training_state(dir, net, optimizer, cur_nimg):
     # -------------------------------------------------------------------
     p = mp.Process(
         target=_mp_save_training_state, 
-        args=(net_state_cpu, opt_state_cpu, cur_nimg, save_training_state._cpu_net_cache, file_path)
+        args=(net_state_cpu, opt_state_cpu, cur_nimg, save_training_state._cpu_net_cache, file_path, remove_path)
     )
     p.start()
 
@@ -107,7 +113,7 @@ def save_training_state(dir, net, optimizer, cur_nimg):
 # -------------------------------------------------------------------
 # [핵심 1] 프로세스 타겟 함수 최상단(Global) 분리
 # -------------------------------------------------------------------
-def _mp_save_network_snapshot(safe_data, tensor_states, cache, path):
+def _mp_save_network_snapshot(safe_data, tensor_states, cache, path, remove_path=None):
     # safe_data: GPU 객체가 배제된 순수 딕셔너리 (dataset_kwargs 등)
     final_dict = dict(safe_data)
     
@@ -122,9 +128,17 @@ def _mp_save_network_snapshot(safe_data, tensor_states, cache, path):
             
     with open(path, 'wb') as f:
         pickle.dump(final_dict, f)
+    
+    # 저장이 완료된 후 이전 파일 삭제
+    if remove_path is not None and os.path.exists(remove_path):
+        try:
+            os.remove(remove_path)
+        except OSError:
+            pass
 
 
-def save_network_snapshot(dir, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg, check_ddp=True):
+
+def save_network_snapshot(dir, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg, check_ddp=True, remove_path=None):
     data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
     
     # -------------------------------------------------------------------
@@ -181,7 +195,7 @@ def save_network_snapshot(dir, ema, loss_fn, augment_pipe, dataset_kwargs, cur_n
     # data 원본 대신 GPU 객체가 제거된 safe_data를 전달해야 에러가 나지 않습니다.
     p = mp.Process(
         target=_mp_save_network_snapshot, 
-        args=(safe_data, tensor_snapshots, save_network_snapshot._cpu_model_cache, file_path)
+        args=(safe_data, tensor_snapshots, save_network_snapshot._cpu_model_cache, file_path, remove_path)
     )
     p.start()
     
@@ -518,6 +532,9 @@ def training_loop(
 
             # Save a copy of the training state dump to the temporary directory
             if temp_dir_path is not None:
+                training_state_remove_path = None
+                network_snapshot_remove_path = None
+
                 if latest_saved_kimg is not None:   # remove the previous dump
                     # 이전 파일 삭제 전, 디스크 쓰기가 진행 중이라면 대기하여 충돌 방지 (Back-pressure)
                     for t in bg_threads:
@@ -526,15 +543,11 @@ def training_loop(
                             t.close()
                     bg_threads.clear()
 
-                    training_state_path = os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')
-                    network_snapshot_path = os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl')
-                    if os.path.exists(training_state_path):
-                        os.remove(training_state_path)
-                    if os.path.exists(network_snapshot_path):
-                        os.remove(network_snapshot_path)
+                    training_state_remove_path = os.path.join(temp_dir_path, f'training-state-{latest_saved_kimg//1000:06d}.pt')
+                    network_snapshot_remove_path = os.path.join(temp_dir_path, f'network-snapshot-{latest_saved_kimg//1000:06d}.pkl')
                 # save the new dump
-                t1 = save_training_state(temp_dir_path, net, optimizer, cur_nimg)
-                t2 = save_network_snapshot(temp_dir_path, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg, check_ddp=False)
+                t1 = save_training_state(temp_dir_path, net, optimizer, cur_nimg, remove_path=training_state_remove_path)
+                t2 = save_network_snapshot(temp_dir_path, ema, loss_fn, augment_pipe, dataset_kwargs, cur_nimg, check_ddp=False, remove_path=network_snapshot_remove_path)
                 if t1 is not None: bg_threads.append(t1)
                 if t2 is not None: bg_threads.append(t2)
                 # data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
