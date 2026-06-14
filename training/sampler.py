@@ -106,7 +106,6 @@ def inference_edm_sampler(
         x_next = latents.to(torch.float64) * padding_mask
     else:
         x_next = latents.to(torch.float64) * fit_shape(t_next_0, latents) * padding_mask
-    
     for i in range(num_steps): # 0, ..., N-1
         x_cur = x_next
         t_cur = t_steps[i]
@@ -146,6 +145,13 @@ def inference_edm_sampler(
         elif isinstance(t_hat_net, torch.Tensor) and t_hat_net.ndim == x_hat.ndim:
             if t_hat_net.shape != x_hat.shape:
                 t_hat_net = t_hat_net.expand_as(x_hat)
+
+        if isinstance(t_hat_net, torch.Tensor):
+            if t_hat_net.ndim == 0:
+                t_hat_net = t_hat_net.unsqueeze(0).expand(batch_size)
+            elif t_hat_net.shape[0] != batch_size:
+                t_hat_net = t_hat_net.expand([batch_size] + list(t_hat_net.shape[1:]))
+
         denoised = net(x_hat, t_hat_net, class_labels).to(torch.float64) * padding_mask
         x_list.append(denoised.clone().detach())
         
@@ -179,6 +185,11 @@ def inference_edm_sampler(
                 if t_next_net.shape != x_pred.shape:
                     t_next_net = t_next_net.expand_as(x_pred)
 
+            if isinstance(t_next_net, torch.Tensor):
+                if t_next_net.ndim == 0:
+                    t_next_net = t_next_net.unsqueeze(0).expand(batch_size)
+                elif t_next_net.shape[0] != batch_size:
+                    t_next_net = t_next_net.expand([batch_size] + list(t_next_net.shape[1:]))
             denoised_prime = net(x_pred, t_next_net, class_labels).to(torch.float64) * padding_mask
             x_list.append(denoised_prime.clone().detach())
             d_prime = (x_pred - denoised_prime) / fit_shape(t_next_net, x_cur)

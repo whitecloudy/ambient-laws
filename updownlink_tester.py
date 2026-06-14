@@ -20,7 +20,7 @@ import dnnlib
 from torch_utils import distributed as dist
 import joblib
 from huggingface_hub import hf_hub_download
-from training.dataset import renewRfDataset, renewRfProcessedDataset, widarRfDataset, pad_collate_fn, widar_collate_fn
+from training.dataset import renewRfProcessedDataset,  pad_collate_fn
 import json
 from training.sampler import inference_edm_sampler as edm_sampler
 
@@ -338,7 +338,7 @@ def load_hf_checkpoint(repo_id):
 @click.option('--disc', 'discretization',   help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm',type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                 help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',          type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                  help='Ablate signal scaling s(t)', metavar='vp|none',                   type=click.Choice(['vp', 'none']))
-@click.option('--stop_variance',            help="Early stop generation at this variance",                          type=float, default=0.0)
+@click.option('--stop_sigma',               help="Early stop generation at this variance",                          type=float, default=0.0)
 @click.option('--trunc',                    help='Activate truncated sampling',                                     is_flag=True)
 
 
@@ -402,11 +402,14 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=4, prefetch_factor=2)
     
+    pad_collate = pad_collate_fn()
     def chained_collate_fn(batch):
-        batch = pad_collate_fn(batch)
+        # batch = pad_collate_fn(batch)
+        batch = pad_collate(batch)
         return torch.utils.data.default_collate(batch)
         
-    data_loader_kwargs.collate_fn = chained_collate_fn
+    # data_loader_kwargs.collate_fn = chained_collate_fn
+    data_loader_kwargs.collate_fn = torch.utils.data.default_collate
     rnd_gen = torch.Generator(device=device).manual_seed(seed)
 
     dist.print0('Loading dataset...')
@@ -416,9 +419,9 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
     clear_label_dir, _ = os.path.split(clear_label_dir)
     clear_label_dir = os.path.join(clear_label_dir, 'splited', final_dir_name)
     
-    dataset_obj = renew_with_clear_image(clear_label_dir=clear_label_dir, **dataset_kwargs)
+    # dataset_obj = renew_with_clear_image(clear_label_dir=clear_label_dir, **dataset_kwargs)
     # dataset_obj = renewRfDataset(**dataset_kwargs)
-    # dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
     dist_sampler = torch.utils.data.distributed.DistributedSampler(dataset_obj, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False) # type: ignore
     dataloader_obj = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dist_sampler, batch_size=max_batch_size, **data_loader_kwargs)
 
@@ -454,7 +457,7 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
             sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
             # have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
             # sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-            sampler_fn = edm_sampler if not trunc else truncated_edm_sampler
+            sampler_fn = edm_sampler
             
             if sampler_fn == truncated_edm_sampler:
                 gen_data, gen_data_each_list = sampler_fn(net, latents, labels, current_sigma, **sampler_kwargs)

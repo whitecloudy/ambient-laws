@@ -573,10 +573,13 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         var_sum = 0.0
         var_count = 0
 
-        for fname in self._fname:
+        for fname in tqdm(self._fname, total=len(self._fname)):
             csi_data, noise_sigma_data = self._load_and_normalize(fname)
-            var_sum += (np.sum((csi_data * np.conj(csi_data)).real.flatten()))
+            var_sum += np.sum(csi_data.real.flatten()**2)
             var_count += csi_data.flatten().size
+            var_sum += np.sum(csi_data.imag.flatten()**2)
+            var_count += csi_data.flatten().size
+
         return np.sqrt(var_sum / var_count)
     
 class TransposeCollateFn(object):

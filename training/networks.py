@@ -798,9 +798,12 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             tmp = class_labels
             # tmp shape: [B, K]
             if self.training and self.label_dropout and self.label_type != 'no_label':
-                label_dropout_table = torch.unsqueeze(torch.unsqueeze((torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype), dim=-1), dim=-1)
-                tmp = tmp * label_dropout_table
-                # label_dropout 적용 후 tmp shape: [B, K]
+                dropout_mask = (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
+                # tmp 텐서의 차원 수에 맞게 dropout_mask를 확장합니다.
+                # 예: tmp가 [B, C, H, W]이면 mask는 [B, 1, 1, 1]이 됩니다.
+                while dropout_mask.ndim < tmp.ndim:
+                    dropout_mask = dropout_mask.unsqueeze(-1)
+                tmp = tmp * dropout_mask
                 
             if self.label_type == 'downlink':
                 label_emb = self.map_label(tmp)
