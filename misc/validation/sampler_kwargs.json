@@ -1,0 +1,9 @@
+{
+  "num_steps": 18,
+  "sigma_min": 0.002,
+  "sigma_max": 80.0,
+  "rho": 7.0,
+  "S_churn": 0.0,
+  "S_min": 0.0,
+  "S_noise": 1.0
+}

@@ -70,6 +70,7 @@ def parse_int_list(s):
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
 @click.option('--label_dropout', help='Label dropout probability for classifier-free guidance', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
+@click.option('--grad_clip',     help='Gradient clipping', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=1000, show_default=True)
 
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
@@ -91,6 +92,7 @@ def parse_int_list(s):
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
 @click.option('--resume_options',help='Resume from previous training options', metavar='JSON',      type=str, default=None)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
+@click.option('--temp_save',     help='Save intermediate results.',                                is_flag=True)
 
 # RF dataset related
 @click.option('--view_as_complex', help='Whether to view the data as complex numbers.', type=bool, default=False, show_default=True)
@@ -361,6 +363,7 @@ def main(**kwargs):
     c.update(wandb_onoff=opts.wandb)
     c.update(task=opts.task)
     c.update(allow_tf32=opts.allow_tf32)
+    c.update(grad_clip=opts.grad_clip)
 
     # Random seed.
     if opts.seed is not None:
@@ -415,6 +418,7 @@ def main(**kwargs):
     
     c.no_asm = opts.no_asm
     c.debug_test = opts.debug_test
+    c.temp_save = opts.temp_save
 
     # Print options.
     if dist.get_rank() == 0:
@@ -451,6 +455,7 @@ def main(**kwargs):
         with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
             json.dump(c_json, f, indent=2)
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
+
 
     # Train.
     training_loop.training_loop(**c)

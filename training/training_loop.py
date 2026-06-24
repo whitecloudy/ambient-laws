@@ -233,6 +233,8 @@ def training_loop(
     wandb_onoff         = False,    # Enable wandb logging
     allow_tf32          = False,
     debug_test          = False,
+    temp_save           = False,   
+    grad_clip           = 1000,
 ):
     # Initialize.
     start_time = time.time()
@@ -316,8 +318,7 @@ def training_loop(
     dataset_shape = dataset_item["image"].shape
     dist.print0(f'Dataset image shape: {dataset_shape}')
     # Initialize temporary directory for training state dumps
-    if dist.get_rank() == 0 and not debug_test:
-    # if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and not debug_test and temp_save:
         run_dir_name = os.path.basename(os.path.normpath(run_dir))
         temp_dir_path = tempfile.mkdtemp(prefix='ambient-rf_'+run_dir_name+'_')
         latest_saved_kimg = None
@@ -431,7 +432,7 @@ def training_loop(
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
             
-        grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1000)
+        grad_norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
         with torch.no_grad():
             training_stats.report('Loss/grad_norm', grad_norm.item())
         if debug_test:
