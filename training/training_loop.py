@@ -286,7 +286,6 @@ def training_loop(
         else:
             validation_dataset_iterator = None
             
-            import json
             sampler_json_path = './misc/validation/sampler_kwargs.json'
             if os.path.exists(sampler_json_path):
                 with open(sampler_json_path, 'r') as f:
