@@ -3,6 +3,7 @@ from training.sampler import inference_edm_sampler
 import torch
 import numpy as np
 import torch_utils.distributed as dist
+from tqdm import tqdm
 
 class XRF55Validator:
     """
@@ -23,8 +24,17 @@ class XRF55Validator:
             
         self.sampler_kwargs = sampler_kwargs
 
+    def preprocess_images(self, images):
+        if images.ndim == 5:
+            # images shape: [B, 3, 500, 90, 2] -> absolute -> [B, 3, 500, 90]
+            images_abs = torch.norm(images, dim=-1)
+            # permute [B, 3, 500, 90] -> [B, 3, 90, 500] and reshape -> [B, 270, 500]
+            B = images_abs.shape[0]
+            images = images_abs.permute(0, 1, 3, 2).reshape(B, 270, 500)
+        return images
+
     @torch.no_grad()
-    def validate(self, net, num_samples, batch_size=64, real_loader=None, image_shape=None, class_labels=None):
+    def validate(self, net, num_samples, batch_size=32, real_loader=None, image_shape=None, class_labels=None, data_norm=1.0):
         """
         Runs the validation process without calculating gradients.
         
@@ -61,29 +71,61 @@ class XRF55Validator:
         # Scenario 1: Real loader is provided
         if real_loader is not None:
             loader_iter = iter(real_loader)
-            while local_real_count < local_num_samples or local_gen_count < local_num_samples:
-                try:
-                    batch = next(loader_iter)
-                except StopIteration:
-                    loader_iter = iter(real_loader)
-                    batch = next(loader_iter)
-                
-                real_images = batch['image'].to(self.device)
-                labels = batch['label'].to(self.device) if 'label' in batch else None
-                
-                # Ingest real images
-                if local_real_count < local_num_samples:
-                    current_batch_size = min(real_images.size(0), local_num_samples - local_real_count)
-                    self.calculator.feed_real(real_images[:current_batch_size], is_predictions=False)
-                    local_real_count += current_batch_size
-                
-                # Generate and ingest synthetic images
-                if local_gen_count < local_num_samples:
-                    current_batch_size = min(real_images.size(0), local_num_samples - local_gen_count)
-                    latent_shape = real_images.shape[1:]
-                    latents = torch.randn(current_batch_size, *latent_shape, generator=generator, device=self.device)
-                    batch_labels = labels[:current_batch_size] if labels is not None else None
+            with tqdm(total=local_num_samples, desc="XRF55 Validation (Gen)", disable=not dist.get_rank() == 0) as pbar:
+                while local_real_count < local_num_samples or local_gen_count < local_num_samples:
+                    try:
+                        batch = next(loader_iter)
+                    except StopIteration:
+                        loader_iter = iter(real_loader)
+                        batch = next(loader_iter)
                     
+                    real_images = batch['image'].to(self.device)
+                    labels = batch['label'].to(self.device) if 'label' in batch else None
+                    
+                    # Ingest real images
+                    if local_real_count < local_num_samples:
+                        current_batch_size = min(real_images.size(0), local_num_samples - local_real_count)
+                        real_images_preprocessed = self.preprocess_images(real_images[:current_batch_size])
+                        self.calculator.feed_real(real_images_preprocessed, is_predictions=False)
+                        local_real_count += current_batch_size
+                    
+                    # Generate and ingest synthetic images
+                    if local_gen_count < local_num_samples:
+                        current_batch_size = min(real_images.size(0), local_num_samples - local_gen_count)
+                        latent_shape = real_images.shape[1:]
+                        latents = torch.randn(current_batch_size, *latent_shape, generator=generator, device=self.device)
+                        batch_labels = labels[:current_batch_size] if labels is not None else None
+                        
+                        gen_images, _ = inference_edm_sampler(
+                            unwrapped_net, 
+                            latents, 
+                            class_labels=batch_labels, 
+                            **self.sampler_kwargs
+                        )
+
+                        if data_norm != 1.0:
+                            gen_images = gen_images * data_norm
+                        
+                        gen_images_preprocessed = self.preprocess_images(gen_images)
+                        self.calculator.feed_gen(gen_images_preprocessed, is_predictions=False)
+                        local_gen_count += current_batch_size
+                        pbar.update(current_batch_size)
+                    
+        # Scenario 2: Real loader is not provided (rely on pre-calculated real stats)
+        else:
+            if image_shape is None:
+                raise ValueError("Either real_loader or image_shape must be provided.")
+                
+            with tqdm(total=local_num_samples, desc="XRF55 Validation (Gen)", disable=not dist.get_rank() == 0) as pbar:
+                while local_gen_count < local_num_samples:
+                    current_batch_size = min(batch_size, local_num_samples - local_gen_count)
+                    latents = torch.randn(current_batch_size, *image_shape, generator=generator, device=self.device)
+                    
+                    batch_labels = None
+                    if class_labels is not None:
+                        indices = torch.arange(local_gen_count, local_gen_count + current_batch_size) % class_labels.size(0)
+                        batch_labels = class_labels[indices].to(self.device)
+                        
                     gen_images, _ = inference_edm_sampler(
                         unwrapped_net, 
                         latents, 
@@ -91,32 +133,10 @@ class XRF55Validator:
                         **self.sampler_kwargs
                     )
                     
-                    self.calculator.feed_gen(gen_images, is_predictions=False)
+                    gen_images_preprocessed = self.preprocess_images(gen_images)
+                    self.calculator.feed_gen(gen_images_preprocessed, is_predictions=False)
                     local_gen_count += current_batch_size
-                    
-        # Scenario 2: Real loader is not provided (rely on pre-calculated real stats)
-        else:
-            if image_shape is None:
-                raise ValueError("Either real_loader or image_shape must be provided.")
-                
-            while local_gen_count < local_num_samples:
-                current_batch_size = min(batch_size, local_num_samples - local_gen_count)
-                latents = torch.randn(current_batch_size, *image_shape, generator=generator, device=self.device)
-                
-                batch_labels = None
-                if class_labels is not None:
-                    indices = torch.arange(local_gen_count, local_gen_count + current_batch_size) % class_labels.size(0)
-                    batch_labels = class_labels[indices].to(self.device)
-                    
-                gen_images, _ = inference_edm_sampler(
-                    unwrapped_net, 
-                    latents, 
-                    class_labels=batch_labels, 
-                    **self.sampler_kwargs
-                )
-                
-                self.calculator.feed_gen(gen_images, is_predictions=False)
-                local_gen_count += current_batch_size
+                    pbar.update(current_batch_size)
                 
         # 4. Compute overall metrics (will automatically gather data across GPUs if under DDP)
         is_mean, is_std = self.calculator.compute_is(dataset_type='gen')

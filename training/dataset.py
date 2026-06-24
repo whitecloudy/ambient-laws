@@ -844,11 +844,12 @@ class NoiseMeanCollateFn(object):
 
 
 class rf_augmentation_collate_fn(object):
-    def __init__(self, flip_probability=0.0, phase_shift_probability=0.0, ant_axis=None, complex_axis=None, other_collate_fn=[]):
+    def __init__(self, flip_probability=0.0, phase_shift_probability=0.0, ant_axis=None, complex_axis=None, other_collate_fn=[], is_label_complex=False):
         self._flip_probability = flip_probability
         self._phase_shift_probability = phase_shift_probability
         self._ant_axis = ant_axis
         self._complex_axis = complex_axis   # complex_axis is only valid when batch datas are not complex.
+        self._is_label_complex = is_label_complex
         self._other_collate_fn = other_collate_fn
 
         self._name = str(["rf_augmentation_collate_fn",] + [collate_fn.__name__ for collate_fn in self._other_collate_fn])
@@ -901,7 +902,7 @@ class rf_augmentation_collate_fn(object):
                 real_part, imag_part = np.split(img, 2, axis=complex_axis)
                 img = real_part + 1j * imag_part
 
-                if label.size > 0 and len(label.shape) > complex_axis:
+                if self._is_label_complex and label.size > 0 and len(label.shape) > complex_axis:
                     real_part, imag_part = np.split(label, 2, axis=complex_axis)
                     label = real_part + 1j * imag_part
 
@@ -918,7 +919,7 @@ class rf_augmentation_collate_fn(object):
             if complex_axis is not None:
                 # 다시 실수 형태로 변환
                 shifted_img = np.concatenate((shifted_img.real, shifted_img.imag), axis=complex_axis)
-                if shifted_label.size > 0 and len(shifted_label.shape) > complex_axis:
+                if self._is_label_complex and shifted_label.size > 0 and len(shifted_label.shape) > complex_axis:
                     shifted_label = np.concatenate((shifted_label.real, shifted_label.imag), axis=complex_axis)
 
             item['image'] = shifted_img

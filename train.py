@@ -96,7 +96,7 @@ def parse_int_list(s):
 
 # RF dataset related
 @click.option('--view_as_complex', help='Whether to view the data as complex numbers.', type=bool, default=False, show_default=True)
-@click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to None to not merge.', type=int, default=0, show_default=True)
+@click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to "None" to not merge.', type=str, default='0', show_default=True)
 @click.option('--transpose', help='Transpose the data axes according to the given order. Provide a list of two integers representing the new order of the first two axes (frame_resolution and ant_resolution). Set to None to not transpose.', type=str, default="0,1", show_default=True)
 @click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
 @click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
@@ -125,7 +125,7 @@ def parse_int_list(s):
 @click.option("--consistency_coeff", help="Coefficient for the consistency loss.", type=float, default=0.0)
 
 # Validation params
-@click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='KIMG', type=click.IntRange(min=-1), default=50, show_default=True)
+@click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='tick', type=click.IntRange(min=-1), default=50, show_default=True)
 @click.option('--validation_iterations', help='Number of iterations to run for validation.', metavar='INT', type=click.IntRange(min=1), default=5, show_default=True)
 @click.option('--validation_batch_size', help='Batch size for validation.', metavar='INT', type=click.IntRange(min=1), default=64, show_default=True)
 @click.option('--validation_data', help='Path to the validation data. If not specified, portion of the training data will be used.', metavar='ZIP|DIR', type=str, default=None)
@@ -148,6 +148,12 @@ def main(**kwargs):
     """
     opts = dnnlib.EasyDict(kwargs)
     torch.multiprocessing.set_start_method('spawn')
+
+    complex_merge_axis = opts.complex_merge_axis
+    if complex_merge_axis is None or str(complex_merge_axis).lower() == 'none':
+        complex_merge_axis = None
+    else:
+        complex_merge_axis = int(complex_merge_axis)
     dist.init()
     
     # Initialize config dict.
@@ -191,7 +197,7 @@ def main(**kwargs):
         # dataset_kwargs for RENEW dataset
         c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
                                         corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                        only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+                                        only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=complex_merge_axis,
                                         resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                         normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
                                         multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, 
@@ -202,7 +208,7 @@ def main(**kwargs):
         # TMP: 512 to 256 time scale for now to reduce the computational cost.
         c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
                                     corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=complex_merge_axis,
                                     transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                     normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
                                     multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm)
@@ -215,7 +221,7 @@ def main(**kwargs):
     elif opts.task == 'XRF55':
                 c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
                                     corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
+                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=complex_merge_axis,
                                     transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                     normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
                                     multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm)
@@ -226,15 +232,20 @@ def main(**kwargs):
         
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=4, persistent_workers=True)
 
+    is_label_complex = False
+    if opts.task == 'RENEW':
+        is_label_complex = True
+
     c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(flip_probability=opts.flip_aug_ratio, 
                                                                 phase_shift_probability=opts.phase_shift_aug_ratio, 
-                                                                other_collate_fn=[torch.utils.data.default_collate, ])
+                                                                other_collate_fn=[torch.utils.data.default_collate, ],
+                                                                is_label_complex=is_label_complex)
                                                                 # other_collate_fn=[pad_collate_fn(dynamic_noise=opts.dynamic_noise_sigma), torch.utils.data.default_collate])
     validation_on_off = False
     # Determine whether to turn on validation
     if opts.validation_interval == -1:  # If validation_interval is -1, we will turn off validation regardless of other options.
         validation_on_off = False
-    elif opts.validation_data is None and opts.dataset_keep_percentage >= 1.0: # If validation_data is not specified and we are using the whole dataset for training, we will turn off validation.
+    elif opts.task != 'XRF55' and opts.validation_data is None and opts.dataset_keep_percentage >= 1.0: # If validation_data is not specified and we are using the whole dataset for training, we will turn off validation.
         validation_on_off = False
     else:
         validation_on_off = True

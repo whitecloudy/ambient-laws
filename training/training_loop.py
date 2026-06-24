@@ -27,6 +27,7 @@ import tempfile
 from training.dataset import renewRfProcessedDataset, WiDARDataset, XRF55Dataset
 import torch.multiprocessing as mp
 import io
+from validation.XRF55_validation import XRF55Validator
 
 
 def infiniteloop(dataloader):
@@ -300,7 +301,7 @@ def training_loop(
                     "S_min": 0.0,
                     "S_noise": 1.0
                 }
-            from validation.XRF55_validation import XRF55Validator
+            
             xrf55_validator = XRF55Validator(device=device, stats_path=None, **sampler_kwargs)
         
     else:
@@ -489,14 +490,17 @@ def training_loop(
             dist.print0('Aborting...')
 
         # Run validation.
-        if validation_on_off and (validation_interval_tick > 0) and ((cur_tick+1) % validation_interval_tick == 0):
+        if validation_on_off and (validation_interval_tick > 0) and ((cur_tick) % validation_interval_tick == 0) and cur_tick!=0:
             ddp.eval()
             with torch.no_grad():
                 if task == 'XRF55':
                     dist.print0("Running XRF55 validation (IS/FID)...")
                     # we make 50,000 samples to evalutate IS and FID
                     # divide the work across the distributed processes
-                    num_samples = int((50000 // dist.get_world_size())) * dist.get_world_size()
+                    num_samples = 50000
+                    if debug_test:
+                        num_samples = dist.get_world_size()*16
+                    num_samples = int((num_samples // dist.get_world_size())) * dist.get_world_size()
                     
                     (is_mean, is_std), fid_val = xrf55_validator.validate(
                         net=ema, 
