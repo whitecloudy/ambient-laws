@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import torch_utils.distributed as dist
 
 # ==========================================
 # 🚀 1D ResNet Model Architecture (Self-contained)
@@ -115,16 +116,16 @@ def check_weight_file(path):
     url_wifi = 'https://drive.google.com/file/d/1RM2wEE3AjOv0aYKnOcMJMdx7PmQp3XNM/view?usp=sharing'
     target_file = os.path.join(path, 'model0_params.pth')
     if not os.path.exists(target_file):
-        print(f"Weights file not found at '{target_file}'. Downloading from Google Drive...")
+        dist.print0(f"Weights file not found at '{target_file}'. Downloading from Google Drive...")
         try:
             import gdown
             os.makedirs(path, exist_ok=True)
             gdown.download(url_wifi, target_file, quiet=False, fuzzy=True)
         except ImportError:
-            print("gdown package is not installed. Please install it with 'pip install gdown' or download the weights manually.")
-            print(f"Download URL: {url_wifi}")
+            dist.print0("gdown package is not installed. Please install it with 'pip install gdown' or download the weights manually.")
+            dist.print0(f"Download URL: {url_wifi}")
     else:
-        print('Weights file already exists.')
+        dist.print0('Weights file already exists.')
 
 
 class DMLInceptionScoreCalculator:
@@ -136,7 +137,7 @@ class DMLInceptionScoreCalculator:
     (e.g., from an external DataLoader loop), cache the extracted logits/latents on CPU/NumPy,
     and trigger computation at the end of the loop.
     """
-    def __init__(self, model=None, device=None, weight_path='./result/params/model0_params.pth', stats_path='./result/real_wifi_stats.npz'):
+    def __init__(self, model=None, device=None, weight_path='./misc/validation/model0_params.pth', stats_path='./misc/validation/real_wifi_stats.npz'):
         # 1. Device configuration
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -160,6 +161,22 @@ class DMLInceptionScoreCalculator:
         if self.stats_path is not None:
             self.load_real_statistics(self.stats_path)
 
+    def _gather_numpy_array(self, data):
+        """
+        Helper method to gather a numpy array from all distributed processes.
+        """
+        if dist.get_world_size() <= 1:
+            return data
+            
+        gather_list = dist.all_gather_object(data)
+        
+        # Filter out any None values and concatenate
+        gather_list = [x for x in gather_list if x is not None]
+        if len(gather_list) == 0:
+            return data
+            
+        return np.concatenate(gather_list, axis=0)
+
     def clear(self, clear_stats=False):
         """Clears cached logits and latents. If clear_stats=True, also clears loaded real statistics."""
         self.real_logits.clear()
@@ -169,9 +186,9 @@ class DMLInceptionScoreCalculator:
         if clear_stats:
             self.real_mu = None
             self.real_sigma = None
-            print("Calculator cache and pre-calculated statistics cleared.")
+            dist.print0("Calculator cache and pre-calculated statistics cleared.")
         else:
-            print("Calculator cache cleared (pre-calculated statistics preserved).")
+            dist.print0("Calculator cache cleared (pre-calculated statistics preserved).")
 
     def load_default_model(self):
         """Loads and prepares the default model and pre-trained weights."""
@@ -179,12 +196,12 @@ class DMLInceptionScoreCalculator:
             model = resnet18_mutual()
             if os.path.exists(self.weight_path):
                 model.load_state_dict(torch.load(self.weight_path, map_location='cpu'))
-                print(f"Loaded default weights from {self.weight_path}")
+                dist.print0(f"Loaded default weights from {self.weight_path}")
             else:
                 check_weight_file(os.path.dirname(self.weight_path))
                 if os.path.exists(self.weight_path):
                     model.load_state_dict(torch.load(self.weight_path, map_location='cpu'))
-                    print(f"Downloaded and loaded default weights from {self.weight_path}")
+                    dist.print0(f"Downloaded and loaded default weights from {self.weight_path}")
                 else:
                     raise FileNotFoundError(f"Default weight file '{self.weight_path}' could not be loaded.")
             self.model = model
@@ -321,6 +338,7 @@ class DMLInceptionScoreCalculator:
             raise ValueError(f"No cached logits for dataset type '{dataset_type}'. Call feed_{dataset_type} first.")
             
         all_logits = np.concatenate(cache, axis=0)
+        all_logits = self._gather_numpy_array(all_logits)
         return self.calculate_is_score(all_logits, n_splits=n_splits)
 
     def save_real_statistics(self, filepath):
@@ -332,12 +350,17 @@ class DMLInceptionScoreCalculator:
             raise ValueError("No cached real latent features to save. Call feed_real first.")
             
         real_latents = np.concatenate(self.real_latents, axis=0)
+        real_latents = self._gather_numpy_array(real_latents)
+        
+        if dist.get_world_size() > 1 and dist.get_rank() != 0:
+            return
+            
         mu_real = np.mean(real_latents, axis=0)
         sigma_real = np.cov(real_latents, rowvar=False)
         
         # Save to .npz
         np.savez(filepath, mu=mu_real, sigma=sigma_real)
-        print(f"Real statistics successfully saved to {filepath}")
+        dist.print0(f"Real statistics successfully saved to {filepath}")
 
     def load_real_statistics(self, filepath):
         """
@@ -352,7 +375,7 @@ class DMLInceptionScoreCalculator:
             
         self.real_mu = data['mu']
         self.real_sigma = data['sigma']
-        print(f"Pre-calculated real statistics successfully loaded from {filepath}")
+        dist.print0(f"Pre-calculated real statistics successfully loaded from {filepath}")
 
     def compute_fid(self):
         """
@@ -367,6 +390,7 @@ class DMLInceptionScoreCalculator:
             if not self.real_latents:
                 raise ValueError("No cached real latent features and no pre-calculated real statistics loaded. Call feed_real or load_real_statistics first.")
             real_latents = np.concatenate(self.real_latents, axis=0)
+            real_latents = self._gather_numpy_array(real_latents)
             mu_real = np.mean(real_latents, axis=0)
             sigma_real = np.cov(real_latents, rowvar=False)
             
@@ -374,6 +398,7 @@ class DMLInceptionScoreCalculator:
             raise ValueError("No cached generated latent features. Call feed_gen first.")
             
         gen_latents = np.concatenate(self.gen_latents, axis=0)
+        gen_latents = self._gather_numpy_array(gen_latents)
         
         # Calculate mean and covariance for generated data
         mu_gen = np.mean(gen_latents, axis=0)
@@ -434,27 +459,27 @@ def calculate_dml_is(data, is_predictions=True, model=None, device=None, batch_s
 
 
 if __name__ == '__main__':
-    print("Running validation tests for self-contained calculate_dml_is.py (Class version with FID)...")
+    dist.print0("Running validation tests for self-contained calculate_dml_is.py (Class version with FID)...")
     
     # Instantiate the calculator class
     calculator = DMLInceptionScoreCalculator()
     
     # Test 1: Testing direct Inception Score calculation from predictions/logits (NumPy)
-    print("\n--- Test 1: Predictions (NumPy array via Class) ---")
+    dist.print0("\n--- Test 1: Predictions (NumPy array via Class) ---")
     np.random.seed(42)
     dummy_preds_np = np.random.randn(100, 10)  # 100 samples, 10 classes
     mean_score_np, std_score_np = calculator.calculate(dummy_preds_np, is_predictions=True, n_splits=10)
-    print(f"Result (NumPy): {mean_score_np:.4f} ± {std_score_np:.4f}")
+    dist.print0(f"Result (NumPy): {mean_score_np:.4f} ± {std_score_np:.4f}")
     
     # Test 2: Testing direct Inception Score calculation from predictions/logits (PyTorch Tensor)
-    print("\n--- Test 2: Predictions (PyTorch Tensor via Class) ---")
+    dist.print0("\n--- Test 2: Predictions (PyTorch Tensor via Class) ---")
     torch.manual_seed(42)
     dummy_preds_torch = torch.randn(100, 10)  # 100 samples, 10 classes
     mean_score_torch, std_score_torch = calculator.calculate(dummy_preds_torch, is_predictions=True, n_splits=10)
-    print(f"Result (Tensor): {mean_score_torch:.4f} ± {std_score_torch:.4f}")
+    dist.print0(f"Result (Tensor): {mean_score_torch:.4f} ± {std_score_torch:.4f}")
     
     # Test 3: Raw CSI input test
-    print("\n--- Test 3: Raw Inputs Inference & Score via Class ---")
+    dist.print0("\n--- Test 3: Raw Inputs Inference & Score via Class ---")
     try:
         # Dummy CSI inputs: (N, 270, 500)
         dummy_raw_inputs = np.random.rand(20, 270, 500).astype(np.float32)
@@ -464,24 +489,24 @@ if __name__ == '__main__':
             batch_size=10, 
             n_splits=2  # Since we only have 20 samples, use n_splits=2
         )
-        print(f"Result (Raw Inputs): {mean_score_raw:.4f} ± {std_score_raw:.4f}")
+        dist.print0(f"Result (Raw Inputs): {mean_score_raw:.4f} ± {std_score_raw:.4f}")
     except Exception as e:
-        print(f"Raw inputs test failed or weight file missing: {e}")
+        dist.print0(f"Raw inputs test failed or weight file missing: {e}")
 
     # Test 4: Verify wrapper compatibility
-    print("\n--- Test 4: Verification of backward-compatible wrapper function ---")
+    dist.print0("\n--- Test 4: Verification of backward-compatible wrapper function ---")
     mean_wrapper, std_wrapper = calculate_dml_is(dummy_preds_np, is_predictions=True, n_splits=10)
-    print(f"Result (Wrapper): {mean_wrapper:.4f} ± {std_wrapper:.4f}")
+    dist.print0(f"Result (Wrapper): {mean_wrapper:.4f} ± {std_wrapper:.4f}")
 
     # Test 5: FID Score test using dummy features
-    print("\n--- Test 5: FID Score calculation (Class) ---")
+    dist.print0("\n--- Test 5: FID Score calculation (Class) ---")
     dummy_real = np.random.randn(50, 1024)
     dummy_gen = np.random.randn(50, 1024) + 0.5  # shift slightly
     fid = calculator.calculate_fid(dummy_real, dummy_gen, is_latent=True)
-    print(f"FID Score (latent): {fid:.4f}")
+    dist.print0(f"FID Score (latent): {fid:.4f}")
 
     # Test 6: FID Score test using raw inputs
-    print("\n--- Test 6: FID Score calculation from raw inputs (Class) ---")
+    dist.print0("\n--- Test 6: FID Score calculation from raw inputs (Class) ---")
     try:
         dummy_real_raw = np.random.rand(20, 270, 500).astype(np.float32)
         dummy_gen_raw = np.random.rand(20, 270, 500).astype(np.float32)
@@ -491,12 +516,12 @@ if __name__ == '__main__':
             is_latent=False, 
             batch_size=10
         )
-        print(f"FID Score (raw inputs): {fid_raw:.4f}")
+        dist.print0(f"FID Score (raw inputs): {fid_raw:.4f}")
     except Exception as e:
-        print(f"Raw inputs FID test failed or weight file missing: {e}")
+        dist.print0(f"Raw inputs FID test failed or weight file missing: {e}")
 
     # Test 7: Streaming / Feed API test (Asynchronous calculation)
-    print("\n--- Test 7: Streaming / Feed API (Asynchronous) ---")
+    dist.print0("\n--- Test 7: Streaming / Feed API (Asynchronous) ---")
     calculator.clear(clear_stats=True)
     try:
         # Simulate batch feeding from a dataloader loop (5 batches)
@@ -505,19 +530,19 @@ if __name__ == '__main__':
             batch_gen = np.random.rand(4, 270, 500).astype(np.float32)
             calculator.feed_real(batch_real, is_predictions=False)
             calculator.feed_gen(batch_gen, is_predictions=False)
-            print(f"Fed batch {i+1}/5 to calculator.")
+            dist.print0(f"Fed batch {i+1}/5 to calculator.")
             
         # Now compute the scores
         is_mean, is_std = calculator.compute_is(dataset_type='gen', n_splits=2)
         fid_val = calculator.compute_fid()
         
-        print(f"Result (Streaming IS): {is_mean:.4f} ± {is_std:.4f}")
-        print(f"Result (Streaming FID): {fid_val:.4f}")
+        dist.print0(f"Result (Streaming IS): {is_mean:.4f} ± {is_std:.4f}")
+        dist.print0(f"Result (Streaming FID): {fid_val:.4f}")
     except Exception as e:
-        print(f"Streaming test failed: {e}")
+        dist.print0(f"Streaming test failed: {e}")
 
     # Test 8: Save/Load Real Statistics for FID
-    print("\n--- Test 8: Save/Load Real Statistics for FID ---")
+    dist.print0("\n--- Test 8: Save/Load Real Statistics for FID ---")
     calculator.clear(clear_stats=True)
     try:
         # Feed real data to calculator
@@ -541,12 +566,12 @@ if __name__ == '__main__':
         
         # Compute FID using the loaded statistics
         fid_loaded = calculator.compute_fid()
-        print(f"Result (FID with loaded statistics): {fid_loaded:.4f}")
+        dist.print0(f"Result (FID with loaded statistics): {fid_loaded:.4f}")
         
         # Clean up temp file
         if os.path.exists(stats_path):
             os.remove(stats_path)
     except Exception as e:
-        print(f"Save/Load statistics test failed: {e}")
+        dist.print0(f"Save/Load statistics test failed: {e}")
 
 

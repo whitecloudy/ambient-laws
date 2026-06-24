@@ -65,3 +65,13 @@ def print0(*args, **kwargs):
 
 def destroy_process_group():
     torch.distributed.destroy_process_group()
+
+#----------------------------------------------------------------------------
+
+def all_gather_object(obj):
+    if get_world_size() <= 1:
+        return [obj]
+    import torch.distributed as dist_py
+    gather_list = [None] * get_world_size()
+    dist_py.all_gather_object(gather_list, obj)
+    return gather_list
