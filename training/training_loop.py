@@ -268,17 +268,40 @@ def training_loop(
         raise ValueError(f'Unsupported task: {task}')
     validation_on_off = validation_kwargs.validation_on_off
     if validation_on_off:
-        validation_dataset_kwargs = dataset_kwargs.copy()
-        if validation_kwargs.validation_data is not None:
-            validation_dataset_kwargs['data'] = validation_kwargs.validation_data
-            validation_dataset_kwargs['keep_percentage'] = 1.0
-        else:
-            validation_dataset_kwargs['flip_keep_dataset'] = True
-        
-        validation_dataset_obj = dataset_obj.__class__(**validation_dataset_kwargs)
-        validation_dataset_sampler = misc.FiniteSampler(dataset=validation_dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=False, seed=seed)
-        validation_dataset_iterator = torch.utils.data.DataLoader(dataset=validation_dataset_obj, sampler=validation_dataset_sampler, batch_size=validation_kwargs.validation_batch_size, **data_loader_kwargs)
         validation_interval_tick = validation_kwargs.validation_interval
+        
+        if task != 'XRF55':
+            validation_dataset_kwargs = dataset_kwargs.copy()
+            if validation_kwargs.validation_data is not None:
+                validation_dataset_kwargs['data'] = validation_kwargs.validation_data
+                validation_dataset_kwargs['keep_percentage'] = 1.0
+            else:
+                validation_dataset_kwargs['flip_keep_dataset'] = True
+            
+            validation_dataset_obj = dataset_obj.__class__(**validation_dataset_kwargs)
+            validation_dataset_sampler = misc.FiniteSampler(dataset=validation_dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=False, seed=seed)
+            validation_dataset_iterator = torch.utils.data.DataLoader(dataset=validation_dataset_obj, sampler=validation_dataset_sampler, batch_size=validation_kwargs.validation_batch_size, **data_loader_kwargs)
+        else:
+            validation_dataset_iterator = None
+            
+            import json
+            sampler_json_path = './misc/validation/sampler_kwargs.json'
+            if os.path.exists(sampler_json_path):
+                with open(sampler_json_path, 'r') as f:
+                    sampler_kwargs = json.load(f)
+            else:
+                sampler_kwargs = {
+                    "num_steps": 18,
+                    "sigma_min": 0.002,
+                    "sigma_max": 80.0,
+                    "rho": 7.0,
+                    "S_churn": 0.0,
+                    "S_min": 0.0,
+                    "S_noise": 1.0
+                }
+            from validation.XRF55_validation import XRF55Validator
+            xrf55_validator = XRF55Validator(device=device, stats_path=None, **sampler_kwargs)
+        
     else:
         validation_dataset_iterator = None
         validation_interval_tick = -1
@@ -466,26 +489,57 @@ def training_loop(
             dist.print0('Aborting...')
 
         # Run validation.
-        if validation_on_off and validation_dataset_iterator is not None and (validation_interval_tick > 0) and ((cur_tick+1) % validation_interval_tick == 0):
+        if validation_on_off and (validation_interval_tick > 0) and ((cur_tick+1) % validation_interval_tick == 0):
             ddp.eval()
             with torch.no_grad():
-                with tqdm.tqdm(total=validation_kwargs.validation_iterations * len(validation_dataset_iterator), desc="Validation", disable=not dist.get_rank() == 0) as pbar:
-                    for val_iter in range(validation_kwargs.validation_iterations):
-                        for val_dataset_item in validation_dataset_iterator:
-                            val_images = val_dataset_item["image"].to(device)
-                            val_labels = val_dataset_item["label"].to(device)
-                            val_current_sigma = val_dataset_item["sigma"].to(device)
+                if task == 'XRF55':
+                    dist.print0("Running XRF55 validation (IS/FID)...")
+                    # we make 50,000 samples to evalutate IS and FID
+                    # divide the work across the distributed processes
+                    num_samples = int((50000 // dist.get_world_size())) * dist.get_world_size()
+                    
+                    (is_mean, is_std), fid_val = xrf55_validator.validate(
+                        net=ema, 
+                        num_samples=num_samples, 
+                        batch_size=validation_kwargs.validation_batch_size, 
+                        real_loader=None,
+                        image_shape=dataset_shape[1:]
+                    )
+                    
+                    training_stats.report('Validation/IS_mean', is_mean)
+                    training_stats.report('Validation/IS_std', is_std)
+                    if fid_val is not None:
+                        training_stats.report('Validation/FID', fid_val)
+                        dist.print0(f"Validation IS: {is_mean:.4f} ± {is_std:.4f}, FID: {fid_val:.4f}")
+                    else:
+                        dist.print0(f"Validation IS: {is_mean:.4f} ± {is_std:.4f}")
+                        
+                    if wandb_onoff and wandb.run is not None:
+                        wandb_data = {
+                            'Validation/IS_mean': is_mean,
+                            'Validation/IS_std': is_std
+                        }
+                        if fid_val is not None:
+                            wandb_data['Validation/FID'] = fid_val
+                        wandb.log(wandb_data, step=int(cur_nimg/1e3))
+                elif validation_dataset_iterator is not None:
+                    with tqdm.tqdm(total=validation_kwargs.validation_iterations * len(validation_dataset_iterator), desc="Validation", disable=not dist.get_rank() == 0) as pbar:
+                        for val_iter in range(validation_kwargs.validation_iterations):
+                            for val_dataset_item in validation_dataset_iterator:
+                                val_images = val_dataset_item["image"].to(device)
+                                val_labels = val_dataset_item["label"].to(device)
+                                val_current_sigma = val_dataset_item["sigma"].to(device)
 
-                            if "original_shape" in val_dataset_item:
-                                val_original_shape = val_dataset_item["original_shape"].to(device)
-                            else:
-                                val_original_shape = None
+                                if "original_shape" in val_dataset_item:
+                                    val_original_shape = val_dataset_item["original_shape"].to(device)
+                                else:
+                                    val_original_shape = None
 
-                            val_loss, _, _ = loss_fn(net=ddp, images=val_images, labels=val_labels, current_sigma=val_current_sigma, augment_pipe=None, original_shape=val_original_shape)
-                            
-                            training_stats.report('Validation/loss', val_loss.clone().detach())
-                            pbar.update(1)
-                    pbar.close()
+                                val_loss, _, _ = loss_fn(net=ddp, images=val_images, labels=val_labels, current_sigma=val_current_sigma, augment_pipe=None, original_shape=val_original_shape)
+                                
+                                training_stats.report('Validation/loss', val_loss.clone().detach())
+                                pbar.update(1)
+                        pbar.close()
             ddp.train()
 
         # Save network snapshot.
