@@ -302,7 +302,7 @@ def training_loop(
                     "S_noise": 1.0
                 }
             
-            xrf55_validator = XRF55Validator(device=device, stats_path=None, **sampler_kwargs)
+            xrf55_validator = XRF55Validator(device=device, **sampler_kwargs)
         
     else:
         validation_dataset_iterator = None
@@ -507,7 +507,8 @@ def training_loop(
                         num_samples=num_samples, 
                         batch_size=validation_kwargs.validation_batch_size, 
                         real_loader=None,
-                        image_shape=dataset_shape[1:]
+                        image_shape=dataset_shape[1:],
+                        data_norm=dataset_kwargs.normalize_value
                     )
                     
                     training_stats.report('Validation/IS_mean', is_mean)
