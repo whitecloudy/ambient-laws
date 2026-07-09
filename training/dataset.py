@@ -1236,14 +1236,14 @@ class WiDARDataset(Dataset):
 
     def _normalize_data(self, csi_data, noise_sigma_data):
 
-        if self.sigma_norm:
-            # Sigma Normalization
-            csi_data /= np.maximum(noise_sigma_data, 1e-12)
-            noise_sigma_data = np.ones_like(noise_sigma_data)
-        else:
-            mean_sigma = np.sqrt(np.mean(noise_sigma_data**2))
-            csi_data /= mean_sigma
-            noise_sigma_data /= mean_sigma
+        # if self.sigma_norm:
+        #     # Sigma Normalization
+        #     csi_data /= np.maximum(noise_sigma_data, 1e-12)
+        #     noise_sigma_data = np.ones_like(noise_sigma_data)
+        # else:
+        #     mean_sigma = np.sqrt(np.mean(noise_sigma_data**2))
+        #     csi_data /= mean_sigma
+        #     noise_sigma_data /= mean_sigma
 
         csi_data /= self.normalize_value
         noise_sigma_data /= self.normalize_value
@@ -1401,13 +1401,21 @@ class WiDARDataset(Dataset):
         var_sum = 0.0
         var_count = 0
 
+        noise_var_sum = 0.0
+        noise_var_count = 0
+
         for idx in tqdm(self.live_idx, desc="Calculating normalized value"):
             file_path = self.file_paths[idx]
             csi_data, noise_sigma_data, _, _ = _process_widar_file(file_path, 3, self._label_dim)
             csi_data, noise_sigma_data = self._normalize_data(csi_data, noise_sigma_data)
-            var_sum += np.sum(np.sqrt((csi_data * np.conj(csi_data)).real.flatten()))
-            var_count += csi_data.flatten().size
-        return (var_sum / var_count)
+            var_sum += (np.sqrt((np.sum(csi_data.real.flatten()**2) + np.sum(csi_data.imag.flatten()**2)) / (csi_data.flatten().size * 2)))
+            var_count += 1
+
+            noise_var_sum += (np.sqrt(np.sum((noise_sigma_data**2).flatten())/noise_sigma_data.flatten().size))
+            noise_var_count += 1
+
+        return (var_sum / var_count), (noise_var_sum / noise_var_count)
+
 
 
 def _process_xrf55_file(file_path, ant_size, label_dim):
@@ -1767,8 +1775,10 @@ class XRF55Dataset(Dataset):
 
 if __name__ == "__main__":
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else "../data/XRF55_noise_calculated/Scene1"
-    print(path)
-    dataset = XRF55Dataset(path=path, view_as_complex=True, dataset_keep_percentage=1.0, normalize_value=9.114174, must_not_contain=r"regex:\d{2}_\d{2}_(1[5-9]|20)_\d{2}\.npz$")
+    # path = sys.argv[1] if len(sys.argv) > 1 else "../data/XRF55_noise_calculated/Scene1"
+    # print(path)
+    # dataset = XRF55Dataset(path=path, view_as_complex=True, dataset_keep_percentage=1.0, normalize_value=9.114174, must_not_contain=r"regex:\d{2}_\d{2}_(1[5-9]|20)_\d{2}\.npz$")
+    path = sys.argv[1] if len(sys.argv) > 1 else "../data/widar_preprocess/256_recal_noise/train"
+    dataset = WiDARDataset(path=path, view_as_complex=True, dataset_keep_percentage=1.0, must_not_contain="-user5-")
 
     print(dataset.calculate_normalized_value)

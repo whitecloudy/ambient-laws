@@ -34,7 +34,50 @@ def reassembling_filename(date, label_info):
     return filename
 
 
-def process_file(file_path, save_dir, meta_df):
+def fit_data_size(data, target_size):
+    T, C = data.shape
+    if T > target_size:
+        return data[:target_size, :]
+    elif T < target_size:
+        padding = np.zeros((target_size - T, C), dtype=data.dtype)
+        return np.concatenate((data, padding), axis=0)
+    else:
+        return data
+    
+# def interpolate_data(data, target_size):
+#     T, C = data.shape
+#     if T == target_size:
+#         return data
+#     x_old = np.arange(T)
+#     x_new = np.linspace(0, T-1, target_size)
+#     interpolated_data = np.zeros((target_size, C), dtype=data.dtype)
+#     for c in range(C):
+#         interpolated_data[:, c] = np.interp(x_new, x_old, data[:, c])
+#     return interpolated_data
+
+def interpolate_data(data, target_size):
+    T, C = data.shape
+    if T == target_size:
+        return data
+        
+    # 0부터 T-1까지 target_size개 만큼 균일하게 나눈 후, 
+    # 가장 가까운 정수 인덱스로 반올림(round)합니다.
+    x_new = np.linspace(0, T - 1, target_size)
+    nearest_indices = np.round(x_new).astype(int)
+    
+    # 계산된 인덱스를 사용해 원본 데이터에서 값을 그대로 가져옵니다.
+    interpolated_data = data[nearest_indices, :]
+    
+    return interpolated_data
+
+
+def preprocess_data(data, target_size):
+    # data = fit_data_size(data, 2048)
+    data = interpolate_data(data, target_size)
+    return data
+
+
+def process_file(file_path, save_dir, meta_df, target_size=512):
     # Key : ["csi_data", "time", "noise_array"]
     data = sio.loadmat(file_path)
 
@@ -45,6 +88,16 @@ def process_file(file_path, save_dir, meta_df):
     csi_data = data['csi_data'] 
     time = data['time']
     noise_array = data['noise_array']
+    original_length = csi_data.shape[0]
+
+    if csi_data.shape[0] != time.shape[0] or csi_data.shape[0] != noise_array.shape[0]:
+        raise ValueError(f"Data length mismatch in file {file_path}: csi_data length {csi_data.shape[0]}, time length {time.shape[0]}, noise_array length {noise_array.shape[0]}")
+    elif csi_data.shape[0] < target_size:
+        print(f"Skipping file due to insufficient data length: {file_path}, csi_data length: {csi_data.shape[0]}")
+        return 
+    csi_data = preprocess_data(csi_data, target_size=target_size)
+    noise_array = np.sqrt(preprocess_data(np.power(noise_array, 2), target_size=target_size))
+    resized_non_padded_length = target_size
 
     gesture_meta_data = meta_df[(meta_df['date'] == date) & (meta_df['user'] == userN)]
     assert not gesture_meta_data.empty, f"No metadata found for date {date} and user {userN}"
@@ -65,21 +118,21 @@ def process_file(file_path, save_dir, meta_df):
 
     reassembled_filename = reassembling_filename(date, label_info)
     save_path = os.path.join(save_dir, reassembled_filename)
-    np.savez_compressed(save_path, csi_data=csi_data, time=time, noise_array=noise_array)
+    np.savez_compressed(save_path, csi_data=csi_data, noise_array=noise_array, original_length=original_length, resized_non_padded_length=resized_non_padded_length)
 
-def process_chunk(chunk_file_list, save_dir, meta_df):
-    print(f"Processing chunk with {len(chunk_file_list)} files...")
+def process_chunk(chunk_file_list, save_dir, meta_df, target_size):
+    # print(f"Processing chunk with {len(chunk_file_list)} files...")
     for file_path in chunk_file_list:
-        process_file(file_path, save_dir, meta_df)
-
+        process_file(file_path, save_dir, meta_df, target_size)
 
 @click.command()
-@click.option('--dir', default="../../nas_archive/Dataset/Widar dataset/matlab processed csi", help='Directory of the raw data')
+@click.option('--dir', default="../../nas_archive/Dataset/Widar_dataset/matlab_processed_csi", help='Directory of the raw data')
 @click.option('--save_dir', default="../data/widar_preprocess", help='Directory to save the preprocessed data')
 @click.option('--n_proc', default=4, help='Number of processes to use for preprocessing')
 @click.option('--process_chunk_size', default=128, help='Number of files to process in each chunk')
-@click.option('--meta_csv', default=None, help='Path to save the metadata csv file')
-def __main__(dir, save_dir, n_proc, process_chunk_size, meta_csv):
+@click.option('--meta_csv', default="../../nas_archive/Dataset/Widar/Original CSI/widar_data_label.csv", help='Path to save the metadata csv file')
+@click.option('--target_size', default=512, help='Target size for the preprocessed data')
+def __main__(dir, save_dir, n_proc, process_chunk_size, meta_csv, target_size):
     scan_file_list = []
     for root, _, files in os.walk(dir):
         for file in files:
@@ -100,10 +153,8 @@ def __main__(dir, save_dir, n_proc, process_chunk_size, meta_csv):
             chunk_file_list_split = [scan_file_list[min(i+j*process_chunk_size, total_len):i+min((j+1)*process_chunk_size, total_len)] for j in range(n_proc)]
             total_len_chunk = sum(len(chunk) for chunk in chunk_file_list_split)
             with multiprocessing.Pool(n_proc) as pool:
-                pool.starmap(process_chunk, [(chunk_file_list, save_dir, meta_df) for chunk_file_list in chunk_file_list_split])
+                pool.starmap(process_chunk, [(chunk_file_list, save_dir, meta_df, target_size) for chunk_file_list in chunk_file_list_split])
             pbar.update(total_len_chunk)
-
-
 
 if __name__ == "__main__":
     __main__()
