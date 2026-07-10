@@ -71,6 +71,7 @@ def parse_int_list(s):
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
 @click.option('--label_dropout', help='Label dropout probability for classifier-free guidance', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
 @click.option('--grad_clip',     help='Gradient clipping', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=1000, show_default=True)
+@click.option('--lr_rampup_kimg',     help='LR Rampup in kimg', metavar='INT', type=click.IntRange(min=0, min_open=True), default=10000, show_default=True)
 
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
@@ -259,6 +260,7 @@ def main(**kwargs):
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8, weight_decay=opts.weight_decay)
+    c.lr_rampup_kimg = opts.lr_rampup_kimg
 
     dist.synchronize()
     # Validate dataset options.
