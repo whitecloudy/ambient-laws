@@ -489,6 +489,11 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         else:
             dtype = np.float32
 
+        if self._complex_merge_axis is None:
+            return_complex_merge_axis = -1
+        else:
+            return_complex_merge_axis = self._complex_merge_axis
+
         return {
             'image': csi_data.astype(dtype),
             "label": label_data.astype(dtype),
@@ -497,7 +502,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             "noise": np.random.randn(*csi_data.shape),
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
-            'complex_merge_axis': self._complex_merge_axis,
+            'complex_merge_axis': return_complex_merge_axis,
             'axis_name': self._axis_name,
         }
 
@@ -1113,7 +1118,7 @@ class WiDARDataset(Dataset):
                  image_noise_seed = 445481,
                  noise_mean_flag = True,
                  noise_mean_alter_way = True,
-                 use_labels=True, # WiDAR seems to always have labels
+                 use_labels=True, 
                  cache = None,
                  sigma = 0.0,
                  only_positive = False,
@@ -1139,6 +1144,7 @@ class WiDARDataset(Dataset):
         self.image_noise_seed = image_noise_seed
         self.noise_mean_flag = noise_mean_flag
         self.noise_mean_alter_way = noise_mean_alter_way
+        self._use_labels = use_labels
         self.file_paths = []
 
         if isinstance(self.dir_path, str):

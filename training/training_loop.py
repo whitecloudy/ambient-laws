@@ -276,8 +276,8 @@ def training_loop(
         if task != 'XRF55':
             validation_dataset_kwargs = dataset_kwargs.copy()
             if validation_kwargs.validation_data is not None:
-                validation_dataset_kwargs['data'] = validation_kwargs.validation_data
-                validation_dataset_kwargs['keep_percentage'] = 1.0
+                validation_dataset_kwargs['path'] = validation_kwargs.validation_data
+                validation_dataset_kwargs['dataset_keep_percentage'] = 1.0
             else:
                 validation_dataset_kwargs['flip_keep_dataset'] = True
             
@@ -341,11 +341,9 @@ def training_loop(
     with torch.no_grad():
         images = torch.zeros(dataset_shape, device=device)
         sigma = torch.ones([batch_gpu], device=device)
-        if net.model.label_type == 'downlink':
-            labels = torch.zeros([batch_gpu, net.label_dim, net.img_resolution[0], net.img_resolution[1]], device=device)
-        elif net.model.label_type == 'classes':
-            labels = torch.zeros([batch_gpu, net.label_dim], device=device)
-        elif net.model.label_type == 'no_label':
+        if net.model.label_type != 'no_label' and "label" in dataset_item and dataset_item["label"] is not None:
+            labels = torch.zeros_like(dataset_item["label"]).to(device)
+        else:
             labels = None
         misc.print_module_summary(net, [images, sigma, labels], max_nesting=2, verbose=dist.get_rank() == 0)
 

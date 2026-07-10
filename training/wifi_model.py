@@ -226,13 +226,18 @@ class tfdiff_WiFi(nn.Module):
         self.dropout = dropout
         self.mlp_ratio = mlp_ratio
         self.dynamic_noise = dynamic_noise
+        self.cond_dim = cond_dim
         self.p_embed = PositionEmbedding(
             sample_rate, input_dim, hidden_dim)
         self.t_embed = DiffusionEmbedding(
             max_step, embed_dim, hidden_dim)
         # self.t_embed = PositionalEmbedding(num_channels=embed_dim, endpoint=True)
 
-        self.c_embed = MLPConditionEmbedding(cond_dim, hidden_dim)
+        if self.cond_dim != 0:
+            self.c_embed = MLPConditionEmbedding(cond_dim, hidden_dim)
+        else:
+            self.c_embed = None
+
         self.blocks = nn.ModuleList([
             DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(num_block)
         ])
@@ -280,8 +285,11 @@ class tfdiff_WiFi(nn.Module):
 
         x = self.p_embed(x)
         t = self.t_embed(t)
-        c = self.c_embed(c)
-        c = c + t
+        if self.c_embed is not None:
+            c = self.c_embed(c)
+            c = c + t
+        else:
+            c = t
         for block in self.blocks:
             x = block(x, c)
         x = self.final_layer(x, c)

@@ -299,7 +299,7 @@ class tfdiff_mimo(nn.Module):
     # x : [B, N, S, A, 2]
     # t : [B]
     # c : [B, N, C, 2]
-    def forward(self, x, noise_labels, class_labels):
+    def forward(self, x, noise_labels, class_labels, augment_labels=None, **kwargs):
         x = x
         if self.dynamic_noise:
             while noise_labels.ndim < x.ndim:
