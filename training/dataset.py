@@ -568,19 +568,25 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
     def get_normalize_value(self):
         return self._normalize_value
     
+
     @property
     def calculate_normalized_value(self):
         var_sum = 0.0
         var_count = 0
 
-        for fname in tqdm(self._fname, total=len(self._fname)):
-            csi_data, noise_sigma_data = self._load_and_normalize(fname)
-            var_sum += np.sum(csi_data.real.flatten()**2)
-            var_count += csi_data.flatten().size
-            var_sum += np.sum(csi_data.imag.flatten()**2)
-            var_count += csi_data.flatten().size
+        noise_var_sum = 0.0
+        noise_var_count = 0
 
-        return np.sqrt(var_sum / var_count)
+        for fname in tqdm(self._fname, desc="Calculating normalized value"):
+            csi_data, noise_sigma_data = self._load_and_normalize(fname)
+            var_sum += (np.sqrt((np.sum(csi_data.real.flatten()**2) + np.sum(csi_data.imag.flatten()**2)) / (csi_data.flatten().size * 2)))
+            var_count += 1
+
+            noise_var_sum += (np.sqrt(np.sum((noise_sigma_data**2).flatten())/noise_sigma_data.flatten().size))
+            noise_var_count += 1
+
+        return (var_sum / var_count), (noise_var_sum / noise_var_count)
+
     
 class TransposeCollateFn(object):
     """
@@ -1778,7 +1784,11 @@ if __name__ == "__main__":
     # path = sys.argv[1] if len(sys.argv) > 1 else "../data/XRF55_noise_calculated/Scene1"
     # print(path)
     # dataset = XRF55Dataset(path=path, view_as_complex=True, dataset_keep_percentage=1.0, normalize_value=9.114174, must_not_contain=r"regex:\d{2}_\d{2}_(1[5-9]|20)_\d{2}\.npz$")
-    path = sys.argv[1] if len(sys.argv) > 1 else "../data/widar_preprocess/256_recal_noise/train"
-    dataset = WiDARDataset(path=path, view_as_complex=True, dataset_keep_percentage=1.0, must_not_contain="-user5-")
+
+    # path = sys.argv[1] if len(sys.argv) > 1 else "../data/widar_preprocess/256_recal_noise/train"
+    # dataset = WiDARDataset(path=path, view_as_complex=True, dataset_keep_percentage=1.0, must_not_contain="-user5-")
+
+    path = sys.argv[1] if len(sys.argv) > 1 else "../data/RENEW/updown_link_test/train"
+    dataset = renewRfProcessedDataset(path=path, view_as_complex=True, dataset_keep_percentage=1.0)
 
     print(dataset.calculate_normalized_value)

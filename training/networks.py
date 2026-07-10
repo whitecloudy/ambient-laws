@@ -1133,6 +1133,18 @@ class RF_transformer(tfdiff_WiFi):
         self.out_channels = out_channels
         super().__init__(*args, **kwargs)
 
+from training.mimo_model import tfdiff_mimo
+
+class RF_transformer_MIMO(tfdiff_mimo):
+    def __init__(self, img_resolution, in_channels, label_dim, label_type, out_channels, *args, **kwargs):
+        self.img_resolution = img_resolution
+        self.in_channels = in_channels
+        self.label_dim = label_dim
+        self.label_type = label_type
+        self.out_channels = out_channels
+        super().__init__(*args, **kwargs)
+
+
 
 #----------------------------------------------------------------------------
 # Reimplementation of the ADM architecture from the paper

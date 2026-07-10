@@ -33,6 +33,9 @@ def process_file(args):
     elif csi_data.ndim == 5 and noise_data.ndim == 3:
         # 데이터 shape: [Frame, User, Pilot_Rep, Cell, Subcarrier] 및 [Frame, User, Cell]
         n_frames, n_users, pilot_rep, n_cells, n_subcarriers = csi_data.shape
+    else:
+        print(f"Error: Unexpected data shape for {prefix}")
+        return
 
     # 출력 디렉토리 생성
     file_prefix = os.path.basename(prefix)

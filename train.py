@@ -312,6 +312,8 @@ def main(**kwargs):
         c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55)
     elif opts.arch == 'rf_transformer_default_xrf_500_large':
         c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55, hidden_dim=512, num_block=16)
+    elif opts.arch == 'rf_transformer_MIMO_default':
+        c.network_kwargs.update(model_type='RF_transformer_MIMO', sample_rate=1, input_dim=26)
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])

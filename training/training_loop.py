@@ -540,7 +540,7 @@ def training_loop(
                                 else:
                                     val_original_shape = None
 
-                                val_loss, _, _ = loss_fn(net=ddp, images=val_images, labels=val_labels, current_sigma=val_current_sigma, augment_pipe=None, original_shape=val_original_shape)
+                                val_loss, _, _ = loss_fn(net=ema, images=val_images, labels=val_labels, current_sigma=val_current_sigma, augment_pipe=None, original_shape=val_original_shape)
                                 
                                 training_stats.report('Validation/loss', val_loss.clone().detach())
                                 pbar.update(1)

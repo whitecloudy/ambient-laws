@@ -8,6 +8,61 @@ import click
 import csv
 import multiprocessing
 
+def estimate_noise_variance(H, group_size=5, num_signals=3, time_step=10):
+    """
+    H: 수신된 CSI 데이터 행렬 (N_c x N_t)
+    group_size: 묶을 부반송파의 개수 (delta_k 기반, 예: 3)
+    num_signals: 묶음 내에 존재하는 독립적인 신호의 개수 (q)
+    time_step: 시간 단계 수 (N_t) - 실제 데이터에서 사용할 시간 단계 수 (예: 10)
+    """
+    N_c, N_t = H.shape
+    n_t = time_step
+    
+    # 묶음(그룹)의 총 개수 계산 (나머지는 버림)
+    num_groups = N_c // group_size
+    
+    noise_variances = []
+    
+    for t in range(0, N_t, n_t):
+        # 주파수 평균화를 위한 빈 공분산 행렬 초기화
+        R_avg = np.zeros((group_size, group_size), dtype=complex)
+        current_n_t = min(n_t, N_t - t)
+        
+        for g in range(num_groups):
+            # 1. group_size 만큼 부반송파 행렬 잘라내기
+            H_group = H[g*group_size : (g+1)*group_size, t:t+current_n_t]
+            
+            # 2. 공분산 행렬 계산 (H_group * H_group^H / current_n_t)
+            R_group = (H_group @ H_group.conj().T) / current_n_t
+            
+            # 행렬 더하기
+            R_avg += R_group
+            
+        # 3. 주파수 축 평균화 (논문의 핵심: 차원을 줄이면서 데이터 신뢰도 확보)
+        R_avg /= num_groups 
+    
+        # 4. SVD (특이값 분해) 수행
+        # 공분산 행렬(Hermitian)이므로 SVD의 특이값(S)은 EVD의 고유값과 동일합니다.
+        U, S, Vh = np.linalg.svd(R_avg)
+        
+        # S는 내림차순(가장 큰 값부터 작은 값 순)으로 정렬된 특이값(고유값) 배열입니다.
+        # 5. 노이즈 공간 분리 및 세기 계산
+        # 가장 큰 num_signals 개수는 신호 공간(Signal Subspace)이므로 제외하고,
+        # 나머지 작은 고유값들(Noise Subspace)을 평균내어 노이즈 세기를 구합니다.
+        noise_eigenvalues = S[num_signals:]
+        noise_variance = np.mean(noise_eigenvalues)
+        noise_variances.append(noise_variance)
+
+    noise_variances = np.array(noise_variances)
+    noise_std_complex = np.sqrt(noise_variances)/np.sqrt(2)
+    
+    # H와 동일한 (N_c, N_t) 형태로 확장
+    noise_std_complex = np.repeat(noise_std_complex, n_t)[:N_t]
+    noise_std_complex = np.tile(noise_std_complex, (N_c, 1))
+    
+    return noise_std_complex
+
+
 def extract_date_and_userN_from_dir(dir):
     dir_split = os.path.normpath(dir).split(os.sep)
     date = int(dir_split[-3])
@@ -95,8 +150,20 @@ def process_file(file_path, save_dir, meta_df, target_size=512):
     elif csi_data.shape[0] < target_size:
         print(f"Skipping file due to insufficient data length: {file_path}, csi_data length: {csi_data.shape[0]}")
         return 
+
+    csi_data = csi_data/noise_array # make widar data same as original. noise_array in this data was just dummy value
+    t_csi_data = csi_data.transpose(1,0)  
+    noise_std_complex_list = []
+    for i in range(3):
+        start_i = i*30
+        end_i = start_i+30
+        noise_std = estimate_noise_variance(t_csi_data[start_i:end_i])
+        noise_std_complex_list.append(noise_std)
+    noise_array = np.concatenate(noise_std_complex_list, axis=0)
+    noise_array = noise_array.transpose(1,0)
+
     csi_data = preprocess_data(csi_data, target_size=target_size)
-    noise_array = np.sqrt(preprocess_data(np.power(noise_array, 2), target_size=target_size))
+    noise_array = preprocess_data(noise_array, target_size=target_size)
     resized_non_padded_length = target_size
 
     gesture_meta_data = meta_df[(meta_df['date'] == date) & (meta_df['user'] == userN)]
@@ -130,7 +197,7 @@ def process_chunk(chunk_file_list, save_dir, meta_df, target_size):
 @click.option('--save_dir', default="../data/widar_preprocess", help='Directory to save the preprocessed data')
 @click.option('--n_proc', default=4, help='Number of processes to use for preprocessing')
 @click.option('--process_chunk_size', default=128, help='Number of files to process in each chunk')
-@click.option('--meta_csv', default="../../nas_archive/Dataset/Widar/Original CSI/widar_data_label.csv", help='Path to save the metadata csv file')
+@click.option('--meta_csv', default="../../nas_archive/Dataset/Widar/Original_CSI/widar_data_label.csv", help='Path to save the metadata csv file')
 @click.option('--target_size', default=512, help='Target size for the preprocessed data')
 def __main__(dir, save_dir, n_proc, process_chunk_size, meta_csv, target_size):
     scan_file_list = []
