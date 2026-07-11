@@ -1076,7 +1076,10 @@ def _process_widar_file(file_path, ant_size, label_dim):
         csi_data = np.stack(csi_data)
 
         noise_sigma_data = file_data['noise_array'].astype(np.float32) 
-        noise_sigma_data = np.repeat(np.expand_dims(noise_sigma_data, axis=0), ant_size, axis=0)
+        # noise_sigma_data = np.repeat(np.expand_dims(noise_sigma_data, axis=0), ant_size, axis=0)
+        noise_sigma_data = np.split(noise_sigma_data, axis=1, indices_or_sections=ant_size)
+        noise_sigma_data = np.stack(noise_sigma_data)
+
         true_length = file_data['resized_non_padded_length'].astype(np.float32)
 
     base_name = os.path.basename(file_path)
