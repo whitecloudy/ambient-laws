@@ -1444,7 +1444,7 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         while sigma.ndim < x.ndim:
             sigma = sigma.unsqueeze(-1)
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32)
-        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+        dtype = torch.bfloat16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()

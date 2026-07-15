@@ -396,6 +396,9 @@ def training_loop(
 
     bg_threads = []
 
+    if debug_test:
+        debug_start_time = time.time()
+
     # LOOP STARTS HERE.
     while True:
         # Accumulate gradients.
@@ -420,7 +423,9 @@ def training_loop(
                 training_stats.report('Loss/loss', loss)
                 if debug_test:
                     with torch.no_grad():
-                        dist.print0(f'loss: {torch.mean(loss).item()}')
+                        debug_end_time = time.time()
+                        dist.print0(f'loss: {torch.mean(loss).item()}, tick_time: {(debug_end_time - debug_start_time):.4f}s')
+                        debug_start_time = time.time()
                 (loss).sum().mul(loss_scaling / batch_gpu_total).backward()
 
         # Update weights.

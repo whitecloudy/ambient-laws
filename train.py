@@ -70,7 +70,7 @@ def parse_int_list(s):
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
 @click.option('--label_dropout', help='Label dropout probability for classifier-free guidance', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
-@click.option('--grad_clip',     help='Gradient clipping', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=1000, show_default=True)
+@click.option('--grad_clip',     help='Gradient clipping', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=1e8, show_default=True)
 @click.option('--lr_rampup_kimg',     help='LR Rampup in kimg', metavar='INT', type=click.IntRange(min=0, min_open=True), default=10000, show_default=True)
 
 # Performance-related.
