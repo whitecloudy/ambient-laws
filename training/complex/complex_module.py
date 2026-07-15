@@ -6,13 +6,41 @@ import numpy as np
 import math
 
 
+def forward_with_dtype(mod, input):
+    if isinstance(mod, nn.Linear):
+        w = mod.weight.to(input.dtype)
+        b = mod.bias.to(input.dtype) if mod.bias is not None else None
+        return F.linear(input, w, b)
+    elif isinstance(mod, nn.LayerNorm):
+        w = mod.weight.to(input.dtype) if mod.weight is not None else None
+        b = mod.bias.to(input.dtype) if mod.bias is not None else None
+        return F.layer_norm(input, mod.normalized_shape, w, b, mod.eps)
+    elif isinstance(mod, nn.modules.batchnorm._BatchNorm):
+        w = mod.weight.to(input.dtype) if mod.weight is not None else None
+        b = mod.bias.to(input.dtype) if mod.bias is not None else None
+        rm = mod.running_mean.to(input.dtype) if mod.running_mean is not None else None
+        rv = mod.running_var.to(input.dtype) if mod.running_var is not None else None
+        return F.batch_norm(
+            input, rm, rv, w, b,
+            training=mod.training or not mod.track_running_stats,
+            momentum=mod.momentum, eps=mod.eps
+        )
+    elif isinstance(mod, nn.Conv3d):
+        w = mod.weight.to(input.dtype)
+        b = mod.bias.to(input.dtype) if mod.bias is not None else None
+        return F.conv3d(input, w, b, mod.stride, mod.padding, mod.dilation, mod.groups)
+    else:
+        return mod(input)
+
 def apply_complex(F_r, F_i, X):
     X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
-    return torch.stack((F_r(X_r) - F_i(X_i), F_r(X_i) + F_i(X_r)), dim=-1)
+    out_r = forward_with_dtype(F_r, X_r) - forward_with_dtype(F_i, X_i)
+    out_i = forward_with_dtype(F_r, X_i) + forward_with_dtype(F_i, X_r)
+    return torch.stack((out_r, out_i), dim=-1)
 
 def apply_complex_sep(F_r, F_i, X):
     X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
-    return torch.stack((F_r(X_r), F_i(X_i)), dim=-1)
+    return torch.stack((forward_with_dtype(F_r, X_r), forward_with_dtype(F_i, X_i)), dim=-1)
 
 @torch.jit.script
 def complex_mul(X, Y):
