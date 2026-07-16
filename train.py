@@ -125,6 +125,10 @@ def parse_int_list(s):
 @click.option("--num_primes", help="Number of primes for the consistency loss.", type=int, default=6)
 @click.option("--consistency_coeff", help="Coefficient for the consistency loss.", type=float, default=0.0)
 
+# EDM Loss params
+@click.option('--p_mean',        help='P_mean parameter for EDM Loss', metavar='FLOAT', type=float, default=-1.2, show_default=True)
+@click.option('--p_std',         help='P_std parameter for EDM Loss', metavar='FLOAT', type=float, default=1.2, show_default=True)
+
 # Validation params
 @click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='tick', type=click.IntRange(min=-1), default=50, show_default=True)
 @click.option('--validation_iterations', help='Number of iterations to run for validation.', metavar='INT', type=click.IntRange(min=1), default=5, show_default=True)
@@ -356,6 +360,7 @@ def main(**kwargs):
     c.loss_kwargs.update(num_primes=opts.num_primes)
     c.loss_kwargs.update(consistency_coeff=opts.consistency_coeff)
     c.loss_kwargs.update(no_asm=opts.no_asm)
+    c.loss_kwargs.update(P_mean=opts.p_mean, P_std=opts.p_std)
 
     # Network options.
     if opts.cbase is not None:
