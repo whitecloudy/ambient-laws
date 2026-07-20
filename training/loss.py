@@ -16,8 +16,9 @@ import ambient_utils
 from training.sampler import edm_sampler, padding_mask_from_original_shape
 
 
-def from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, current_sigma, desired_sigma):
-    return (1 - (desired_sigma / current_sigma) ** 2) * x0_pred + ((desired_sigma / current_sigma) ** 2) * noisy_input
+# def from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, current_sigma, desired_sigma):
+def from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, sigma_t, sigma_t_n):
+    return (1 - (sigma_t_n / sigma_t) ** 2) * x0_pred + ((sigma_t_n / sigma_t) ** 2) * noisy_input
 
 #----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
@@ -73,8 +74,8 @@ class EDMLoss:
 
         # sigma가 0으로 남아있는걸 제거해서 nan 생성 방지
         if isinstance(sigma, torch.Tensor):
-            nonzero_sigma = torch.where(sigma == 0.0, torch.tensor(1e-8, dtype=sigma.dtype, device=sigma.device), sigma)
-        elif sigma == 0.0:
+            nonzero_sigma = torch.where(sigma < 1e-8, torch.tensor(1e-8, dtype=sigma.dtype, device=sigma.device), sigma)
+        elif sigma < 1e-8:
             nonzero_sigma = 1e-8
         else:
             nonzero_sigma = sigma
