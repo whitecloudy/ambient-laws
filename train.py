@@ -130,6 +130,7 @@ def parse_int_list(s):
 # EDM Loss params
 @click.option('--p_mean',        help='P_mean parameter for EDM Loss', metavar='FLOAT', type=float, default=-1.2, show_default=True)
 @click.option('--p_std',         help='P_std parameter for EDM Loss', metavar='FLOAT', type=float, default=1.2, show_default=True)
+@click.option('--sigma_data',    help='sigma_data parameter for EDM Loss and Precond', metavar='FLOAT', type=float, default=0.5, show_default=True)
 
 # Validation params
 @click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='tick', type=click.IntRange(min=-1), default=50, show_default=True)
@@ -370,7 +371,7 @@ def main(**kwargs):
     c.loss_kwargs.update(num_primes=opts.num_primes)
     c.loss_kwargs.update(consistency_coeff=opts.consistency_coeff)
     c.loss_kwargs.update(no_asm=opts.no_asm)
-    c.loss_kwargs.update(P_mean=opts.p_mean, P_std=opts.p_std)
+    c.loss_kwargs.update(P_mean=opts.p_mean, P_std=opts.p_std, sigma_data=opts.sigma_data)
 
     # Network options.
     if opts.cbase is not None:
@@ -381,7 +382,7 @@ def main(**kwargs):
         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=opts.augment)
         c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
         c.network_kwargs.augment_dim = 9
-    c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16, label_dropout=opts.label_dropout, attention_scale=opts.attn_scale)
+    c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16, label_dropout=opts.label_dropout, attention_scale=opts.attn_scale, sigma_data=opts.sigma_data)
 
 
     # Training options.
