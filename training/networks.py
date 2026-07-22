@@ -186,18 +186,20 @@ class GroupNorm(torch.nn.Module):
 
 class AttentionOp(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k):
-        w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
+    def forward(ctx, q, k, scale=1.0):
+        w = ((torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32))) * scale).softmax(dim=2).to(q.dtype)
         ctx.save_for_backward(q, k, w)
+        ctx.scale = scale
         return w
 
     @staticmethod
     def backward(ctx, dw):
         q, k, w = ctx.saved_tensors
+        scale = ctx.scale
         db = torch._softmax_backward_data(grad_output=dw.to(torch.float32), output=w.to(torch.float32), dim=2, input_dtype=torch.float32)
-        dq = torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) / np.sqrt(k.shape[1])
-        dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
-        return dq, dk
+        dq = (torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) * scale) / np.sqrt(k.shape[1])
+        dk = (torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) * scale) / np.sqrt(k.shape[1])
+        return dq, dk, None
 
 #----------------------------------------------------------------------------
 # Unified U-Net block with optional up/downsampling and self-attention.
@@ -212,7 +214,8 @@ class UNetBlock(torch.nn.Module):
         resample_filter=[1,1], resample_stride=2, resample_proj=False, adaptive_scale=True,
         kernel=3,
         init=dict(), init_zero=dict(init_weight=0), init_attn=None, stride=(1,1),
-        emb_stride=(1,1) # 추가: emb 전용 stride
+        emb_stride=(1,1), # 추가: emb 전용 stride
+        attention_scale=1.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -222,6 +225,7 @@ class UNetBlock(torch.nn.Module):
         self.dropout = dropout
         self.skip_scale = skip_scale
         self.adaptive_scale = adaptive_scale
+        self.attention_scale = float(attention_scale)
 
         if isinstance(stride, int):
             stride = (stride, stride)
@@ -265,7 +269,7 @@ class UNetBlock(torch.nn.Module):
 
         if self.num_heads:
             q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
-            w = AttentionOp.apply(q, k)
+            w = AttentionOp.apply(q, k, self.attention_scale)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale
@@ -284,7 +288,8 @@ class UNetBlock_AS(torch.nn.Module):
         resample_filter=[1,1], resample_stride=2, resample_proj=False, adaptive_scale=True,
         kernel=3,
         init=dict(), init_zero=dict(init_weight=0), init_attn=None, stride=(1,1),
-        emb_stride=(1,1) # 유지 호환성을 위해 추가
+        emb_stride=(1,1), # 유지 호환성을 위해 추가
+        attention_scale=1.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -294,6 +299,7 @@ class UNetBlock_AS(torch.nn.Module):
         self.dropout = dropout
         self.skip_scale = skip_scale
         self.adaptive_scale = adaptive_scale
+        self.attention_scale = float(attention_scale)
 
         # emb를 위한 Learnable Downsampling Layer 추가
         self.emb_stride = emb_stride if isinstance(emb_stride, (tuple, list)) else (emb_stride, emb_stride)
@@ -350,7 +356,7 @@ class UNetBlock_AS(torch.nn.Module):
 
         if self.num_heads:
             q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
-            w = AttentionOp.apply(q, k)
+            w = AttentionOp.apply(q, k, self.attention_scale)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale
@@ -476,6 +482,7 @@ class SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
+        attention_scale     = 1.0,          # Attention temperature scaling factor.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -491,7 +498,7 @@ class SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
-            init=init, init_zero=init_zero, init_attn=init_attn,
+            init=init, init_zero=init_zero, init_attn=init_attn, attention_scale=attention_scale,
         )
 
         # Mapping.
@@ -626,6 +633,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
         dynamic_noise       = False,        # Whether to use dynamic noise labels.
+        attention_scale     = 1.0,          # Attention temperature scaling factor.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -649,7 +657,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
-            init=init, init_zero=init_zero, init_attn=init_attn,
+            init=init, init_zero=init_zero, init_attn=init_attn, attention_scale=attention_scale,
         )
 
         # Mapping.
@@ -900,7 +908,8 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         kernel_size         = [3,3],       # Base kernel size.
         stride              = [1,1],       # Base stride.
         stem_kernel         = [3,3],       # Initial stem kernel size (Patchification)
-        stem_stride         = [1,1]        # Initial stem downsampling stride (Patchification)
+        stem_stride         = [1,1],       # Initial stem downsampling stride (Patchification)
+        attention_scale     = 1.0,          # Attention temperature scaling factor.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -919,7 +928,7 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_stride=resample_stride, resample_proj=True, adaptive_scale=False,
             kernel=kernel_size, stride=stride,
-            init=init, init_zero=init_zero, init_attn=init_attn,
+            init=init, init_zero=init_zero, init_attn=init_attn, attention_scale=attention_scale,
         )
         
         if isinstance(stem_stride, int):
@@ -1170,13 +1179,14 @@ class DhariwalUNet(torch.nn.Module, PyTorchModelHubMixin):
         attn_resolutions    = [32,16,8],    # List of resolutions with self-attention.
         dropout             = 0.10,         # List of resolutions with self-attention.
         label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
+        attention_scale     = 1.0,          # Attention temperature scaling factor.
     ):
         super().__init__()
         self.label_dropout = label_dropout
         emb_channels = model_channels * channel_mult_emb
         init = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), init_bias=np.sqrt(1/3))
         init_zero = dict(init_mode='kaiming_uniform', init_weight=0, init_bias=0)
-        block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero)
+        block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero, attention_scale=attention_scale)
 
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=model_channels)
