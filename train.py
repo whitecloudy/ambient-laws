@@ -52,8 +52,8 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma']), default='edm', show_default=True)
-@click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip',       type=click.Choice(['edm', 'edm_c_skip']), default='edm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test']), default='edm', show_default=True)
+@click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',            type=str, default=None, show_default=True)
@@ -128,9 +128,11 @@ def parse_int_list(s):
 @click.option("--consistency_coeff", help="Coefficient for the consistency loss.", type=float, default=0.0)
 
 # EDM Loss params
-@click.option('--p_mean',        help='P_mean parameter for EDM Loss', metavar='FLOAT', type=float, default=-1.2, show_default=True)
-@click.option('--p_std',         help='P_std parameter for EDM Loss', metavar='FLOAT', type=float, default=1.2, show_default=True)
-@click.option('--sigma_data',    help='sigma_data parameter for EDM Loss and Precond', metavar='FLOAT', type=float, default=0.5, show_default=True)
+@click.option('--p_mean',            help='P_mean parameter for EDM Loss', metavar='FLOAT', type=float, default=-1.2, show_default=True)
+@click.option('--p_std',             help='P_std parameter for EDM Loss', metavar='FLOAT', type=float, default=1.2, show_default=True)
+@click.option('--sigma_data',        help='sigma_data parameter for EDM Loss and Precond', metavar='FLOAT', type=float, default=0.5, show_default=True)
+@click.option('--sigma_input_scale', help='sigma_input_scale parameter for EDMPrecond_input_scaling_test', metavar='FLOAT', type=float, default=0.5, show_default=True)
+@click.option('--sigma_loss_scaling', help='sigma_loss_scaling parameter for EDMLoss_loss_scaling_test', metavar='FLOAT', type=float, default=0.5, show_default=True)
 
 # Validation params
 @click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='tick', type=click.IntRange(min=-1), default=50, show_default=True)
@@ -350,8 +352,11 @@ def main(**kwargs):
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
     elif opts.real_precond == 'edm_c_skip':
         c.network_kwargs.class_name = 'training.networks.EDMPrecond_c_skip'
+    elif opts.real_precond == 'edm_input_scaling_test':
+        c.network_kwargs.class_name = 'training.networks.EDMPrecond_input_scaling_test'
+        c.network_kwargs.sigma_input_scale = opts.sigma_input_scale
     else:
-        assert False, f"Only edm and edm_c_skip are supported for now, but got {opts.real_precond}" 
+        assert False, f"Only edm, edm_c_skip, and edm_input_scaling_test are supported for now, but got {opts.real_precond}" 
 
     if opts.precond == 'edm_dynamic':
         c.loss_kwargs.class_name = 'training.loss.EDMLoss_dynamic_sigma'
@@ -359,8 +364,11 @@ def main(**kwargs):
         c.loss_kwargs.class_name = 'training.loss.EDMLoss'
     elif opts.precond == 'edm_boosted_sigma':
         c.loss_kwargs.class_name = 'training.loss.EDMLoss_boosted_sigma'
+    elif opts.precond == 'edm_loss_scaling_test':
+        c.loss_kwargs.class_name = 'training.loss.EDMLoss_loss_scaling_test'
+        c.loss_kwargs.sigma_loss_scaling = opts.sigma_loss_scaling
     else:
-        assert False, f"Only edm, edm_dynamic, and edm_boosted_sigma are supported for now, but got {opts.precond}"
+        assert False, f"Only edm, edm_dynamic, edm_boosted_sigma, and edm_loss_scaling_test are supported for now, but got {opts.precond}"
     
     c.loss_kwargs.update(consistency_batch_size_per_gpu=consistency_batch_size_per_gpu)
     # whether to use weight for the consistency terms
