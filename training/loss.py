@@ -179,9 +179,10 @@ class EDMLoss_loss_scaling_test:
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        # min_sigma_of_each_batch = torch.amax(current_sigma, dim=tuple(range(1, current_sigma.ndim)), keepdim=True)
-        # sigma = torch.clamp(sigma, min=min_sigma_of_each_batch + 1e-6)
-        sigma = torch.clamp(sigma, min=current_sigma + 1e-6)
+        # TEMP : temporary change for check the impact of sigma max clamp during varying ASM Loss
+        min_sigma_of_each_batch = torch.amax(current_sigma, dim=tuple(range(1, current_sigma.ndim)), keepdim=True)
+        sigma = torch.clamp(sigma, min=min_sigma_of_each_batch + 1e-6)
+        # sigma = torch.clamp(sigma, min=current_sigma + 1e-6)
         y, augment_labels = (images, None)
         
         # add additional noise to reach the level sigma
