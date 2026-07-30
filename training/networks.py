@@ -186,18 +186,20 @@ class GroupNorm(torch.nn.Module):
 
 class AttentionOp(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k):
-        w = torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32)).softmax(dim=2).to(q.dtype)
+    def forward(ctx, q, k, scale=1.0):
+        w = ((torch.einsum('ncq,nck->nqk', q.to(torch.float32), (k / np.sqrt(k.shape[1])).to(torch.float32))) * scale).softmax(dim=2).to(q.dtype)
         ctx.save_for_backward(q, k, w)
+        ctx.scale = scale
         return w
 
     @staticmethod
     def backward(ctx, dw):
         q, k, w = ctx.saved_tensors
+        scale = ctx.scale
         db = torch._softmax_backward_data(grad_output=dw.to(torch.float32), output=w.to(torch.float32), dim=2, input_dtype=torch.float32)
-        dq = torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) / np.sqrt(k.shape[1])
-        dk = torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) / np.sqrt(k.shape[1])
-        return dq, dk
+        dq = (torch.einsum('nck,nqk->ncq', k.to(torch.float32), db).to(q.dtype) * scale) / np.sqrt(k.shape[1])
+        dk = (torch.einsum('ncq,nqk->nck', q.to(torch.float32), db).to(k.dtype) * scale) / np.sqrt(k.shape[1])
+        return dq, dk, None
 
 #----------------------------------------------------------------------------
 # Unified U-Net block with optional up/downsampling and self-attention.
@@ -212,7 +214,8 @@ class UNetBlock(torch.nn.Module):
         resample_filter=[1,1], resample_stride=2, resample_proj=False, adaptive_scale=True,
         kernel=3,
         init=dict(), init_zero=dict(init_weight=0), init_attn=None, stride=(1,1),
-        emb_stride=(1,1) # 추가: emb 전용 stride
+        emb_stride=(1,1), # 추가: emb 전용 stride
+        attention_scale=1.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -222,6 +225,7 @@ class UNetBlock(torch.nn.Module):
         self.dropout = dropout
         self.skip_scale = skip_scale
         self.adaptive_scale = adaptive_scale
+        self.attention_scale = float(attention_scale)
 
         if isinstance(stride, int):
             stride = (stride, stride)
@@ -265,7 +269,7 @@ class UNetBlock(torch.nn.Module):
 
         if self.num_heads:
             q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
-            w = AttentionOp.apply(q, k)
+            w = AttentionOp.apply(q, k, self.attention_scale)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale
@@ -284,7 +288,8 @@ class UNetBlock_AS(torch.nn.Module):
         resample_filter=[1,1], resample_stride=2, resample_proj=False, adaptive_scale=True,
         kernel=3,
         init=dict(), init_zero=dict(init_weight=0), init_attn=None, stride=(1,1),
-        emb_stride=(1,1) # 유지 호환성을 위해 추가
+        emb_stride=(1,1), # 유지 호환성을 위해 추가
+        attention_scale=1.0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -294,6 +299,7 @@ class UNetBlock_AS(torch.nn.Module):
         self.dropout = dropout
         self.skip_scale = skip_scale
         self.adaptive_scale = adaptive_scale
+        self.attention_scale = float(attention_scale)
 
         # emb를 위한 Learnable Downsampling Layer 추가
         self.emb_stride = emb_stride if isinstance(emb_stride, (tuple, list)) else (emb_stride, emb_stride)
@@ -350,7 +356,7 @@ class UNetBlock_AS(torch.nn.Module):
 
         if self.num_heads:
             q, k, v = self.qkv(self.norm2(x)).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
-            w = AttentionOp.apply(q, k)
+            w = AttentionOp.apply(q, k, self.attention_scale)
             a = torch.einsum('nqk,nck->ncq', w, v)
             x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale
@@ -476,6 +482,7 @@ class SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         encoder_type        = 'standard',   # Encoder architecture: 'standard' for DDPM++, 'residual' for NCSN++.
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
+        attention_scale     = 1.0,          # Attention temperature scaling factor.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -491,7 +498,7 @@ class SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
-            init=init, init_zero=init_zero, init_attn=init_attn,
+            init=init, init_zero=init_zero, init_attn=init_attn, attention_scale=attention_scale,
         )
 
         # Mapping.
@@ -626,6 +633,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         decoder_type        = 'standard',   # Decoder architecture: 'standard' for both DDPM++ and NCSN++.
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
         dynamic_noise       = False,        # Whether to use dynamic noise labels.
+        attention_scale     = 1.0,          # Attention temperature scaling factor.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -649,7 +657,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
-            init=init, init_zero=init_zero, init_attn=init_attn,
+            init=init, init_zero=init_zero, init_attn=init_attn, attention_scale=attention_scale,
         )
 
         # Mapping.
@@ -900,7 +908,8 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         kernel_size         = [3,3],       # Base kernel size.
         stride              = [1,1],       # Base stride.
         stem_kernel         = [3,3],       # Initial stem kernel size (Patchification)
-        stem_stride         = [1,1]        # Initial stem downsampling stride (Patchification)
+        stem_stride         = [1,1],       # Initial stem downsampling stride (Patchification)
+        attention_scale     = 1.0,          # Attention temperature scaling factor.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -919,7 +928,7 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_stride=resample_stride, resample_proj=True, adaptive_scale=False,
             kernel=kernel_size, stride=stride,
-            init=init, init_zero=init_zero, init_attn=init_attn,
+            init=init, init_zero=init_zero, init_attn=init_attn, attention_scale=attention_scale,
         )
         
         if isinstance(stem_stride, int):
@@ -1170,13 +1179,14 @@ class DhariwalUNet(torch.nn.Module, PyTorchModelHubMixin):
         attn_resolutions    = [32,16,8],    # List of resolutions with self-attention.
         dropout             = 0.10,         # List of resolutions with self-attention.
         label_dropout       = 0,            # Dropout probability of class labels for classifier-free guidance.
+        attention_scale     = 1.0,          # Attention temperature scaling factor.
     ):
         super().__init__()
         self.label_dropout = label_dropout
         emb_channels = model_channels * channel_mult_emb
         init = dict(init_mode='kaiming_uniform', init_weight=np.sqrt(1/3), init_bias=np.sqrt(1/3))
         init_zero = dict(init_mode='kaiming_uniform', init_weight=0, init_bias=0)
-        block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero)
+        block_kwargs = dict(emb_channels=emb_channels, channels_per_head=64, dropout=dropout, init=init, init_zero=init_zero, attention_scale=attention_scale)
 
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=model_channels)
@@ -1410,6 +1420,106 @@ class iDDPMPrecond(torch.nn.Module):
         result = index if return_index else self.u[index.flatten()].to(sigma.dtype)
         return result.reshape(sigma.shape).to(sigma.device)
 
+
+#----------------------------------------------------------------------------
+# Improved preconditioning proposed in the paper "Elucidating the Design
+# Space of Diffusion-Based Generative Models" (EDM).
+
+@persistence.persistent_class
+class EDMPrecond_input_scaling_test(torch.nn.Module, PyTorchModelHubMixin):
+    def __init__(self,
+        img_resolution,                     # Image resolution.
+        img_channels,                       # Number of color channels.
+        label_dim       = 0,                # Number of class labels, 0 = unconditional.
+        use_fp16        = False,            # Execute the underlying model at FP16 precision?
+        sigma_min       = 0,                # Minimum supported noise level.
+        sigma_max       = float('inf'),     # Maximum supported noise level.
+        sigma_data      = 0.5,              # Expected standard deviation of the training data.
+        model_type      = 'DhariwalUNet',   # Class name of the underlying model.
+        sigma_input_scale = 0.5,
+        **model_kwargs,                     # Keyword arguments for the underlying model.
+    ):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.label_dim = label_dim
+        self.use_fp16 = use_fp16
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_data = sigma_data
+        self.sigma_input_scale = sigma_input_scale
+        self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels, out_channels=img_channels, label_dim=label_dim, **model_kwargs)
+
+    def forward(self, x : torch.Tensor, sigma : torch.Tensor, class_labels=None, force_fp32=False, **model_kwargs):
+        x = x.to(torch.float32)
+        sigma = sigma.to(torch.float32)
+        
+        while sigma.ndim < x.ndim:
+            sigma = sigma.unsqueeze(-1)
+        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32)
+        dtype = torch.bfloat16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
+        # c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_in = 1 / (self.sigma_input_scale ** 2 + sigma ** 2).sqrt()
+        
+        safe_sigma = torch.where(sigma == 0.0, torch.tensor(1e-8, dtype=sigma.dtype, device=sigma.device), sigma)
+        c_noise = safe_sigma.log() / 4
+
+        F_x = self.model((c_in * x).to(dtype), c_noise, class_labels=class_labels, **model_kwargs)
+        assert F_x.dtype == dtype
+        D_x = c_skip * x + c_out * F_x.to(torch.float32)
+        return D_x
+
+    def round_sigma(self, sigma):
+        return torch.as_tensor(sigma)
+
+    def generate(self, batch_size=1, device="cuda",
+        num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+        S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    ):
+        net = self.to(device)
+        # Pick latents and labels.
+        latents = torch.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
+        class_labels = None
+        if net.label_dim:
+            class_labels = torch.eye(net.label_dim, device=device)[torch.randint(net.label_dim, size=[batch_size], device=device)]
+
+        # Adjust noise levels based on what's supported by the network.
+        sigma_min = max(sigma_min, net.sigma_min)
+        sigma_max = min(sigma_max, net.sigma_max)
+
+        # Time step discretization.
+        step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
+        t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+        t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
+
+        # Main sampling loop.
+        x_next = latents.to(torch.float64) * t_steps[0]
+        for i, (t_cur, t_next) in list(enumerate(zip(t_steps[:-1], t_steps[1:]))): # 0, ..., N-1
+            x_cur = x_next
+
+            # Increase noise temporarily.
+            gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
+            t_hat = net.round_sigma(t_cur + gamma * t_cur)
+            x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * torch.randn_like(x_cur)
+
+            # Euler step.
+            denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
+            d_cur = (x_hat - denoised) / t_hat
+            x_next = x_hat + (t_next - t_hat) * d_cur
+
+            # Apply 2nd order correction.
+            if i < num_steps - 1:
+                denoised = net(x_next, t_next, class_labels).to(torch.float64)
+                d_prime = (x_next - denoised) / t_next
+                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+        
+        return x_next
+#----------------------------------------------------------------------------
+
+
 #----------------------------------------------------------------------------
 # Improved preconditioning proposed in the paper "Elucidating the Design
 # Space of Diffusion-Based Generative Models" (EDM).
@@ -1444,7 +1554,7 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         while sigma.ndim < x.ndim:
             sigma = sigma.unsqueeze(-1)
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32)
-        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+        dtype = torch.bfloat16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()

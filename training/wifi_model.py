@@ -126,7 +126,7 @@ class PositionEmbedding(nn.Module):
 
     def forward(self, x): 
         x = self.projection(x)
-        rt = cm.complex_mul(x, self.embedding.to(x.device).clone())
+        rt = cm.complex_mul(x, self.embedding.to(device=x.device, dtype=x.dtype))
         return rt
 
     def _build_embedding(self, max_len, hidden_dim):
@@ -255,6 +255,11 @@ class tfdiff_WiFi(nn.Module):
         """
         x = x
         
+        # Cast inputs to x's dtype to support dynamic precision (float16, bfloat16, float32)
+        noise_labels = noise_labels.to(x.dtype)
+        if class_labels is not None:
+            class_labels = class_labels.to(x.dtype)
+            
         antenna_reshape = False
 
         if x.ndim == 5:

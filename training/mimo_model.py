@@ -99,7 +99,7 @@ class PositionEmbedding(nn.Module):
 
     def forward(self, x):
         x = self.projection(x)
-        return cm.complex_mul(x, self.embedding.to(x.device))
+        return cm.complex_mul(x, self.embedding.to(device=x.device, dtype=x.dtype))
 
     def _build_embedding(self, max_len, hidden_dim):
         steps = torch.arange(max_len).unsqueeze(1)  # [P,1]
@@ -301,6 +301,12 @@ class tfdiff_mimo(nn.Module):
     # c : [B, N, C, 2]
     def forward(self, x, noise_labels, class_labels, augment_labels=None, **kwargs):
         x = x
+        
+        # Cast inputs to x's dtype to support dynamic precision (float16, bfloat16, float32)
+        noise_labels = noise_labels.to(x.dtype)
+        if class_labels is not None:
+            class_labels = class_labels.to(x.dtype)
+            
         if self.dynamic_noise:
             while noise_labels.ndim < x.ndim:
                 noise_labels = noise_labels.unsqueeze(-1)
