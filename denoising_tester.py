@@ -286,6 +286,10 @@ def main(**kwargs):
             # labels = dataset_item["label"].to(device)
             current_sigma = dataset_item["sigma"].to(device)
 
+            # Normalize the true signal and current sigma by data_norm
+            normalized_true_signal = true_signal / data_norm
+            normalized_current_sigma = current_sigma / data_norm
+
             complex_axis = None
             complex_axis_name = None
             if 'axis_name' in dataset_item:
@@ -302,13 +306,14 @@ def main(**kwargs):
                 batched_complex_axis = complex_axis + 1
                 
                 # 해당 축을 기준으로 실수부(real)와 허수부(imag)로 절반씩 나눕니다.
-                real_part, imag_part = torch.chunk(true_signal, 2, dim=batched_complex_axis)
+                real_part, imag_part = torch.chunk(normalized_true_signal, 2, dim=batched_complex_axis)
                 
                 # 실수부와 허수부를 합쳐서 복소수 텐서로 재구성합니다.
                 complex_signal = torch.complex(real_part, imag_part)
             else:
                 # complex 축이 지정되지 않은 경우 기존 신호를 그대로 할당합니다.
-                complex_signal = true_signal
+                complex_signal = normalized_true_signal
+
 
             # (Batch)
             signal_power = torch.mean(torch.real(complex_signal * torch.conj(complex_signal)), dim=tuple(range(1, complex_signal.ndim)))
@@ -320,12 +325,12 @@ def main(**kwargs):
                 else:
                     sigma_SNR_steps = (1 / ratio_SNR * signal_power) ** 0.5
 
-                input_signal, added_noise, input_sigma = noise_generator(true_signal, 
-                                                                         current_sigma, 
+                input_signal, added_noise, input_sigma = noise_generator(normalized_true_signal, 
+                                                                         normalized_current_sigma, 
                                                                          sigma_SNR_steps)
                 
-                input_signal = input_signal / data_norm
-                input_sigma = input_sigma / data_norm
+                # input_signal = input_signal / data_norm
+                # input_sigma = input_sigma / data_norm
 
                 if opt.padding_power2:
                     padded_signal, _, original_shape = pad_collate_fn(input_signal)
