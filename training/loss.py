@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch_utils import persistence
 import ambient_utils
-from training.sampler import edm_sampler, padding_mask_from_original_shape
+from training.sampler import edm_sampler, edm_sampler_with_scheduler, padding_mask_from_original_shape
 
 
 # def from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, current_sigma, desired_sigma):
@@ -147,7 +147,7 @@ class EDMLoss_with_scheduler:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
                  consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False,
-                 sigma_max=80,):
+                 sigma_max=80, kl_coeff=1.0):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -161,8 +161,9 @@ class EDMLoss_with_scheduler:
         self.with_weight = with_weight
         self.with_grad = with_grad
         self.sigma_max = sigma_max
+        self.kl_coeff = kl_coeff
 
-    def __call__(self, net, images, labels=None, current_sigma=0.0, noise_scheduler=rule_based_noise_scheduler, augment_pipe=None, original_shape=None):
+    def __call__(self, net, images, labels=None, current_sigma=0.0, augment_pipe=None, original_shape=None):
         current_sigma = torch.as_tensor(current_sigma, dtype=images.dtype, device=images.device)
         # net._set_static_graph()
         while current_sigma.ndim < images.ndim:
@@ -175,25 +176,29 @@ class EDMLoss_with_scheduler:
         else:
             padding_mask = torch.ones_like(images)
 
-        current_sigma = current_sigma * padding_mask
-        
-        # Instantiate scheduler
-        scheduler = noise_scheduler(sigma_max=self.sigma_max) if isinstance(noise_scheduler, type) else noise_scheduler
-
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in reference space
         sigma_ref = (rnd_normal * self.P_std + self.P_mean).exp()
-        
-        # Calculate sigma_t_n_mean (reference noise level for current_sigma)
+
         sigma_t_n_mean = torch.sqrt(torch.mean(current_sigma ** 2, dim=list(range(1, current_sigma.ndim))))
         sigma_t_n_mean_aligned = sigma_t_n_mean.view(-1, *[1] * (current_sigma.ndim - 1))
         
         # Clamp sigma_ref to be at least sigma_t_n_mean to ensure we only add noise
         sigma_ref = torch.clamp(sigma_ref, min=sigma_t_n_mean_aligned + 1e-6)
+
+        assert hasattr(net, "generate_latent_z") and hasattr(net, "get_noise_scheduling"), "net must have generate_latent_z and get_noise_scheduling methods in EDM_with_scheduler"
+        z, kl_loss = net.generate_latent_z(images, current_sigma)
+
+        # noise_schedule_dict : {"poly_sigma": poly_sigma,
+        #                       "latent_z": z,
+        #                       "abd": abd
+        #                       }
+        noise_schedule_dict = net.get_noise_scheduling(sigma_ref, current_sigma, z)
         
-        # Map reference noise to multivariable noise using scheduler
-        sigma = scheduler.sample_single_step(current_sigma, sigma_ref)
-        
+        # get sigma in data space: 
+        sigma = noise_schedule_dict['poly_sigma']
+        abd = noise_schedule_dict['abd']
+
         y, augment_labels = (images, None)
         
         # add additional noise to reach the level sigma
@@ -216,7 +221,7 @@ class EDMLoss_with_scheduler:
 
         # loss weight depends on sigma
         weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
-        loss = weight * ((D_yn - y) ** 2)
+        loss = weight * ((D_yn - y) ** 2) + self.kl_coeff * kl_loss
         return_sigma = sigma
     
         # consistency loss
@@ -227,7 +232,8 @@ class EDMLoss_with_scheduler:
             new_sigma_ref = torch.clamp(new_sigma_ref, max=sigma_ref)
             
             # Map new_sigma_ref to multivariable space using scheduler
-            new_sigma = scheduler.sample_single_step(current_sigma, new_sigma_ref)
+            new_noise_schedule_dict = net.get_noise_scheduling(new_sigma_ref, current_sigma, z=z, abd=abd)
+            new_sigma = new_noise_schedule_dict['poly_sigma']
 
             # we will only keep the first batch_size / self.num_primes part of the batch
             consistency_batch_size = self.consistency_batch_size
@@ -236,6 +242,11 @@ class EDMLoss_with_scheduler:
             noisy_input = noisy_input[:consistency_batch_size]
             sigma = sigma[:consistency_batch_size]
             new_sigma = new_sigma[:consistency_batch_size]
+            c_sigma_ref = sigma_ref[:consistency_batch_size]
+            c_new_sigma_ref = new_sigma_ref[:consistency_batch_size]
+            c_current_sigma = current_sigma[:consistency_batch_size]
+            c_z = z[:consistency_batch_size]
+            c_abd = (abd[0][:consistency_batch_size], abd[1][:consistency_batch_size], abd[2][:consistency_batch_size]) if abd is not None else None
             if labels is not None:
                 labels = labels[:consistency_batch_size]
             edm_padding_mask = padding_mask[:consistency_batch_size]
@@ -244,14 +255,31 @@ class EDMLoss_with_scheduler:
             noisy_input = noisy_input.repeat_interleave(self.num_primes, dim=0)
             sigma = sigma.repeat_interleave(self.num_primes, dim=0)
             new_sigma = new_sigma.repeat_interleave(self.num_primes, dim=0)
+            c_sigma_ref = c_sigma_ref.repeat_interleave(self.num_primes, dim=0)
+            c_new_sigma_ref = c_new_sigma_ref.repeat_interleave(self.num_primes, dim=0)
+            c_current_sigma = c_current_sigma.repeat_interleave(self.num_primes, dim=0)
+            c_z = c_z.repeat_interleave(self.num_primes, dim=0)
+            if c_abd is not None:
+                c_abd = (c_abd[0].repeat_interleave(self.num_primes, dim=0), c_abd[1].repeat_interleave(self.num_primes, dim=0), c_abd[2].repeat_interleave(self.num_primes, dim=0))
             if labels is not None:
                 labels = labels.repeat_interleave(self.num_primes, dim=0)
             edm_padding_mask = edm_padding_mask.repeat_interleave(self.num_primes, dim=0)
 
+            consistency_noise_schedule_dict = {
+                'poly_sigma': sigma,
+                'latent_z': c_z,
+                'abd': c_abd,
+                'sigma_ref': c_sigma_ref,
+                'current_sigma': c_current_sigma,
+            }
+
             # run sampler from sigma -> new_sigma
             with torch.no_grad() if not self.with_grad else torch.enable_grad():
-                x_t_prime = edm_sampler(net, noisy_input, class_labels=labels, num_steps=self.num_consistency_steps, 
-                                        sigma_min=new_sigma, sigma_max=sigma, padding_mask=edm_padding_mask) 
+                x_t_prime = edm_sampler_with_scheduler(
+                    net, noisy_input, class_labels=labels, num_steps=self.num_consistency_steps, 
+                    sigma_min=new_sigma, sigma_max=sigma, padding_mask=edm_padding_mask,
+                    noise_schedule_dict=consistency_noise_schedule_dict, new_sigma_ref=c_new_sigma_ref
+                ) 
             # get predictions for x_t_prime
             x0_pred_prime = net(x_t_prime, new_sigma, labels)
             # group together predictions

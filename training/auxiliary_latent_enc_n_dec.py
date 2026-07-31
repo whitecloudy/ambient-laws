@@ -197,13 +197,14 @@ class PolynomialNoiseScheduler(nn.Module):
         t = (self.sigma_max_rho - sigma_mean_rho) / (self.sigma_max_rho - self.sigma_min_rho)
         return t
 
-    def forward(self, z, sigma, sigma_t_n):
+    def forward(self, z, sigma, sigma_t_n, abd = None):
         """
         z: [B, m] (Encoder에서 나온 k-hot 벡터)
         sigma: [B] 또는 스칼라/텐서 (Reference/Input Noise Level 값)
         sigma_t_n: [B, ...] (노이즈 타겟/상태 텐서)
         """
         B = z.size(0)
+        z = z.to(dtype=self.noise_decoder[0].weight.dtype)
         orig_shape = sigma_t_n.shape
 
         # Ensure sigma is a tensor and expanded to orig_shape
@@ -231,7 +232,11 @@ class PolynomialNoiseScheduler(nn.Module):
         tau_n = self.__compute_tau_n(sigma_t_n)
         
         # MLP를 통과하여 a, b, d 계수 추출
-        a, b, d = self.__compute_coefficients(z)
+        if abd is None:
+            a, b, d = self.__compute_coefficients(z)
+            abd = (a, b, d)
+        else:
+            a, b, d = abd
         
         # 브로드캐스팅을 위해 t의 차원을 [B, 1]로 맞춤
         t_view = t.view(B, 1)
@@ -242,14 +247,14 @@ class PolynomialNoiseScheduler(nn.Module):
         sigma_t_n_flat = sigma_t_n.view(B, -1)
         
         # Compute polynomial sigma
-        sigma_flat = self.__compute_sigma((a, b, d), t_view_clamped, tau_n_flat, sigma_t_n_flat)
+        sigma_flat = self.__compute_sigma(abd, t_view_clamped, tau_n_flat, sigma_t_n_flat)
         polynomial_sigma = sigma_flat.view(orig_shape)
 
         # 일부분만 범위 밖인 경우 torch.where 적용, 전부 범위 안이면 polynomial_sigma 즉시 반환
         if torch.any(out_of_bounds):
-            return torch.where(out_of_bounds, sigma_expanded, polynomial_sigma)
+            return torch.where(out_of_bounds, sigma_expanded, polynomial_sigma), abd
         
-        return polynomial_sigma
+        return polynomial_sigma, abd
 
 
 

@@ -54,6 +54,86 @@ def edm_sampler(
     return x_next
 
 
+def edm_sampler_with_scheduler(
+    net, latents, class_labels=None,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7, padding_mask=1,
+    noise_schedule_dict=None, new_sigma_ref=None
+):
+    if noise_schedule_dict is not None and hasattr(net, "get_noise_scheduling"):
+        sigma_ref = noise_schedule_dict.get('sigma_ref', None)
+        current_sigma = noise_schedule_dict.get('current_sigma', None)
+        z = noise_schedule_dict.get('latent_z', None)
+        abd = noise_schedule_dict.get('abd', None)
+
+        if sigma_ref is not None and new_sigma_ref is not None and current_sigma is not None:
+            step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+            ref_sigma_max = sigma_ref.to(torch.float64)
+            ref_sigma_min = new_sigma_ref.to(torch.float64)
+            
+            if isinstance(ref_sigma_max, torch.Tensor):
+                ref_sigma_max = ref_sigma_max.unsqueeze(0).expand([num_steps] + [-1] * ref_sigma_max.ndim)
+            if isinstance(ref_sigma_min, torch.Tensor):
+                ref_sigma_min = ref_sigma_min.unsqueeze(0).expand([num_steps] + [-1] * ref_sigma_min.ndim)
+            
+            step_indices = fit_shape(step_indices, ref_sigma_max)
+            step_indices = fit_shape(step_indices, ref_sigma_min)
+            
+            ref_t_steps = (ref_sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (ref_sigma_min ** (1 / rho) - ref_sigma_max ** (1 / rho))) ** rho
+            
+            t_steps = []
+            for i in range(num_steps):
+                ref_t = ref_t_steps[i]
+                ref_t_in = ref_t.to(dtype=latents.dtype) if isinstance(ref_t, torch.Tensor) else ref_t
+                sched_res = net.get_noise_scheduling(ref_t_in, current_sigma, z=z, abd=abd)
+                t_steps.append(sched_res['poly_sigma'])
+        else:
+            step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+            if isinstance(sigma_max, torch.Tensor):
+                sigma_max_t = sigma_max.unsqueeze(0).expand([num_steps, ]+([-1, ]*(len(sigma_max.shape)-1)))
+            else:
+                sigma_max_t = min(sigma_max, getattr(net, 'sigma_max', 80))
+                
+            if isinstance(sigma_min, torch.Tensor):
+                sigma_min_t = sigma_min.unsqueeze(0).expand([num_steps, ]+([-1, ]*(len(sigma_min.shape)-1)))
+            else:
+                sigma_min_t = max(sigma_min, getattr(net, 'sigma_min', 0.002))
+                
+            step_indices = fit_shape(step_indices, sigma_max_t)
+            step_indices = fit_shape(step_indices, sigma_min_t)
+            t_steps_tensor = (sigma_max_t ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min_t ** (1 / rho) - sigma_max_t ** (1 / rho))) ** rho
+            t_steps = [t_steps_tensor[i] for i in range(num_steps)]
+    else:
+        step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+        if isinstance(sigma_max, torch.Tensor):
+            sigma_max_t = sigma_max.unsqueeze(0).expand([num_steps, ]+([-1, ]*(len(sigma_max.shape)-1)))
+        else:
+            sigma_max_t = min(sigma_max, getattr(net, 'sigma_max', 80))
+            
+        if isinstance(sigma_min, torch.Tensor):
+            sigma_min_t = sigma_min.unsqueeze(0).expand([num_steps, ]+([-1, ]*(len(sigma_min.shape)-1)))
+        else:
+            sigma_min_t = max(sigma_min, getattr(net, 'sigma_min', 0.002))
+            
+        step_indices = fit_shape(step_indices, sigma_max_t)
+        step_indices = fit_shape(step_indices, sigma_min_t)
+        t_steps_tensor = (sigma_max_t ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min_t ** (1 / rho) - sigma_max_t ** (1 / rho))) ** rho
+        t_steps = [t_steps_tensor[i] for i in range(num_steps)]
+
+    x_next = latents
+    for i in range(num_steps - 1): # 0, ..., N-2
+        x_cur = x_next
+        t_cur = t_steps[i]
+        t_next = t_steps[i+1]
+
+        denoised = net(x_cur, t_cur, class_labels).to(torch.float64)
+        t_cur_fitted = fit_shape(t_cur, x_cur)
+        d_cur = (x_cur - denoised) / t_cur_fitted
+        step_diff = t_next - t_cur
+        x_next = x_cur + 2 * step_diff * d_cur + (torch.sqrt(2 * step_diff.abs() * t_cur_fitted) * torch.randn_like(x_cur) * padding_mask)
+
+    return x_next
+
+
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
 

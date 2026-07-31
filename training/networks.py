@@ -1521,8 +1521,8 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
 #----------------------------------------------------------------------------
 # Improved preconditioning proposed in the paper "Elucidating the Design
 # Space of Diffusion-Based Generative Models" (EDM).
-from .auxiliary_latent_enc_n_dec import PolynomialNoiseScheduler
-import torch.functional as F
+from .auxiliary_latent_enc_n_dec import PolynomialNoiseScheduler, TopKDiscreteEncoder
+import torch.nn.functional as F
 @persistence.persistent_class
 class EDMPrecond_with_scheduler(EDMPrecond):
     def __init__(self,
@@ -1533,33 +1533,50 @@ class EDMPrecond_with_scheduler(EDMPrecond):
         sigma_min=0.002,
         rho=7,
         mlp_hidden_dim=None,
+        latent_encoder=None,
         **model_kwargs,                     # Keyword arguments for the underlying model.
     ):
-        super().__init__(model_kwargs)
+        super().__init__(**model_kwargs)
         self.m = m
         self.k = k
+        self.noise_scheduler = PolynomialNoiseScheduler(m=m, out_dim=data_shape, sigma_max=sigma_max, sigma_min=sigma_min, rho=rho)
+        if latent_encoder is not None:
+            self.latent_encoder = latent_encoder
+        else:
+            self.latent_encoder = TopKDiscreteEncoder(m=m, k=k)
 
-        self.noise_scheduler = PolynomialNoiseScheduler(m=m, data_shape=data_shape, sigma_max=sigma_max, sigma_min=sigma_min, rho=rho)
+    def generate_latent_z(self, x_t_n, sigma_t_n):
+        batch_size = x_t_n.shape[0]
+        device = x_t_n.device
+
+        # TODO : temporary random z for debugging 
+        # if use_pretrained_encoder:
+        #     z, _ = self.latent_encoder(x_t_n, sigma_t_n, is_training=False)
+        # else:
+        z = torch.randn(batch_size, self.m, device=device)
+        z = torch.topk(z, self.k, dim=-1).indices
+        z = F.one_hot(z, num_classes=self.m).sum(-2).to(torch.float32)    
         
-        self.noise_mlp = MLP()
-
-    def forward(self, x : torch.Tensor, sigma : torch.Tensor, sigma_t_n : torch.Tensor, z=None, class_labels=None, force_fp32=False, **model_kwargs):
-        x = x.to(torch.float32)
-        sigma = sigma.to(torch.float32)
-        sigma_t_n = sigma_t_n.to(torch.float32)
-
-        batch_size = x.shape[0]
-
+        return z, 0
+        
+    def get_noise_scheduling(self, sigma, sigma_t_n, z=None, abd=None):
+        batch_size = sigma.shape[0]
         # make random z, top k
         if z is None:
-            z = torch.randn(batch_size, self.m, device=x.device)
+            z = torch.randn(batch_size, self.m, device=sigma.device)
             z = torch.topk(z, self.k, dim=-1).indices
-            z = F.one_hot(z, num_classes=self.m).sum(-1)
-        
-        # noise scheduler get z and output polynomial coefficients
-        poly_sigma = self.noise_scheduler(z, sigma, sigma_t_n)
+            z = F.one_hot(z, num_classes=self.m).sum(-2).to(torch.float32)
 
-        D_x = self.super().forward(x, poly_sigma, class_labels=class_labels, force_fp32=force_fp32, **model_kwargs)
-        
-        return D_x
+        if abd is None:
+            poly_sigma, abd = self.noise_scheduler(z, sigma, sigma_t_n)
+        else:
+            poly_sigma, abd = self.noise_scheduler(z, sigma, sigma_t_n, abd)
+
+        return {"poly_sigma": poly_sigma, 
+                "latent_z": z,
+                "abd": abd,
+                "sigma_ref": sigma,
+                "current_sigma": sigma_t_n
+                }
+
 #----------------------------------------------------------------------------
