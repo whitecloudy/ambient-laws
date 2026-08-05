@@ -3,6 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _init_weights(m):
+    """Xavier (Glorot) Uniform initialization for Linear and Conv2d layers"""
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+
 class ResnetBlock(nn.Module):
     """표준 Diffusion/VDM 모델에서 주로 사용하는 Swish(SiLU) 기반 ResNet 블록"""
     def __init__(self, in_channels, out_channels, downsample=False):
@@ -21,6 +29,8 @@ class ResnetBlock(nn.Module):
                 nn.Conv2d(in_channels, out_channels, kernel_size=1),
                 nn.AvgPool2d(2) if downsample else nn.Identity()
             )
+
+        self.apply(_init_weights)
 
     def forward(self, x):
         h = self.act(self.conv1(x))
@@ -53,6 +63,8 @@ class UnetEncoder(nn.Module):
         self.dropout = nn.Dropout(p=0.1)
         self.fc = nn.Linear(base_channels * 4, m)
 
+        self.apply(_init_weights)
+
     def forward(self, x):
         x = self.conv_in(x)
         x = self.down_blocks(x)
@@ -75,6 +87,7 @@ class TopKDiscreteEncoder(nn.Module):
         
         # 백본으로 ldm.model_mulan_epsilon 스타일의 UnetEncoder 사용
         self.encoder_backbone = UnetEncoder(in_channels=in_channels, m=m, base_channels=base_channels)
+        self.apply(_init_weights)
 
     def forward(self, x0, is_training=True):
         # 1. UnetEncoder를 통한 Logits 추출
@@ -105,8 +118,78 @@ class TopKDiscreteEncoder(nn.Module):
         
         return z, kl_loss
 
+class noise_decoder(nn.Module):
+    def __init__(self, m=50, inout_dim=[14,8,52], mlp_hidden_dim=None, cnn_dim=32, a_amp=4.0, b_amp=4.0, d_amp=4.0):
+        super().__init__()
+        self.m = m
+        self.inout_dim = inout_dim
+        self.shape = (-1, ) + tuple(self.inout_dim) 
+        self.cnn_dim = cnn_dim
+        self.mlp_hidden_dim = 1
+
+        self.a_amp = a_amp
+        self.b_amp = b_amp
+        self.d_amp = d_amp
+
+        if mlp_hidden_dim is None:
+            for dim in self.inout_dim:
+                self.mlp_hidden_dim *= dim
+        else:
+            self.mlp_hidden_dim = mlp_hidden_dim
+
+        m_encoder_output_len = cnn_dim//2 * inout_dim[1] * inout_dim[2]
+        
+        # 잠재 변수 z를 받아 다항식 계수를 생성하는 2-layer MLP
+        self.m_encoder = nn.Sequential(
+            nn.Linear(m, self.mlp_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.mlp_hidden_dim, m_encoder_output_len),
+            nn.LayerNorm(m_encoder_output_len)
+        )
+
+        self.sigma_t_n_encoder = nn.Sequential(
+            nn.Conv2d(in_channels=self.inout_dim[0], out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim//2, kernel_size=3, stride=1, padding=1),
+            nn.LayerNorm((cnn_dim//2, inout_dim[1], inout_dim[2]))
+        )
+
+        self.output_noise_decoder = nn.Sequential(
+            nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(in_channels=cnn_dim, out_channels=int(inout_dim[0]*3), kernel_size=3, stride=1, padding=1) # a, b, d 세 가지 계수를 위해 3배수 출력
+        )   
+
+        self.apply(_init_weights)
+
+    def forward(self, z, sigma_t_n):
+        batch_size = z.size(0)
+        h, w = self.inout_dim[1], self.inout_dim[2]
+        
+        z_encoded = self.m_encoder(z)
+        z_encoded = z_encoded.view(batch_size, self.cnn_dim // 2, h, w)
+        sigma_t_n_encoded = self.sigma_t_n_encoder(sigma_t_n)
+
+        # latent code와 sigma_t_n_encoded를 컨캣하고 채널차원 기준으로 concatenation
+        encoded = torch.cat([z_encoded, sigma_t_n_encoded], dim=1)
+
+        noise_pred = self.output_noise_decoder(encoded)
+        
+        # c3 (inout_dim[0] * 3)를 3개로 분할하여 a, b, d 계수 추출
+        a, b, d = torch.chunk(noise_pred, 3, dim=1)
+
+        # PolynomialNoiseScheduler 다항식 계산에 맞춰 [B, output_len] 형태로 flatten
+        a = (nn.Sigmoid(a.reshape(batch_size, -1))-0.5) * self.a_amp
+        b = (nn.Sigmoid(b.reshape(batch_size, -1))-0.5) * self.b_amp
+        d = (nn.Sigmoid(d.reshape(batch_size, -1))-0.5) * self.d_amp + 1.0 # 모델은 최초에 0 근처의 값을 내뱉을 것이고 여기서 가장 Default인 f_t는 
+
+        return a, b, d
+
+        
 class PolynomialNoiseScheduler(nn.Module):
-    def __init__(self, m=50, out_dim=[14,8,52], sigma_max=80, sigma_min=0.002, rho=7, mlp_hidden_dim=None):
+    def __init__(self, m=50, out_dim=[14,8,52], sigma_max=80, sigma_min=0.002, rho=1, mlp_hidden_dim=None, cnn_dim=32):
         super().__init__()
         self.m = m
         self.out_dim = out_dim
@@ -119,20 +202,16 @@ class PolynomialNoiseScheduler(nn.Module):
         if mlp_hidden_dim is None:
             mlp_hidden_dim = output_len
         
-        # 잠재 변수 z를 받아 다항식 계수를 생성하는 2-layer MLP
-        self.noise_decoder = nn.Sequential(
-            nn.Linear(m, mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(mlp_hidden_dim, 3 * output_len) # a, b, d 세 가지 계수를 위해 3배수 출력
-        )
+        # noise_decoder 인스턴스 사용
+        self.noise_decoder = noise_decoder(m=m, inout_dim=out_dim, mlp_hidden_dim=mlp_hidden_dim, cnn_dim=cnn_dim)
         
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.rho = rho
         self.sigma_max_rho = self.sigma_max ** (1 / self.rho)
         self.sigma_min_rho = self.sigma_min ** (1 / self.rho)
+
+        self.apply(_init_weights)
 
 
     def __compute_tau_n(self, sigma_t_n):
@@ -143,17 +222,16 @@ class PolynomialNoiseScheduler(nn.Module):
 
         return tau_n
 
-    def __compute_coefficients(self, z):
-        coeffs = self.noise_decoder(z) # [B, 3 * output_len]
-        a, b, d = torch.chunk(coeffs, 3, dim=-1) # 각각 [B, output_len]
+    def __compute_coefficients(self, z, sigma_t_n):
+        a, b, d = self.noise_decoder(z, sigma_t_n) # 각각 [B, output_len]
         return a, b, d
 
     def __compute_f(self, a, b, d, t):
-        f_t = (a**2 / 5) * t**5 + \
+        f_t = ((a**2 / 5) * t**5 + \
                 (a * b / 2) * t**4 + \
                 ((b**2 + 2 * a * d) / 3) * t**3 + \
                 (b * d) * t**2 + \
-                (d**2) * t
+                (d**2) * t)
         return f_t  
 
     def __compute_sigma(self, abd, t, tau_n, sigma_t_n):
@@ -204,7 +282,7 @@ class PolynomialNoiseScheduler(nn.Module):
         sigma_t_n: [B, ...] (노이즈 타겟/상태 텐서)
         """
         B = z.size(0)
-        z = z.to(dtype=self.noise_decoder[0].weight.dtype)
+        z = z.to(dtype=next(self.noise_decoder.parameters()).dtype)
         orig_shape = sigma_t_n.shape
 
         # Ensure sigma is a tensor and expanded to orig_shape
@@ -233,7 +311,7 @@ class PolynomialNoiseScheduler(nn.Module):
         
         # MLP를 통과하여 a, b, d 계수 추출
         if abd is None:
-            a, b, d = self.__compute_coefficients(z)
+            a, b, d = self.__compute_coefficients(z, sigma_t_n)
             abd = (a, b, d)
         else:
             a, b, d = abd
