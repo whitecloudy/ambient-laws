@@ -1517,14 +1517,11 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
                 x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
         
         return x_next
-#----------------------------------------------------------------------------
-
-    # def __init__(self, m=50, out_dim=[14,8,52], sigma_max=80, sigma_min=0.002, rho=7, mlp_hidden_dim=None):
 
 #----------------------------------------------------------------------------
 # Improved preconditioning proposed in the paper "Elucidating the Design
 # Space of Diffusion-Based Generative Models" (EDM).
-from .auxiliary_latent_enc_n_dec import PolynomialNoiseScheduler, TopKDiscreteEncoder
+from training.auxiliary_latent_enc_n_dec import PolynomialNoiseScheduler, TopKDiscreteEncoder
 import torch.nn.functional as F
 @persistence.persistent_class
 class EDMPrecond_with_scheduler(EDMPrecond):
