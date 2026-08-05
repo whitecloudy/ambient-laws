@@ -147,7 +147,7 @@ class EDMLoss_with_scheduler:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
                  consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False,
-                 sigma_max=80, kl_coeff=1.0):
+                 sigma_max=80, kl_coeff=1.0, **kwargs):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -186,14 +186,19 @@ class EDMLoss_with_scheduler:
         # Clamp sigma_ref to be at least sigma_t_n_mean to ensure we only add noise
         sigma_ref = torch.clamp(sigma_ref, min=sigma_t_n_mean_aligned + 1e-6)
 
-        assert hasattr(net, "generate_latent_z") and hasattr(net, "get_noise_scheduling"), "net must have generate_latent_z and get_noise_scheduling methods in EDM_with_scheduler"
-        z, kl_loss = net.generate_latent_z(images, current_sigma)
+        def _get_net_attr(n, name):
+            if hasattr(n, name):
+                return getattr(n, name)
+            elif hasattr(n, 'module') and hasattr(n.module, name):
+                return getattr(n.module, name)
+            return None
 
-        # noise_schedule_dict : {"poly_sigma": poly_sigma,
-        #                       "latent_z": z,
-        #                       "abd": abd
-        #                       }
-        noise_schedule_dict = net.get_noise_scheduling(sigma_ref, current_sigma, z)
+        generate_latent_z_fn = _get_net_attr(net, "generate_latent_z")
+        get_noise_scheduling_fn = _get_net_attr(net, "get_noise_scheduling")
+        assert generate_latent_z_fn is not None and get_noise_scheduling_fn is not None, "net must have generate_latent_z and get_noise_scheduling methods in EDMLoss_with_scheduler"
+
+        z, kl_loss = generate_latent_z_fn(images, current_sigma)
+        noise_schedule_dict = get_noise_scheduling_fn(sigma_ref, current_sigma, z)
         
         # get sigma in data space: 
         sigma = noise_schedule_dict['poly_sigma']
@@ -205,7 +210,8 @@ class EDMLoss_with_scheduler:
         n = torch.randn_like(y) * torch.sqrt(sigma ** 2 - current_sigma ** 2)
 
         noisy_input = (y + n) * padding_mask
-        x0_pred = net(noisy_input, sigma, labels, augment_labels=augment_labels)
+        class_labels_to_pass = z if labels is None else labels
+        x0_pred = net(noisy_input, sigma, class_labels=class_labels_to_pass, augment_labels=augment_labels, z=z)
         # make it xtn prediction
 
         # sigma가 0으로 남아있는걸 제거해서 nan 생성 방지

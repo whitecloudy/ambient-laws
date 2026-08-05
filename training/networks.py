@@ -9,6 +9,7 @@
 "Elucidating the Design Space of Diffusion-Based Generative Models"."""
 
 import numpy as np
+import math
 import torch
 from torch_utils import persistence
 from torch.nn.functional import silu
@@ -765,8 +766,10 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 self.dec[f'{H_res}x{W_res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
                 self.dec[f'{H_res}x{W_res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
-    def forward(self, x, noise_labels, class_labels, augment_labels=None):
+    def forward(self, x, noise_labels, class_labels=None, augment_labels=None, z=None):
         # [Shape 가정] x: [B, C, H, W], noise_labels: [B, C, H, W], class_labels: [B, K]
+        if class_labels is None and z is not None:
+            class_labels = z
         
         x, pad_h, pad_w, orig_H, orig_W = pad_to_power_of_two(x)
         if self.label_type == 'downlink':
@@ -1526,38 +1529,51 @@ import torch.nn.functional as F
 @persistence.persistent_class
 class EDMPrecond_with_scheduler(EDMPrecond):
     def __init__(self,
+        img_resolution,                     # Image resolution.
+        img_channels,                       # Number of color channels.
+        label_dim       = 0,                # Number of class labels, 0 = unconditional.
+        use_fp16        = False,            # Execute the underlying model at FP16 precision?
+        sigma_min       = 0.002,            # Minimum supported noise level.
+        sigma_max       = 80,               # Maximum supported noise level.
+        sigma_data      = 0.5,              # Expected standard deviation of the training data.
+        model_type      = 'RF_SongUNet',    # Class name of the underlying model.
         m=50,
         k=15,
         data_shape = [14,8,52],
-        sigma_max=80,
-        sigma_min=0.002,
         rho=7,
         mlp_hidden_dim=None,
         latent_encoder=None,
         **model_kwargs,                     # Keyword arguments for the underlying model.
     ):
-        super().__init__(**model_kwargs)
+        if 'label_type' in model_kwargs and model_kwargs['label_type'] == 'classes' and label_dim == 0:
+            label_dim = m
+        super().__init__(img_resolution=img_resolution, img_channels=img_channels, label_dim=label_dim,
+                         use_fp16=use_fp16, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data,
+                         model_type=model_type, **model_kwargs)
         self.m = m
         self.k = k
         self.noise_scheduler = PolynomialNoiseScheduler(m=m, out_dim=data_shape, sigma_max=sigma_max, sigma_min=sigma_min, rho=rho)
         if latent_encoder is not None:
             self.latent_encoder = latent_encoder
         else:
-            self.latent_encoder = TopKDiscreteEncoder(m=m, k=k)
+            self.latent_encoder = TopKDiscreteEncoder(in_channels=img_channels, m=m, k=k)
 
-    def generate_latent_z(self, x_t_n, sigma_t_n):
-        batch_size = x_t_n.shape[0]
-        device = x_t_n.device
+    def forward(self, x: torch.Tensor, sigma: torch.Tensor, class_labels=None, force_fp32=False, z=None, **model_kwargs):
+        if class_labels is None and z is not None:
+            class_labels = z
+        return super().forward(x, sigma, class_labels=class_labels, force_fp32=force_fp32, **model_kwargs)
 
-        # TODO : temporary random z for debugging 
-        # if use_pretrained_encoder:
-        #     z, _ = self.latent_encoder(x_t_n, sigma_t_n, is_training=False)
-        # else:
-        z = torch.randn(batch_size, self.m, device=device)
-        z = torch.topk(z, self.k, dim=-1).indices
-        z = F.one_hot(z, num_classes=self.m).sum(-2).to(torch.float32)    
-        
-        return z, 0
+    def generate_latent_z(self, x_t_n, sigma_t_n=None):
+        if hasattr(self, 'latent_encoder') and self.latent_encoder is not None:
+            z, kl_loss = self.latent_encoder(x_t_n, is_training=self.training)
+            return z, kl_loss
+        else:
+            batch_size = x_t_n.shape[0]
+            device = x_t_n.device
+            z = torch.randn(batch_size, self.m, device=device)
+            z = torch.topk(z, self.k, dim=-1).indices
+            z = F.one_hot(z, num_classes=self.m).sum(-2).to(torch.float32)
+            return z, 0
         
     def get_noise_scheduling(self, sigma, sigma_t_n, z=None, abd=None):
         batch_size = sigma.shape[0]

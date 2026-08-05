@@ -52,8 +52,8 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test']), default='edm', show_default=True)
-@click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test']), default='edm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
+@click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',            type=str, default=None, show_default=True)
@@ -133,6 +133,10 @@ def parse_int_list(s):
 @click.option('--sigma_data',        help='sigma_data parameter for EDM Loss and Precond', metavar='FLOAT', type=float, default=0.5, show_default=True)
 @click.option('--sigma_input_scale', help='sigma_input_scale parameter for EDMPrecond_input_scaling_test', metavar='FLOAT', type=float, default=0.5, show_default=True)
 @click.option('--sigma_loss_scaling', help='sigma_loss_scaling parameter for EDMLoss_loss_scaling_test', metavar='FLOAT', type=float, default=0.5, show_default=True)
+@click.option('--m_dim',             help='Latent z dimension m for scheduler', metavar='INT', type=int, default=50, show_default=True)
+@click.option('--k_top',             help='Top-k selection k for scheduler', metavar='INT', type=int, default=15, show_default=True)
+@click.option('--rho',               help='Rho parameter for scheduler', metavar='FLOAT', type=float, default=7.0, show_default=True)
+@click.option('--kl_coeff',          help='KL loss coefficient for EDMLoss_with_scheduler', metavar='FLOAT', type=float, default=1.0, show_default=True)
 
 # Validation params
 @click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='tick', type=click.IntRange(min=-1), default=50, show_default=True)
@@ -355,8 +359,16 @@ def main(**kwargs):
     elif opts.real_precond == 'edm_input_scaling_test':
         c.network_kwargs.class_name = 'training.networks.EDMPrecond_input_scaling_test'
         c.network_kwargs.sigma_input_scale = opts.sigma_input_scale
+    elif opts.real_precond == 'edm_with_scheduler':
+        c.network_kwargs.class_name = 'training.networks.EDMPrecond_with_scheduler'
+        c.network_kwargs.m = opts.m_dim
+        c.network_kwargs.k = opts.k_top
+        c.network_kwargs.rho = opts.rho
+        c.network_kwargs.data_shape = [opts.frame_res, opts.ant_res, 52] if hasattr(opts, 'frame_res') else [14, 8, 52]
+        c.network_kwargs.label_type = 'classes'
+        c.network_kwargs.label_dim = opts.m_dim
     else:
-        assert False, f"Only edm, edm_c_skip, and edm_input_scaling_test are supported for now, but got {opts.real_precond}" 
+        assert False, f"Unsupported real_precond: {opts.real_precond}" 
 
     if opts.precond == 'edm_dynamic':
         c.loss_kwargs.class_name = 'training.loss.EDMLoss_dynamic_sigma'
@@ -367,8 +379,11 @@ def main(**kwargs):
     elif opts.precond == 'edm_loss_scaling_test':
         c.loss_kwargs.class_name = 'training.loss.EDMLoss_loss_scaling_test'
         c.loss_kwargs.sigma_loss_scaling = opts.sigma_loss_scaling
+    elif opts.precond == 'edm_with_scheduler':
+        c.loss_kwargs.class_name = 'training.loss.EDMLoss_with_scheduler'
+        c.loss_kwargs.kl_coeff = opts.kl_coeff
     else:
-        assert False, f"Only edm, edm_dynamic, edm_boosted_sigma, and edm_loss_scaling_test are supported for now, but got {opts.precond}"
+        assert False, f"Unsupported precond: {opts.precond}"
     
     c.loss_kwargs.update(consistency_batch_size_per_gpu=consistency_batch_size_per_gpu)
     # whether to use weight for the consistency terms
