@@ -331,17 +331,27 @@ def training_loop(
     dist.print0('Constructing network...')
     # interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
     if task == 'RENEW':  
-        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_resolution=dataset_shape[-2:]) # TODO: This is very clumsy. Need to fix ASAP
-    elif task == 'WIDAR':
+        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_resolution=dataset_shape[-2:])
+    elif task in ['WIDAR', 'XRF55']:
         interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_type='classes')
-    elif task == 'XRF55':
-        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_type='classes')
+    else:
+        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim)
+
+    # network_kwargs에 이미 label_dim이나 label_type이 명시되어 있으면(예: EDM scheduler 사용 시) interface_kwargs의 덮어쓰기 방지
+    if 'label_dim' in network_kwargs:
+        interface_kwargs.pop('label_dim', None)
+    if 'label_type' in network_kwargs:
+        interface_kwargs.pop('label_type', None)
+
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     with torch.no_grad():
         images = torch.zeros(dataset_shape, device=device)
         sigma = torch.ones([batch_gpu], device=device)
-        if net.model.label_type != 'no_label' and "label" in dataset_item and dataset_item["label"] is not None:
+        if hasattr(net, "generate_latent_z"):
+            z, _ = net.generate_latent_z(images, sigma)
+            labels = z
+        elif getattr(getattr(net, 'model', None), 'label_type', None) != 'no_label' and "label" in dataset_item and dataset_item["label"] is not None:
             labels = torch.zeros_like(dataset_item["label"]).to(device)
         else:
             labels = None

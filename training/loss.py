@@ -207,7 +207,8 @@ class EDMLoss_with_scheduler:
         n = torch.randn_like(y) * torch.sqrt(sigma ** 2 - current_sigma ** 2)
 
         noisy_input = (y + n) * padding_mask
-        class_labels_to_pass = z if labels is None else labels
+        is_classes = (hasattr(net, 'model') and getattr(net.model, 'label_type', None) == 'classes') or (hasattr(net, 'module') and hasattr(net.module, 'model') and getattr(net.module.model, 'label_type', None) == 'classes')
+        class_labels_to_pass = z if (labels is None or is_classes) else labels
         x0_pred = net(noisy_input, sigma, class_labels=class_labels_to_pass, augment_labels=augment_labels, z=z)
         # make it xtn prediction
 
