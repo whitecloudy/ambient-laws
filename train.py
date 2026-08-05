@@ -364,7 +364,6 @@ def main(**kwargs):
         c.network_kwargs.m = opts.m_dim
         c.network_kwargs.k = opts.k_top
         c.network_kwargs.rho = opts.rho
-        c.network_kwargs.data_shape = [opts.frame_res, opts.ant_res, 52] if hasattr(opts, 'frame_res') else [14, 8, 52]
         c.network_kwargs.label_type = 'classes'
         c.network_kwargs.label_dim = opts.m_dim
     else:

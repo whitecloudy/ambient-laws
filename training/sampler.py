@@ -24,7 +24,7 @@ def edm_sampler(
     net, latents, class_labels=None,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7, padding_mask=1):
     # Time step discretization.
-    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device).view(-1, *[1]*latents.ndim)
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device).reshape(-1, *[1]*latents.ndim)
     # Adjust noise levels based on what's supported by the network.
     if isinstance(sigma_max, torch.Tensor):
         sigma_max = sigma_max.unsqueeze(0)
@@ -54,12 +54,20 @@ def edm_sampler(
     return x_next
 
 
+def _get_net_attr(n, name):
+    if hasattr(n, name):
+        return getattr(n, name)
+    elif hasattr(n, 'module') and hasattr(n.module, name):
+        return getattr(n.module, name)
+    return None
+
 def edm_sampler_with_scheduler(
     net, latents, class_labels=None,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7, padding_mask=1,
     noise_schedule_dict=None, new_sigma_ref=None
 ):
-    if noise_schedule_dict is not None and hasattr(net, "get_noise_scheduling"):
+    get_noise_scheduling_fn = _get_net_attr(net, "get_noise_scheduling")
+    if noise_schedule_dict is not None and get_noise_scheduling_fn is not None:
         sigma_ref = noise_schedule_dict.get('sigma_ref', None)
         current_sigma = noise_schedule_dict.get('current_sigma', None)
         z = noise_schedule_dict.get('latent_z', None)
@@ -84,7 +92,7 @@ def edm_sampler_with_scheduler(
             for i in range(num_steps):
                 ref_t = ref_t_steps[i]
                 ref_t_in = ref_t.to(dtype=latents.dtype) if isinstance(ref_t, torch.Tensor) else ref_t
-                sched_res = net.get_noise_scheduling(ref_t_in, current_sigma, z=z, abd=abd)
+                sched_res = get_noise_scheduling_fn(ref_t_in, current_sigma, z=z, abd=abd)
                 t_steps.append(sched_res['poly_sigma'])
         else:
             step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
@@ -94,7 +102,7 @@ def edm_sampler_with_scheduler(
                 sigma_max_t = min(sigma_max, getattr(net, 'sigma_max', 80))
                 
             if isinstance(sigma_min, torch.Tensor):
-                sigma_min_t = sigma_min.unsqueeze(0).expand([num_steps, ]+([-1, ]*(len(sigma_min.shape)-1)))
+                sigma_min_t = sigma_min.unsqueeze(0).expand([num_steps] + [-1] * len(sigma_min.shape))
             else:
                 sigma_min_t = max(sigma_min, getattr(net, 'sigma_min', 0.002))
                 
@@ -105,12 +113,12 @@ def edm_sampler_with_scheduler(
     else:
         step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
         if isinstance(sigma_max, torch.Tensor):
-            sigma_max_t = sigma_max.unsqueeze(0).expand([num_steps, ]+([-1, ]*(len(sigma_max.shape)-1)))
+            sigma_max_t = sigma_max.unsqueeze(0).expand([num_steps] + [-1] * len(sigma_max.shape))
         else:
             sigma_max_t = min(sigma_max, getattr(net, 'sigma_max', 80))
             
         if isinstance(sigma_min, torch.Tensor):
-            sigma_min_t = sigma_min.unsqueeze(0).expand([num_steps, ]+([-1, ]*(len(sigma_min.shape)-1)))
+            sigma_min_t = sigma_min.unsqueeze(0).expand([num_steps] + [-1] * len(sigma_min.shape))
         else:
             sigma_min_t = max(sigma_min, getattr(net, 'sigma_min', 0.002))
             

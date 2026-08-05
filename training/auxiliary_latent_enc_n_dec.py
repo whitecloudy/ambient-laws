@@ -90,6 +90,8 @@ class TopKDiscreteEncoder(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, x0, is_training=True):
+        enc_dtype = next(self.encoder_backbone.parameters()).dtype
+        x0 = x0.to(dtype=enc_dtype)
         # 1. UnetEncoder를 통한 Logits 추출
         logits = self.encoder_backbone(x0) # Shape: [B, m]
         
@@ -113,7 +115,7 @@ class TopKDiscreteEncoder(nn.Module):
         z = z_hard.detach() - q.detach() + q
         
         # 5. KL Divergence 계산 (Uniform prior 기준)
-        log_m = torch.log(torch.tensor(self.m, dtype=torch.float32, device=logits.device))
+        log_m = torch.log(torch.tensor(self.m, dtype=logits.dtype, device=logits.device))
         kl_loss = -torch.sum(q * (torch.log(q + 1e-8) + log_m), dim=-1).mean()
         
         return z, kl_loss
@@ -167,15 +169,18 @@ class noise_decoder(nn.Module):
     def forward(self, z, sigma_t_n):
         batch_size = z.size(0)
         h, w = self.inout_dim[1], self.inout_dim[2]
+        dec_dtype = next(self.m_encoder.parameters()).dtype
         
+        z = z.to(dtype=dec_dtype)
         z_encoded = self.m_encoder(z)
-        z_encoded = z_encoded.view(batch_size, self.cnn_dim // 2, h, w)
+        z_encoded = z_encoded.reshape(batch_size, self.cnn_dim // 2, h, w)
 
         if sigma_t_n.ndim < 4:
             while sigma_t_n.ndim < 4:
                 sigma_t_n = sigma_t_n.unsqueeze(-1)
             sigma_t_n = sigma_t_n.expand(batch_size, *self.inout_dim)
 
+        sigma_t_n = sigma_t_n.to(dtype=dec_dtype)
         sigma_t_n_encoded = self.sigma_t_n_encoder(sigma_t_n)
 
         # latent code와 sigma_t_n_encoded를 컨캣하고 채널차원 기준으로 concatenation
@@ -221,10 +226,11 @@ class PolynomialNoiseScheduler(nn.Module):
 
 
     def __compute_tau_n(self, sigma_t_n):
-        if sigma_t_n.ndim > 1:
-            sigma_t_n_mean = torch.sqrt(torch.mean(sigma_t_n ** 2, dim=list(range(1, sigma_t_n.ndim))))
+        sigma_t_n_f64 = sigma_t_n.to(torch.float64)
+        if sigma_t_n_f64.ndim > 1:
+            sigma_t_n_mean = torch.sqrt(torch.mean(sigma_t_n_f64 ** 2, dim=list(range(1, sigma_t_n_f64.ndim))))
         else:
-            sigma_t_n_mean = sigma_t_n.abs()
+            sigma_t_n_mean = sigma_t_n_f64.abs()
         sigma_t_n_mean_rho = sigma_t_n_mean ** (1 / self.rho)
 
         tau_n = (self.sigma_max_rho - sigma_t_n_mean_rho) / (self.sigma_max_rho - self.sigma_min_rho)
@@ -236,49 +242,59 @@ class PolynomialNoiseScheduler(nn.Module):
         return a, b, d
 
     def __compute_f(self, a, b, d, t):
-        f_t = ((a**2 / 5) * t**5 + \
-                (a * b / 2) * t**4 + \
-                ((b**2 + 2 * a * d) / 3) * t**3 + \
-                (b * d) * t**2 + \
-                (d**2) * t)
+        a_f64 = a.to(torch.float64)
+        b_f64 = b.to(torch.float64)
+        d_f64 = d.to(torch.float64)
+        t_f64 = t.to(torch.float64)
+        f_t = ((a_f64**2 / 5) * t_f64**5 + \
+                (a_f64 * b_f64 / 2) * t_f64**4 + \
+                ((b_f64**2 + 2 * a_f64 * d_f64) / 3) * t_f64**3 + \
+                (b_f64 * d_f64) * t_f64**2 + \
+                (d_f64**2) * t_f64)
         return f_t  
 
     def __compute_sigma(self, abd, t, tau_n, sigma_t_n):
-        f_t = self.__compute_f(abd[0], abd[1], abd[2], t)
-        f_tau = self.__compute_f(abd[0], abd[1], abd[2], tau_n)
-        f_1 = self.__compute_f(abd[0], abd[1], abd[2], 1.0)
+        a_f64 = abd[0].to(torch.float64)
+        b_f64 = abd[1].to(torch.float64)
+        d_f64 = abd[2].to(torch.float64)
+        t_f64 = t.to(torch.float64)
+        tau_n_f64 = tau_n.to(torch.float64)
+        sigma_t_n_f64 = sigma_t_n.to(torch.float64)
 
-        sigma_t_n_rho = sigma_t_n ** (1 / self.rho)
+        f_t = self.__compute_f(a_f64, b_f64, d_f64, t_f64)
+        f_tau = self.__compute_f(a_f64, b_f64, d_f64, tau_n_f64)
+        f_1 = self.__compute_f(a_f64, b_f64, d_f64, torch.tensor(1.0, dtype=torch.float64, device=t.device))
+
+        sigma_t_n_rho = sigma_t_n_f64 ** (1 / self.rho)
 
         sigma_below = self.__compute_sigma_below_tau(f_t, f_tau, sigma_t_n_rho)
         sigma_above = self.__compute_sigma_above_tau(f_t, f_1, f_tau, sigma_t_n_rho)
 
         # Align dimensions for condition check
-        t_aligned = t
-        if isinstance(t_aligned, torch.Tensor):
-            while t_aligned.ndim < tau_n.ndim:
-                t_aligned = t_aligned.unsqueeze(-1)
+        t_aligned = t_f64
+        while t_aligned.ndim < tau_n_f64.ndim:
+            t_aligned = t_aligned.unsqueeze(-1)
 
-        cond = t_aligned < tau_n
+        cond = t_aligned < tau_n_f64
         sigma = torch.where(cond, sigma_below, sigma_above)
         return sigma
 
     def __compute_sigma_below_tau(self, f_t, f_tau_n, sigma_t_n_rho):
-        f_tau_n_safe = torch.where(f_tau_n.abs() < 1e-8, torch.full_like(f_tau_n, 1e-8), f_tau_n)
+        f_tau_n_safe = torch.clamp(f_tau_n.abs(), min=1e-8) * torch.sign(f_tau_n + 1e-12)
         base = self.sigma_max_rho + (f_t / f_tau_n_safe) * (sigma_t_n_rho - self.sigma_max_rho)
         return torch.clamp(base, min=1e-8) ** self.rho
     
     def __compute_sigma_above_tau(self, f_t, f_1, f_tau_n, sigma_t_n_rho):
         denom = f_tau_n - f_1
-        denom_safe = torch.where(denom.abs() < 1e-8, torch.full_like(denom, -1e-8), denom)
+        denom_safe = torch.clamp(denom.abs(), min=1e-8) * torch.sign(denom + 1e-12)
         base = self.sigma_min_rho + (f_t - f_1) / denom_safe * (sigma_t_n_rho - self.sigma_min_rho)
         return torch.clamp(base, min=1e-8) ** self.rho
 
     def __compute_t_from_sigma(self, sigma):
         if not isinstance(sigma, torch.Tensor):
-            sigma_tensor = torch.tensor(sigma, dtype=torch.float32)
+            sigma_tensor = torch.tensor(sigma, dtype=torch.float64)
         else:
-            sigma_tensor = sigma
+            sigma_tensor = sigma.to(torch.float64)
 
         if sigma_tensor.ndim > 1:
             sigma_mean = torch.sqrt(torch.mean(sigma_tensor ** 2, dim=list(range(1, sigma_tensor.ndim))))
@@ -296,15 +312,15 @@ class PolynomialNoiseScheduler(nn.Module):
         sigma_t_n: [B, ...] (노이즈 타겟/상태 텐서)
         """
         B = z.size(0)
-        z = z.to(dtype=next(self.noise_decoder.parameters()).dtype)
         orig_shape = sigma_t_n.shape
 
-        # Ensure sigma is a tensor and expanded to orig_shape
+        # Ensure sigma and sigma_t_n are float64 tensors for high-power polynomial math
         if not isinstance(sigma, torch.Tensor):
-            sigma_tensor = torch.tensor(sigma, device=sigma_t_n.device, dtype=sigma_t_n.dtype)
+            sigma_tensor = torch.tensor(sigma, device=sigma_t_n.device, dtype=torch.float64)
         else:
-            sigma_tensor = sigma.to(device=sigma_t_n.device, dtype=sigma_t_n.dtype)
+            sigma_tensor = sigma.to(device=sigma_t_n.device, dtype=torch.float64)
 
+        sigma_t_n_f64 = sigma_t_n.to(torch.float64)
         sigma_expanded = sigma_tensor
         while sigma_expanded.ndim < sigma_t_n.ndim:
             sigma_expanded = sigma_expanded.unsqueeze(-1)
@@ -315,33 +331,38 @@ class PolynomialNoiseScheduler(nn.Module):
 
         # 전체가 범위 밖인 경우 MLP 및 다항식 계산 없이 즉시 반환
         if torch.all(out_of_bounds):
-            return sigma_expanded
+            return sigma_expanded, abd
 
-        # sigma를 t (0~1 사이)로 환산
+        # sigma를 t (0~1 사이)로 환산 (float64)
         t = self.__compute_t_from_sigma(sigma_tensor)
 
-        # Calculate tau_n
-        tau_n = self.__compute_tau_n(sigma_t_n)
+        # Calculate tau_n (float64)
+        tau_n = self.__compute_tau_n(sigma_t_n_f64)
         
-        # MLP를 통과하여 a, b, d 계수 추출
+        # Neural Network Architecture forward pass using module precision (e.g. bfloat16/float32)
         if abd is None:
             a, b, d = self.__compute_coefficients(z, sigma_t_n)
             abd = (a, b, d)
         else:
             a, b, d = abd
         
+        a_f64 = a.to(torch.float64)
+        b_f64 = b.to(torch.float64)
+        d_f64 = d.to(torch.float64)
+        abd_f64 = (a_f64, b_f64, d_f64)
+
         # 브로드캐스팅을 위해 t의 차원을 [B, 1]로 맞춤
-        t_view = t.view(B, 1)
+        t_view = t.reshape(B, 1)
         t_view_clamped = torch.clamp(t_view, min=0.0, max=1.0)
         
         # Flatten inputs for polynomial calculations
-        tau_n_flat = tau_n.view(B, 1)
-        sigma_t_n_flat = sigma_t_n.view(B, -1)
+        tau_n_flat = tau_n.reshape(B, 1)
+        sigma_t_n_flat = sigma_t_n_f64.reshape(B, -1)
         
-        # Compute polynomial sigma
-        sigma_flat = self.__compute_sigma(abd, t_view_clamped, tau_n_flat, sigma_t_n_flat)
+        # Compute polynomial sigma in float64
+        sigma_flat = self.__compute_sigma(abd_f64, t_view_clamped, tau_n_flat, sigma_t_n_flat)
         target_shape = (B,) + tuple(self.out_dim) if len(orig_shape) == 1 else orig_shape
-        polynomial_sigma = sigma_flat.view(target_shape)
+        polynomial_sigma = sigma_flat.reshape(target_shape)
 
         # 일부분만 범위 밖인 경우 torch.where 적용, 전부 범위 안이면 polynomial_sigma 즉시 반환
         if torch.any(out_of_bounds):
