@@ -136,9 +136,6 @@ class EDMLoss:
         loss = loss * padding_mask
         return loss, x0_pred, return_sigma
 
-
-from training.noise_scheduler import rule_based_noise_scheduler
-
 #----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
 # of Diffusion-Based Generative Models" (EDM).
