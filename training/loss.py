@@ -134,7 +134,7 @@ class EDMLoss:
             loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
         
         loss = loss * padding_mask
-        return loss, x0_pred, return_sigma
+        return loss, x0_pred, return_sigma, None
 
 #----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
@@ -302,7 +302,7 @@ class EDMLoss_with_scheduler:
             loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
 
         loss = loss * padding_mask
-        return loss, x0_pred, return_sigma
+        return loss, x0_pred, return_sigma, kl_loss
 
 
 #----------------------------------------------------------------------------
@@ -425,7 +425,7 @@ class EDMLoss_loss_scaling_test:
             loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
         
         loss = loss * padding_mask
-        return loss, x0_pred, return_sigma
+        return loss, x0_pred, return_sigma, None
 
 #----------------------------------------------------------------------------
 
@@ -557,7 +557,7 @@ class EDMLoss_dynamic_sigma:
             loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
         
         loss = loss * padding_mask
-        return loss, x0_pred, return_sigma
+        return loss, x0_pred, return_sigma, None
 
 #----------------------------------------------------------------------------
 
@@ -683,6 +683,6 @@ class EDMLoss_boosted_sigma:
             loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
         
         loss = loss * padding_mask
-        return loss, x0_pred, return_sigma
+        return loss, x0_pred, return_sigma, None
 
 #----------------------------------------------------------------------------

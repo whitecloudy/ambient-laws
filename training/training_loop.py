@@ -429,12 +429,28 @@ def training_loop(
                 if (loss_kwargs.class_name != 'training.loss.EDMLoss_boosted_sigma') and no_asm:
                     current_sigma = torch.zeros_like(current_sigma)
 
-                loss, x0_pred, sigma = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe, original_shape=original_shape)
-                training_stats.report('Loss/loss', loss)
+                loss_out = loss_fn(net=ddp, images=images, labels=labels, current_sigma=current_sigma, augment_pipe=augment_pipe, original_shape=original_shape)
+                if len(loss_out) == 4:
+                    loss, x0_pred, sigma, kl_loss = loss_out
+                else:
+                    loss, x0_pred, sigma = loss_out
+                    kl_loss = None
+
+                if kl_loss is not None:
+                    kl_coeff = getattr(loss_fn, 'kl_coeff', 1.0)
+                    if hasattr(loss_fn, 'module'):
+                        kl_coeff = getattr(loss_fn.module, 'kl_coeff', kl_coeff)
+                    pure_loss = (loss - kl_coeff * kl_loss.to(loss.dtype)).detach()
+                    training_stats.report('Loss/loss', pure_loss)
+                    training_stats.report('Loss/kl_loss', kl_loss.detach())
+                else:
+                    training_stats.report('Loss/loss', loss.detach())
                 if debug_test:
                     with torch.no_grad():
                         debug_end_time = time.time()
                         dist.print0(f'loss: {torch.mean(loss).item()}, tick_time: {(debug_end_time - debug_start_time):.4f}s')
+                        if kl_loss is not None:
+                            dist.print0(f'kl_loss: {torch.mean(kl_loss).item()}')
                         debug_start_time = time.time()
                 (loss).sum().mul(loss_scaling / batch_gpu_total).backward()
 
@@ -553,9 +569,22 @@ def training_loop(
                                 else:
                                     val_original_shape = None
 
-                                val_loss, _, _ = loss_fn(net=ema, images=val_images, labels=val_labels, current_sigma=val_current_sigma, augment_pipe=None, original_shape=val_original_shape)
-                                
-                                training_stats.report('Validation/loss', val_loss.clone().detach())
+                                val_loss_out = loss_fn(net=ema, images=val_images, labels=val_labels, current_sigma=val_current_sigma, augment_pipe=None, original_shape=val_original_shape)
+                                if len(val_loss_out) == 4:
+                                    val_loss, _, _, val_kl_loss = val_loss_out
+                                else:
+                                    val_loss, _, _ = val_loss_out
+                                    val_kl_loss = None
+
+                                if val_kl_loss is not None:
+                                    kl_coeff = getattr(loss_fn, 'kl_coeff', 1.0)
+                                    if hasattr(loss_fn, 'module'):
+                                        kl_coeff = getattr(loss_fn.module, 'kl_coeff', kl_coeff)
+                                    val_pure_loss = (val_loss - kl_coeff * val_kl_loss.to(val_loss.dtype)).detach()
+                                    training_stats.report('Validation/loss', val_pure_loss)
+                                    training_stats.report('Validation/kl_loss', val_kl_loss.detach())
+                                else:
+                                    training_stats.report('Validation/loss', val_loss.detach())
                                 pbar.update(1)
                         pbar.close()
             ddp.train()
