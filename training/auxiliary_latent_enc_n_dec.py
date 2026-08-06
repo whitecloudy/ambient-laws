@@ -89,6 +89,8 @@ class TopKDiscreteEncoder(nn.Module):
         self.encoder_backbone = UnetEncoder(in_channels=in_channels, m=m, base_channels=base_channels)
         self.apply(_init_weights)
 
+        self.log_m = math.log(m)
+
     def forward(self, x0, is_training=True):
         enc_dtype = next(self.encoder_backbone.parameters()).dtype
         x0 = x0.to(dtype=enc_dtype)
@@ -96,10 +98,31 @@ class TopKDiscreteEncoder(nn.Module):
         logits = self.encoder_backbone(x0) # Shape: [B, m]
         
         if is_training:
-            # 2. Sum-of-Gamma / Gumbel 노이즈 추가 (연속적 이완)
-            U = torch.rand_like(logits)
-            noise = -torch.log(-torch.log(U + 1e-8) + 1e-8)
-            noisy_logits = logits + noise
+            # 2. Sum-of-Gamma 노이즈 추가 (Sahoo et al.)
+            # 원본 JAX 코드의 _gamma_noise 로직을 PyTorch로 이식
+            shape = logits.shape
+            gamma_tau = 10.0  # 논문 및 코드 기본값
+        
+            # alpha(concentration) = 1.0 / k 인 Gamma 분포 정의 (10번 샘플링)
+            concentration = torch.full((10, *shape), 1.0 / self.k, dtype=logits.dtype, device=logits.device)
+            gamma_dist = torch.distributions.Gamma(concentration, rate=1.0)
+            noise = gamma_dist.sample() # Shape: [10, B, m]
+            
+            # beta 값 배열 생성: k / [1.0, 2.0, ..., 10.0]
+            beta_vals = torch.arange(1.0, 11.0, dtype=logits.dtype, device=logits.device)
+            beta = self.k / beta_vals
+            
+            # 차원 브로드캐스팅을 위해 view 사용 (예: [10, 1, 1] 형태로 변경)
+            view_shape = [10] + [1] * len(shape)
+            beta = beta.view(*view_shape)
+            
+            # Sum-of-Gamma 연산 적용
+            s = noise / beta
+            s = torch.sum(s, dim=0)          # 10번 샘플링한 차원을 기준으로 합산 -> Shape: [B, m]
+            s = s - math.log(10.0)           # 상수 보정
+            gamma_noise = gamma_tau * (s / self.k) # 최종 스케일링
+            
+            noisy_logits = logits + gamma_noise
         else:
             # 평가/추론 시에는 노이즈 생략
             noisy_logits = logits
@@ -109,14 +132,18 @@ class TopKDiscreteEncoder(nn.Module):
         z_hard = torch.zeros_like(noisy_logits).scatter_(-1, topk_indices, 1.0)
         
         q = F.softmax(logits, dim=-1)
+        log_q = F.log_softmax(logits, dim=-1)
         
         # 4. Identity Straight-Through Estimator (STE) 적용
-        # 순전파: z_hard, 역전파: q의 그래디언트
-        z = z_hard.detach() - q.detach() + q
+        centered_noisy_logits = noisy_logits - noisy_logits.mean(dim=-1, keepdim=True)
+        norm = torch.norm(centered_noisy_logits, p=2, dim=-1, keepdim=True)
+        soft_topk = centered_noisy_logits / (norm + 1e-8)
+
+        # 순전파: z_hard, 역전파: soft_topk의 그래디언트
+        z = z_hard.detach() - soft_topk.detach() + soft_topk
         
         # 5. KL Divergence 계산 (Uniform prior 기준)
-        log_m = torch.log(torch.tensor(self.m, dtype=logits.dtype, device=logits.device))
-        kl_loss = -torch.sum(q * (torch.log(q + 1e-8) + log_m), dim=-1).mean()
+        kl_loss = torch.sum(q * (log_q + self.log_m), dim=-1).mean()
         
         return z, kl_loss
 
