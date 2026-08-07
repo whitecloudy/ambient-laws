@@ -225,7 +225,8 @@ class EDMLoss_with_scheduler:
 
         # loss weight depends on sigma (float64)
         weight_f64 = (nonzero_sigma_f64 ** 2 + self.sigma_data ** 2) / (nonzero_sigma_f64 * self.sigma_data) ** 2
-        loss = weight_f64 * ((D_yn_f64 - y_f64) ** 2) + self.kl_coeff * kl_loss.to(torch.float64)
+        kl_loss_f64 = kl_loss.to(torch.float64) if isinstance(kl_loss, torch.Tensor) else torch.tensor(kl_loss, dtype=torch.float64, device=y_f64.device)
+        loss = weight_f64 * ((D_yn_f64 - y_f64) ** 2) + self.kl_coeff * kl_loss_f64
         return_sigma = sigma_f64
     
         # consistency loss

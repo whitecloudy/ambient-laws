@@ -1540,10 +1540,14 @@ class EDMPrecond_with_scheduler(EDMPrecond):
         rho=7,
         mlp_hidden_dim=None,
         latent_encoder=None,
+        scheduler_mode='using_sigma_t_n',
         **model_kwargs,                     # Keyword arguments for the underlying model.
     ):
+        self.scheduler_mode = scheduler_mode
+
         if 'label_type' in model_kwargs and model_kwargs['label_type'] == 'classes' and label_dim == 0:
-            label_dim = m
+            if self.scheduler_mode != 'no_nn_scheduler':
+                label_dim = m
         super().__init__(img_resolution=img_resolution, img_channels=img_channels, label_dim=label_dim,
                          use_fp16=use_fp16, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data,
                          model_type=model_type, **model_kwargs)
@@ -1558,15 +1562,21 @@ class EDMPrecond_with_scheduler(EDMPrecond):
             else:
                 data_shape = [img_channels, 14, 52]
 
-        self.noise_scheduler = PolynomialNoiseScheduler(m=m, out_dim=data_shape, sigma_max=sigma_max, sigma_min=sigma_min, rho=rho)
-        if latent_encoder is not None:
-            self.latent_encoder = latent_encoder
+        self.noise_scheduler = PolynomialNoiseScheduler(m=m, out_dim=data_shape, sigma_max=sigma_max, sigma_min=sigma_min, rho=rho, scheduler_mode=self.scheduler_mode)
+
+        if self.scheduler_mode == 'no_nn_scheduler':
+            self.latent_encoder = None
         else:
-            self.latent_encoder = TopKDiscreteEncoder(in_channels=img_channels, m=m, k=k)
+            if latent_encoder is not None:
+                self.latent_encoder = latent_encoder
+            else:
+                self.latent_encoder = TopKDiscreteEncoder(in_channels=img_channels, m=m, k=k)
 
         if self.use_fp16:
-            self.latent_encoder.to(torch.bfloat16)
-            self.noise_scheduler.noise_decoder.to(torch.bfloat16)
+            if self.latent_encoder is not None:
+                self.latent_encoder.to(torch.bfloat16)
+            if hasattr(self.noise_scheduler, 'noise_decoder') and len(list(self.noise_scheduler.noise_decoder.parameters())) > 0:
+                self.noise_scheduler.noise_decoder.to(torch.bfloat16)
 
     def forward(self, x: torch.Tensor, sigma: torch.Tensor, class_labels=None, force_fp32=False, z=None, **model_kwargs):
         if class_labels is None and z is not None:
@@ -1574,6 +1584,9 @@ class EDMPrecond_with_scheduler(EDMPrecond):
         return super().forward(x, sigma, class_labels=class_labels, force_fp32=force_fp32, **model_kwargs)
 
     def generate_latent_z(self, x_t_n, sigma_t_n=None, force_fp32=False):
+        if self.scheduler_mode == 'no_nn_scheduler':
+            return None, torch.tensor(0.0)
+
         dtype = torch.bfloat16 if (self.use_fp16 and not force_fp32 and x_t_n.device.type == 'cuda') else (x_t_n.dtype if x_t_n.is_floating_point() else torch.float32)
         if hasattr(self, 'latent_encoder') and self.latent_encoder is not None:
             self.latent_encoder.to(dtype=dtype)
@@ -1586,20 +1599,24 @@ class EDMPrecond_with_scheduler(EDMPrecond):
             z = torch.randn(batch_size, self.m, device=device, dtype=dtype)
             z = torch.topk(z, self.k, dim=-1).indices
             z = F.one_hot(z, num_classes=self.m).sum(-2).to(dtype)
-            return z, 0
+            return z, torch.tensor(0.0)
         
     def get_noise_scheduling(self, sigma, sigma_t_n, z=None, abd=None, force_fp32=False):
         dtype = torch.bfloat16 if (self.use_fp16 and not force_fp32 and sigma.device.type == 'cuda') else (sigma_t_n.dtype if sigma_t_n.is_floating_point() else torch.float32)
-        if hasattr(self.noise_scheduler, 'noise_decoder'):
+        if hasattr(self.noise_scheduler, 'noise_decoder') and len(list(self.noise_scheduler.noise_decoder.parameters())) > 0:
             self.noise_scheduler.noise_decoder.to(dtype=dtype)
         batch_size = sigma.shape[0]
-        # make random z, top k
-        if z is None:
-            z = torch.randn(batch_size, self.m, device=sigma.device, dtype=dtype)
-            z = torch.topk(z, self.k, dim=-1).indices
-            z = F.one_hot(z, num_classes=self.m).sum(-2).to(dtype)
+
+        if self.scheduler_mode == 'no_nn_scheduler':
+            z = None
         else:
-            z = z.to(dtype=dtype)
+            # make random z, top k if z is None
+            if z is None:
+                z = torch.randn(batch_size, self.m, device=sigma.device, dtype=dtype)
+                z = torch.topk(z, self.k, dim=-1).indices
+                z = F.one_hot(z, num_classes=self.m).sum(-2).to(dtype)
+            else:
+                z = z.to(dtype=dtype)
 
         if abd is None:
             poly_sigma, abd = self.noise_scheduler(z, sigma, sigma_t_n)

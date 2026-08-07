@@ -143,19 +143,20 @@ class TopKDiscreteEncoder(nn.Module):
         # 순전파: z_hard, 역전파: soft_topk의 그래디언트
         z = z_hard.detach() - soft_topk.detach() + soft_topk
         
-        # 5. KL Divergence 계산 (Uniform prior 기준)
-        kl_loss = torch.sum(q * (log_q + self.log_m), dim=-1).mean()
+        # 5. KL Divergence 계산 (Uniform prior 기준, 부동소수점 오차 방지를 위해 clamp min=0.0 적용)
+        kl_loss = torch.clamp(torch.sum(q * (log_q + self.log_m), dim=-1), min=0.0).mean()
         
         return z, kl_loss
 
 class noise_decoder(nn.Module):
-    def __init__(self, m=50, inout_dim=[14,8,52], mlp_hidden_dim=None, cnn_dim=32, a_amp=4.0, b_amp=4.0, d_amp=2.0):
+    def __init__(self, m=50, inout_dim=[14,8,52], mlp_hidden_dim=None, cnn_dim=32, a_amp=4.0, b_amp=4.0, d_amp=2.0, scheduler_mode='using_sigma_t_n'):
         super().__init__()
         self.m = m
         self.inout_dim = inout_dim
         self.shape = (-1, ) + tuple(self.inout_dim) 
         self.cnn_dim = cnn_dim
         self.mlp_hidden_dim = 1
+        self.scheduler_mode = scheduler_mode
 
         self.a_amp = a_amp
         self.b_amp = b_amp
@@ -167,68 +168,114 @@ class noise_decoder(nn.Module):
         else:
             self.mlp_hidden_dim = mlp_hidden_dim
 
-        m_encoder_output_len = cnn_dim//2 * inout_dim[1] * inout_dim[2]
-        
-        # 잠재 변수 z를 받아 다항식 계수를 생성하는 2-layer MLP
-        self.m_encoder = nn.Sequential(
-            nn.Linear(m, self.mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.mlp_hidden_dim, m_encoder_output_len),
-            nn.LayerNorm(m_encoder_output_len)
-        )
+        output_len = 1
+        for dim in self.inout_dim:
+            output_len *= dim
+        self.output_len = output_len
 
-        self.sigma_t_n_encoder = nn.Sequential(
-            nn.Conv2d(in_channels=self.inout_dim[0], out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim//2, kernel_size=3, stride=1, padding=1),
-            nn.LayerNorm((cnn_dim//2, inout_dim[1], inout_dim[2]))
-        )
+        if self.scheduler_mode == 'using_sigma_t_n':
+            m_encoder_output_len = cnn_dim//2 * inout_dim[1] * inout_dim[2]
+            
+            # 잠재 변수 z를 받아 다항식 계수를 생성하는 2-layer MLP
+            self.m_encoder = nn.Sequential(
+                nn.Linear(m, self.mlp_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.mlp_hidden_dim, m_encoder_output_len),
+                nn.LayerNorm(m_encoder_output_len)
+            )
 
-        self.output_noise_decoder = nn.Sequential(
-            nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(in_channels=cnn_dim, out_channels=int(inout_dim[0]*3), kernel_size=3, stride=1, padding=1) # a, b, d 세 가지 계수를 위해 3배수 출력
-        )   
+            self.sigma_t_n_encoder = nn.Sequential(
+                nn.Conv2d(in_channels=self.inout_dim[0], out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim//2, kernel_size=3, stride=1, padding=1),
+                nn.LayerNorm((cnn_dim//2, inout_dim[1], inout_dim[2]))
+            )
+
+            self.output_noise_decoder = nn.Sequential(
+                nn.Conv2d(in_channels=cnn_dim, out_channels=cnn_dim, kernel_size=3, stride=1, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(in_channels=cnn_dim, out_channels=int(inout_dim[0]*3), kernel_size=3, stride=1, padding=1) # a, b, d 세 가지 계수를 위해 3배수 출력
+            )   
+        elif self.scheduler_mode == 'no_sigma_t_n':
+            # using_sigma_t_n이 False일 때: sigma_t_n을 사용하지 않고 MLP layer로 z만 다룸
+            self.m_encoder = nn.Sequential(
+                nn.Linear(m, self.mlp_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(self.mlp_hidden_dim, self.output_len * 3)
+            )
+        elif self.scheduler_mode == 'no_nn_scheduler':
+            # z와 sigma_t_n을 사용하지 않고 a=0, b=0, d=1만 출력하는 모드
+            pass
+        else:
+            raise ValueError(f"Unknown scheduler_mode: {self.scheduler_mode}")
 
         self.apply(_init_weights)
 
-    def forward(self, z, sigma_t_n):
+    def forward(self, z=None, sigma_t_n=None):
+        if self.scheduler_mode == 'no_nn_scheduler':
+            if z is not None:
+                batch_size = z.size(0)
+                device = z.device
+                dtype = z.dtype
+            elif sigma_t_n is not None:
+                batch_size = sigma_t_n.size(0)
+                device = sigma_t_n.device
+                dtype = sigma_t_n.dtype
+            else:
+                batch_size = 1
+                device = torch.device('cpu')
+                dtype = torch.float32
+
+            a = torch.zeros((batch_size, self.output_len), device=device, dtype=dtype)
+            b = torch.zeros((batch_size, self.output_len), device=device, dtype=dtype)
+            d = torch.ones((batch_size, self.output_len), device=device, dtype=dtype)
+            return a, b, d
+
         batch_size = z.size(0)
-        h, w = self.inout_dim[1], self.inout_dim[2]
         dec_dtype = next(self.m_encoder.parameters()).dtype
         
         z = z.to(dtype=dec_dtype)
-        z_encoded = self.m_encoder(z)
-        z_encoded = z_encoded.reshape(batch_size, self.cnn_dim // 2, h, w)
 
-        if sigma_t_n.ndim < 4:
-            while sigma_t_n.ndim < 4:
-                sigma_t_n = sigma_t_n.unsqueeze(-1)
-            sigma_t_n = sigma_t_n.expand(batch_size, *self.inout_dim)
+        if self.scheduler_mode == 'using_sigma_t_n':
+            h, w = self.inout_dim[1], self.inout_dim[2]
+            z_encoded = self.m_encoder(z)
+            z_encoded = z_encoded.reshape(batch_size, self.cnn_dim // 2, h, w)
 
-        sigma_t_n = sigma_t_n.to(dtype=dec_dtype)
-        sigma_t_n_encoded = self.sigma_t_n_encoder(sigma_t_n)
+            if sigma_t_n.ndim < 4:
+                while sigma_t_n.ndim < 4:
+                    sigma_t_n = sigma_t_n.unsqueeze(-1)
+                sigma_t_n = sigma_t_n.expand(batch_size, *self.inout_dim)
 
-        # latent code와 sigma_t_n_encoded를 컨캣하고 채널차원 기준으로 concatenation
-        encoded = torch.cat([z_encoded, sigma_t_n_encoded], dim=1)
+            sigma_t_n = sigma_t_n.to(dtype=dec_dtype)
+            sigma_t_n_encoded = self.sigma_t_n_encoder(sigma_t_n)
 
-        noise_pred = self.output_noise_decoder(encoded)
-        
-        # c3 (inout_dim[0] * 3)를 3개로 분할하여 a, b, d 계수 추출
-        a, b, d = torch.chunk(noise_pred, 3, dim=1)
+            # latent code와 sigma_t_n_encoded를 컨캣하고 채널차원 기준으로 concatenation
+            encoded = torch.cat([z_encoded, sigma_t_n_encoded], dim=1)
 
-        # PolynomialNoiseScheduler 다항식 계산에 맞춰 [B, output_len] 형태로 flatten
-        a = (torch.sigmoid(a.reshape(batch_size, -1)) - 0.5) * self.a_amp
-        b = (torch.sigmoid(b.reshape(batch_size, -1)) - 0.5) * self.b_amp
-        d = (torch.sigmoid(d.reshape(batch_size, -1)) - 0.5) * self.d_amp + 1.0 
+            noise_pred = self.output_noise_decoder(encoded)
+            
+            # c3 (inout_dim[0] * 3)를 3개로 분할하여 a, b, d 계수 추출
+            a, b, d = torch.chunk(noise_pred, 3, dim=1)
+
+            # PolynomialNoiseScheduler 다항식 계산에 맞춰 [B, output_len] 형태로 flatten
+            a = (torch.sigmoid(a.reshape(batch_size, -1)) - 0.5) * self.a_amp
+            b = (torch.sigmoid(b.reshape(batch_size, -1)) - 0.5) * self.b_amp
+            d = (torch.sigmoid(d.reshape(batch_size, -1)) - 0.5) * self.d_amp + 1.0 
+        elif self.scheduler_mode == 'no_sigma_t_n':
+            noise_pred = self.m_encoder(z)
+            a, b, d = torch.chunk(noise_pred, 3, dim=-1)
+
+            a = (torch.sigmoid(a) - 0.5) * self.a_amp
+            b = (torch.sigmoid(b) - 0.5) * self.b_amp
+            d = (torch.sigmoid(d) - 0.5) * self.d_amp + 1.0
 
         return a, b, d
 
         
 class PolynomialNoiseScheduler(nn.Module):
-    def __init__(self, m=50, out_dim=[14,8,52], sigma_max=80, sigma_min=0.002, rho=1, mlp_hidden_dim=None, cnn_dim=32):
+    def __init__(self, m=50, out_dim=[14,8,52], sigma_max=80, sigma_min=0.002, rho=1, mlp_hidden_dim=None, cnn_dim=32, scheduler_mode='using_sigma_t_n'):
         super().__init__()
         self.m = m
         self.out_dim = out_dim
@@ -240,10 +287,12 @@ class PolynomialNoiseScheduler(nn.Module):
 
         if mlp_hidden_dim is None:
             mlp_hidden_dim = output_len
-        
+
+        self.scheduler_mode = scheduler_mode
+
         # noise_decoder 인스턴스 사용
-        self.noise_decoder = noise_decoder(m=m, inout_dim=out_dim, mlp_hidden_dim=mlp_hidden_dim, cnn_dim=cnn_dim)
-        
+        self.noise_decoder = noise_decoder(m=m, inout_dim=out_dim, mlp_hidden_dim=mlp_hidden_dim, cnn_dim=cnn_dim, scheduler_mode=self.scheduler_mode)
+
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.rho = rho
@@ -335,11 +384,11 @@ class PolynomialNoiseScheduler(nn.Module):
 
     def forward(self, z, sigma, sigma_t_n, abd = None):
         """
-        z: [B, m] (Encoder에서 나온 k-hot 벡터)
+        z: [B, m] (Encoder에서 나온 k-hot 벡터) 또는 None (no_nn_scheduler 모드인 경우)
         sigma: [B] 또는 스칼라/텐서 (Reference/Input Noise Level 값)
         sigma_t_n: [B, ...] (노이즈 타겟/상태 텐서)
         """
-        B = z.size(0)
+        B = sigma_t_n.size(0) if sigma_t_n is not None else (z.size(0) if z is not None else 1)
         orig_shape = sigma_t_n.shape
 
         # Ensure sigma and sigma_t_n are float64 tensors for high-power polynomial math

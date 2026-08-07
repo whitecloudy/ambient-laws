@@ -137,6 +137,7 @@ def parse_int_list(s):
 @click.option('--k_top',             help='Top-k selection k for scheduler', metavar='INT', type=int, default=15, show_default=True)
 @click.option('--rho',               help='Rho parameter for scheduler', metavar='FLOAT', type=float, default=7.0, show_default=True)
 @click.option('--kl_coeff',          help='KL loss coefficient for EDMLoss_with_scheduler', metavar='FLOAT', type=float, default=1.0, show_default=True)
+@click.option('--scheduler_mode',    help='Scheduler mode for edm_with_scheduler', metavar='using_sigma_t_n|no_sigma_t_n|no_nn_scheduler', type=click.Choice(['using_sigma_t_n', 'no_sigma_t_n', 'no_nn_scheduler']), default='using_sigma_t_n', show_default=True)
 
 # Validation params
 @click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='tick', type=click.IntRange(min=-1), default=50, show_default=True)
@@ -364,8 +365,13 @@ def main(**kwargs):
         c.network_kwargs.m = opts.m_dim
         c.network_kwargs.k = opts.k_top
         c.network_kwargs.rho = opts.rho
-        c.network_kwargs.label_type = 'classes'
-        c.network_kwargs.label_dim = opts.m_dim
+        c.network_kwargs.scheduler_mode = opts.scheduler_mode
+        if opts.scheduler_mode != 'no_nn_scheduler':
+            c.network_kwargs.label_type = 'classes'
+            c.network_kwargs.label_dim = opts.m_dim
+        else:
+            c.network_kwargs.label_type = 'no_label'
+            c.network_kwargs.label_dim = 0
     else:
         assert False, f"Unsupported real_precond: {opts.real_precond}" 
 
