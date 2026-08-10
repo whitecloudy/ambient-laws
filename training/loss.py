@@ -250,7 +250,10 @@ class EDMLoss_with_scheduler:
             c_sigma_ref_f64 = sigma_ref_f64[:consistency_batch_size]
             c_new_sigma_ref_f64 = new_sigma_ref_f64[:consistency_batch_size]
             c_current_sigma_f64 = current_sigma_f64[:consistency_batch_size]
-            c_z = z[:consistency_batch_size]
+            if z is not None:
+                c_z = z[:consistency_batch_size]
+            else:
+                c_z = None
             c_abd = (abd[0][:consistency_batch_size], abd[1][:consistency_batch_size], abd[2][:consistency_batch_size]) if abd is not None else None
             if labels is not None:
                 c_labels_orig = labels[:consistency_batch_size]
@@ -265,7 +268,8 @@ class EDMLoss_with_scheduler:
             c_sigma_ref_f64 = c_sigma_ref_f64.repeat_interleave(self.num_primes, dim=0)
             c_new_sigma_ref_f64 = c_new_sigma_ref_f64.repeat_interleave(self.num_primes, dim=0)
             c_current_sigma_f64 = c_current_sigma_f64.repeat_interleave(self.num_primes, dim=0)
-            c_z = c_z.repeat_interleave(self.num_primes, dim=0)
+            if c_z is not None:
+                c_z = c_z.repeat_interleave(self.num_primes, dim=0)
             if c_abd is not None:
                 c_abd = (c_abd[0].repeat_interleave(self.num_primes, dim=0), c_abd[1].repeat_interleave(self.num_primes, dim=0), c_abd[2].repeat_interleave(self.num_primes, dim=0))
             if c_labels_orig is not None:
