@@ -1563,9 +1563,12 @@ class EDMPrecond_with_scheduler(EDMPrecond):
     ):
         self.scheduler_mode = scheduler_mode
 
-        if 'label_type' in model_kwargs and model_kwargs['label_type'] == 'classes' and label_dim == 0:
-            if getattr(self, 'scheduler_mode', 'no_nn_scheduler') not in ['no_nn_scheduler', 'using_sigma_t_n_wo_z']:
-                label_dim = m
+        if getattr(self, 'scheduler_mode', 'no_nn_scheduler') in ['no_nn_scheduler', 'using_sigma_t_n_wo_z']:
+            label_dim = 0
+            if 'label_type' in model_kwargs:
+                model_kwargs['label_type'] = 'no_label'
+        elif 'label_type' in model_kwargs and model_kwargs['label_type'] == 'classes' and label_dim == 0:
+            label_dim = m
         super().__init__(img_resolution=img_resolution, img_channels=img_channels, label_dim=label_dim,
                          use_fp16=use_fp16, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data,
                          model_type=model_type, **model_kwargs)

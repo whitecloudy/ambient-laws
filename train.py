@@ -366,7 +366,7 @@ def main(**kwargs):
         c.network_kwargs.k = opts.k_top
         c.network_kwargs.rho = opts.rho
         c.network_kwargs.scheduler_mode = opts.scheduler_mode
-        if opts.scheduler_mode != 'no_nn_scheduler':
+        if opts.scheduler_mode in ['using_sigma_t_n', 'no_sigma_t_n']:
             c.network_kwargs.label_type = 'classes'
             c.network_kwargs.label_dim = opts.m_dim
         else:
