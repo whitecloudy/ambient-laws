@@ -137,7 +137,7 @@ def parse_int_list(s):
 @click.option('--k_top',             help='Top-k selection k for scheduler', metavar='INT', type=int, default=15, show_default=True)
 @click.option('--rho',               help='Rho parameter for scheduler', metavar='FLOAT', type=float, default=7.0, show_default=True)
 @click.option('--kl_coeff',          help='KL loss coefficient for EDMLoss_with_scheduler', metavar='FLOAT', type=float, default=1.0, show_default=True)
-@click.option('--scheduler_mode',    help='Scheduler mode for edm_with_scheduler', metavar='using_sigma_t_n|no_sigma_t_n|no_nn_scheduler', type=click.Choice(['using_sigma_t_n', 'no_sigma_t_n', 'no_nn_scheduler']), default='using_sigma_t_n', show_default=True)
+@click.option('--scheduler_mode',    help='Scheduler mode for edm_with_scheduler', metavar='using_sigma_t_n|no_sigma_t_n|no_nn_scheduler|using_sigma_t_n_wo_z', type=click.Choice(['using_sigma_t_n', 'no_sigma_t_n', 'no_nn_scheduler', 'using_sigma_t_n_wo_z']), default='using_sigma_t_n', show_default=True)
 
 # Validation params
 @click.option('--validation_interval', help='How often to run validation. If -1, no validation will be run', metavar='tick', type=click.IntRange(min=-1), default=50, show_default=True)

@@ -208,9 +208,17 @@ class EDMLoss_with_scheduler:
         n_f64 = torch.randn_like(y_f64, dtype=torch.float64) * torch.sqrt(diff_sq)
 
         noisy_input_f64 = (y_f64 + n_f64) * padding_mask
+        scheduler_mode = getattr(net, 'scheduler_mode', getattr(getattr(net, 'module', None), 'scheduler_mode', None))
         is_classes = (hasattr(net, 'model') and getattr(net.model, 'label_type', None) == 'classes') or (hasattr(net, 'module') and hasattr(net.module, 'model') and getattr(net.module.model, 'label_type', None) == 'classes')
-        class_labels_to_pass = z if (labels is None or is_classes or (isinstance(labels, torch.Tensor) and labels.ndim >= 2 and labels.shape[-1] == 0)) else labels
-        x0_pred = net(noisy_input_f64, sigma_f64, class_labels=class_labels_to_pass, augment_labels=augment_labels, z=z).to(torch.float64)
+        
+        if scheduler_mode == 'using_sigma_t_n_wo_z':
+            class_labels_to_pass = labels
+            z_to_pass = None
+        else:
+            class_labels_to_pass = z if (labels is None or is_classes or (isinstance(labels, torch.Tensor) and labels.ndim >= 2 and labels.shape[-1] == 0)) else labels
+            z_to_pass = z
+
+        x0_pred = net(noisy_input_f64, sigma_f64, class_labels=class_labels_to_pass, augment_labels=augment_labels, z=z_to_pass).to(torch.float64)
         # make it xtn prediction
 
         # sigma가 0으로 남아있는걸 제거해서 nan 생성 방지
@@ -284,7 +292,12 @@ class EDMLoss_with_scheduler:
                 'current_sigma': c_current_sigma_f64,
             }
 
-            c_class_labels_to_pass = c_z if (c_labels_orig is None or is_classes or (isinstance(c_labels_orig, torch.Tensor) and c_labels_orig.ndim >= 2 and c_labels_orig.shape[-1] == 0)) else c_labels_orig
+            if scheduler_mode == 'using_sigma_t_n_wo_z':
+                c_class_labels_to_pass = c_labels_orig
+                c_z_to_pass = None
+            else:
+                c_class_labels_to_pass = c_z if (c_labels_orig is None or is_classes or (isinstance(c_labels_orig, torch.Tensor) and c_labels_orig.ndim >= 2 and c_labels_orig.shape[-1] == 0)) else c_labels_orig
+                c_z_to_pass = c_z
 
             # run sampler from sigma -> new_sigma
             with torch.no_grad() if not self.with_grad else torch.enable_grad():
@@ -294,7 +307,7 @@ class EDMLoss_with_scheduler:
                     noise_schedule_dict=consistency_noise_schedule_dict, new_sigma_ref=c_new_sigma_ref_f64
                 ).to(torch.float64)
             # get predictions for x_t_prime
-            x0_pred_prime = net(x_t_prime, c_new_sigma_f64, class_labels=c_class_labels_to_pass, z=c_z).to(torch.float64)
+            x0_pred_prime = net(x_t_prime, c_new_sigma_f64, class_labels=c_class_labels_to_pass, z=c_z_to_pass).to(torch.float64)
             # group together predictions
             x0_pred_prime = x0_pred_prime.reshape(consistency_batch_size, self.num_primes, *x0_pred_prime.shape[1:])
             # average predictions

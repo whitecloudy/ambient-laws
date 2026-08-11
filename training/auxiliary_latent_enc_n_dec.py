@@ -209,7 +209,7 @@ class noise_decoder(nn.Module):
             output_len *= dim
         self.output_len = output_len
 
-        if self.scheduler_mode == 'using_sigma_t_n':
+        if self.scheduler_mode in ['using_sigma_t_n', 'using_sigma_t_n_wo_z']:
             m_encoder_output_len = cnn_dim//2 * inout_dim[1] * inout_dim[2]
             
             # 잠재 변수 z를 받아 다항식 계수를 생성하는 2-layer MLP
@@ -275,7 +275,7 @@ class noise_decoder(nn.Module):
         
         z = z.to(dtype=dec_dtype)
 
-        if scheduler_mode == 'using_sigma_t_n':
+        if scheduler_mode in ['using_sigma_t_n', 'using_sigma_t_n_wo_z']:
             h, w = self.inout_dim[1], self.inout_dim[2]
             z_encoded = self.m_encoder(z)
             z_encoded = z_encoded.reshape(batch_size, self.cnn_dim // 2, h, w)

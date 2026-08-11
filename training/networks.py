@@ -1564,7 +1564,7 @@ class EDMPrecond_with_scheduler(EDMPrecond):
         self.scheduler_mode = scheduler_mode
 
         if 'label_type' in model_kwargs and model_kwargs['label_type'] == 'classes' and label_dim == 0:
-            if getattr(self, 'scheduler_mode', 'no_nn_scheduler') != 'no_nn_scheduler':
+            if getattr(self, 'scheduler_mode', 'no_nn_scheduler') not in ['no_nn_scheduler', 'using_sigma_t_n_wo_z']:
                 label_dim = m
         super().__init__(img_resolution=img_resolution, img_channels=img_channels, label_dim=label_dim,
                          use_fp16=use_fp16, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data,
@@ -1597,8 +1597,14 @@ class EDMPrecond_with_scheduler(EDMPrecond):
                 self.noise_scheduler.noise_decoder.to(torch.bfloat16)
 
     def forward(self, x: torch.Tensor, sigma: torch.Tensor, class_labels=None, force_fp32=False, z=None, **model_kwargs):
-        if class_labels is None and z is not None:
-            class_labels = z
+        mode = getattr(self, 'scheduler_mode', 'no_nn_scheduler')
+        if mode == 'using_sigma_t_n_wo_z':
+            z = None
+            if class_labels is not None and isinstance(class_labels, torch.Tensor) and class_labels.shape[-1] == self.m:
+                class_labels = None
+        else:
+            if class_labels is None and z is not None:
+                class_labels = z
         return super().forward(x, sigma, class_labels=class_labels, force_fp32=force_fp32, **model_kwargs)
 
     def generate_latent_z(self, x_t_n, sigma_t_n=None, force_fp32=False):
