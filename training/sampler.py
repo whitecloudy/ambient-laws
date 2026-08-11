@@ -143,6 +143,220 @@ def edm_sampler_with_scheduler(
 
 
 #----------------------------------------------------------------------------
+# Proposed EDM sampler with Noise Scheduler.
+
+def inference_edm_sampler_with_scheduler(
+    net, latents, class_labels=None, randn_like=torch.randn_like,
+    num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    stop_sigma=0.0, latents_already_noisy=False, padding_mask=1,
+    sigma_t_n=None, z=None,
+):
+    batch_size = latents.shape[0]
+    device = latents.device
+
+    if isinstance(padding_mask, float) and padding_mask == 1:
+        padding_exist = False
+    else:
+        padding_exist = True
+
+    padding_mask = torch.as_tensor(padding_mask, device=device)
+
+    get_noise_scheduling_fn = _get_net_attr(net, "get_noise_scheduling")
+    generate_latent_z_fn = _get_net_attr(net, "generate_latent_z")
+
+    # Adjust noise levels based on what's supported by the network.
+    net_sigma_max = getattr(net, 'sigma_max', 80)
+    net_sigma_min = getattr(net, 'sigma_min', 0.002)
+
+    raw_sigma_max = torch.clamp(sigma_max, max=net_sigma_max) if isinstance(sigma_max, torch.Tensor) else min(sigma_max, net_sigma_max)
+    raw_sigma_min = torch.clamp(sigma_min, min=net_sigma_min) if isinstance(sigma_min, torch.Tensor) else max(sigma_min, net_sigma_min)
+
+    if isinstance(raw_sigma_max, torch.Tensor):
+        sigma_max = raw_sigma_max.unsqueeze(0).to(device)
+        sigma_max = sigma_max.expand([num_steps] + ([-1] * (len(sigma_max.shape) - 1)))
+    else:
+        sigma_max = raw_sigma_max
+        
+    if isinstance(raw_sigma_min, torch.Tensor):
+        sigma_min = raw_sigma_min.unsqueeze(0).to(device)
+        sigma_min = sigma_min.expand([num_steps] + ([-1] * (len(sigma_min.shape) - 1)))
+    else:
+        sigma_min = raw_sigma_min
+
+    # Determine sigma_t_n input:
+    # latents_already_noisy == False -> sigma_min
+    # latents_already_noisy == True -> initial latents' sigma_t_n (passed sigma_t_n or sigma_max)
+    if not latents_already_noisy:
+        sigma_t_n_input = raw_sigma_min
+    else:
+        if sigma_t_n is not None:
+            sigma_t_n_input = sigma_t_n
+        else:
+            sigma_t_n_input = raw_sigma_max
+
+    if not isinstance(sigma_t_n_input, torch.Tensor):
+        sigma_t_n_tensor = torch.full((batch_size,), float(sigma_t_n_input), device=device, dtype=latents.dtype)
+    else:
+        sigma_t_n_tensor = sigma_t_n_input.to(device=device, dtype=latents.dtype)
+        if sigma_t_n_tensor.ndim == 0:
+            sigma_t_n_tensor = sigma_t_n_tensor.unsqueeze(0).expand(batch_size)
+    while sigma_t_n_tensor.ndim < latents.ndim:
+        sigma_t_n_tensor = sigma_t_n_tensor.unsqueeze(-1)
+    sigma_t_n_tensor = sigma_t_n_tensor.expand_as(latents)
+
+    # Determine z input:
+    # latents_already_noisy == False -> generated randomly inside net (z=None)
+    # latents_already_noisy == True -> generated from initial latent input via net encoder
+    if z is None:
+        if latents_already_noisy:
+            if generate_latent_z_fn is not None:
+                z_input, _ = generate_latent_z_fn(latents, sigma_t_n_tensor)
+            else:
+                z_input = None
+        else:
+            z_input = None
+    else:
+        z_input = z
+
+    x_list = []
+
+    # Time step discretization in reference space.
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
+    step_indices = fit_shape(step_indices, sigma_max)
+    step_indices = fit_shape(step_indices, sigma_min)
+    t_ref_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    
+    round_sigma_fn = _get_net_attr(net, "round_sigma")
+    if round_sigma_fn is not None:
+        t_ref_steps = torch.cat([round_sigma_fn(t_ref_steps), torch.zeros_like(t_ref_steps[:1])], dim=0) # t_N = 0
+    else:
+        t_ref_steps = torch.cat([t_ref_steps, torch.zeros_like(t_ref_steps[:1])], dim=0)
+
+    abd = None
+
+    def get_sched_sigma(ref_t):
+        nonlocal abd, z_input
+        if ref_t is None or (isinstance(ref_t, (int, float)) and ref_t == 0) or (isinstance(ref_t, torch.Tensor) and (ref_t == 0).all()):
+            return torch.zeros_like(latents, dtype=torch.float64)
+        
+        if isinstance(ref_t, torch.Tensor):
+            ref_t_in = ref_t.to(dtype=latents.dtype)
+            if ref_t_in.ndim == 0:
+                ref_t_in = ref_t_in.unsqueeze(0).expand(batch_size)
+        else:
+            ref_t_in = torch.full((batch_size,), float(ref_t), device=device, dtype=latents.dtype)
+
+        if get_noise_scheduling_fn is not None:
+            res = get_noise_scheduling_fn(ref_t_in, sigma_t_n_tensor, z=z_input, abd=abd)
+            abd = res.get('abd', abd)
+            if z_input is None and 'latent_z' in res:
+                z_input = res['latent_z']
+            return res['poly_sigma'].to(torch.float64)
+        else:
+            return torch.as_tensor(ref_t, dtype=torch.float64, device=device)
+
+    # Initial latent setup.
+    if latents_already_noisy:
+        x_next = latents.to(torch.float64) * padding_mask
+    else:
+        sigma_0 = get_sched_sigma(t_ref_steps[0])
+        x_next = latents.to(torch.float64) * fit_shape(sigma_0, latents) * padding_mask
+
+    for i in range(num_steps): # 0, ..., N-1
+        x_cur = x_next
+        t_cur_ref = t_ref_steps[i]
+        t_next_ref = t_ref_steps[i+1]
+
+        sigma_cur = get_sched_sigma(t_cur_ref)
+
+        if i == num_steps - 1 or (isinstance(t_next_ref, torch.Tensor) and (t_next_ref == 0).all()) or (not isinstance(t_next_ref, torch.Tensor) and t_next_ref == 0):
+            sigma_next = torch.zeros_like(x_cur)
+        else:
+            sigma_next = get_sched_sigma(t_next_ref)
+
+        # Increase noise temporarily (Churn).
+        if isinstance(t_cur_ref, torch.Tensor) and t_cur_ref.ndim > 0:
+            gamma_val = min(S_churn / num_steps, np.sqrt(2) - 1)
+            gamma = torch.where(
+                (t_cur_ref >= S_min) & (t_cur_ref <= S_max),
+                torch.tensor(gamma_val, device=t_cur_ref.device, dtype=t_cur_ref.dtype),
+                torch.tensor(0.0, device=t_cur_ref.device, dtype=t_cur_ref.dtype)
+            )
+        else:
+            gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur_ref <= S_max else 0
+
+        t_hat_ref = t_cur_ref + gamma * t_cur_ref
+        if round_sigma_fn is not None:
+            t_hat_ref = round_sigma_fn(t_hat_ref)
+
+        sigma_hat = get_sched_sigma(t_hat_ref)
+
+        step_noise_scale = (sigma_hat ** 2 - sigma_cur ** 2).clamp(min=0).sqrt()
+        step_noise_scale = fit_shape(step_noise_scale, x_cur)
+
+        if isinstance(step_noise_scale, torch.Tensor) and step_noise_scale.shape != x_cur.shape and padding_exist:
+            pad_width = []
+            for dim_idx in range(x_cur.ndim - 1, -1, -1):
+                if step_noise_scale.shape[dim_idx] == 1 or step_noise_scale.shape[dim_idx] == x_cur.shape[dim_idx]:
+                    pad_width.extend([0, 0])
+                else:
+                    pad_width.extend([0, max(0, x_cur.shape[dim_idx] - step_noise_scale.shape[dim_idx])])
+            step_noise_scale = torch.nn.functional.pad(step_noise_scale, tuple(pad_width))
+        x_hat = (x_cur + step_noise_scale * S_noise * randn_like(x_cur)) * padding_mask
+
+        # Euler step.
+        class_labels_to_pass = z_input if class_labels is None else class_labels
+        denoised = net(x_hat, sigma_hat, class_labels=class_labels_to_pass, z=z_input).to(torch.float64) * padding_mask
+        x_list.append(denoised.clone().detach())
+
+        # Stop if variance is below threshold.
+        if isinstance(t_next_ref, torch.Tensor) and t_next_ref.ndim > 0:
+            if (t_next_ref < stop_sigma).all():
+                return denoised, x_list
+        else:
+            if t_next_ref < stop_sigma:
+                return denoised, x_list
+
+        safe_sigma_hat = torch.where(sigma_hat == 0, torch.tensor(1e-8, device=sigma_hat.device, dtype=sigma_hat.dtype), sigma_hat)
+        d_cur = (x_hat - denoised) / fit_shape(safe_sigma_hat, x_cur)
+        step_noise_scale = fit_shape(sigma_next - sigma_hat, x_cur)
+        if isinstance(step_noise_scale, torch.Tensor) and step_noise_scale.shape != x_cur.shape and padding_exist:
+            pad_width = []
+            for dim_idx in range(x_cur.ndim - 1, -1, -1):
+                if step_noise_scale.shape[dim_idx] == 1 or step_noise_scale.shape[dim_idx] == x_cur.shape[dim_idx]:
+                    pad_width.extend([0, 0])
+                else:
+                    pad_width.extend([0, max(0, x_cur.shape[dim_idx] - step_noise_scale.shape[dim_idx])])
+            step_noise_scale = torch.nn.functional.pad(step_noise_scale, tuple(pad_width))
+
+        x_pred = x_hat + step_noise_scale * d_cur * padding_mask
+
+        # Apply 2nd order correction (Heun).
+        if i < num_steps - 1:
+            denoised_prime = net(x_pred, sigma_next, class_labels=class_labels_to_pass, z=z_input).to(torch.float64) * padding_mask
+            x_list.append(denoised_prime.clone().detach())
+            safe_sigma_next = torch.where(sigma_next == 0, torch.tensor(1e-8, device=sigma_next.device, dtype=sigma_next.dtype), sigma_next)
+            d_prime = (x_pred - denoised_prime) / fit_shape(safe_sigma_next, x_cur)
+
+            step_noise_scale = fit_shape(sigma_next - sigma_hat, x_hat)
+            if isinstance(step_noise_scale, torch.Tensor) and step_noise_scale.shape != x_hat.shape and padding_exist:
+                pad_width = []
+                for dim_idx in range(x_cur.ndim - 1, -1, -1):
+                    if step_noise_scale.shape[dim_idx] == 1 or step_noise_scale.shape[dim_idx] == x_hat.shape[dim_idx]:
+                        pad_width.extend([0, 0])
+                    else:
+                        pad_width.extend([0, max(0, x_hat.shape[dim_idx] - step_noise_scale.shape[dim_idx])])
+                step_noise_scale = torch.nn.functional.pad(step_noise_scale, tuple(pad_width))
+
+            x_next = x_hat + step_noise_scale * (0.5 * d_cur + 0.5 * d_prime)
+        else:
+            x_next = x_pred
+
+    return x_next, x_list
+
+
+#----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
 
 # Return
@@ -153,7 +367,17 @@ def inference_edm_sampler(
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
     stop_sigma=0.0, latents_already_noisy=False, padding_mask=1,
+    **kwargs
 ):
+    if _get_net_attr(net, "get_noise_scheduling") is not None:
+        return inference_edm_sampler_with_scheduler(
+            net=net, latents=latents, class_labels=class_labels, randn_like=randn_like,
+            num_steps=num_steps, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho,
+            S_churn=S_churn, S_min=S_min, S_max=S_max, S_noise=S_noise,
+            stop_sigma=stop_sigma, latents_already_noisy=latents_already_noisy, padding_mask=padding_mask,
+            **kwargs
+        )
+
     batch_size = latents.shape[0]
     device = latents.device
 
@@ -297,3 +521,4 @@ def inference_edm_sampler(
             x_next = x_pred
 
     return x_next, x_list
+
