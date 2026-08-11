@@ -149,6 +149,42 @@ class TopKDiscreteEncoder(nn.Module):
         return z, kl_loss
 
 class noise_decoder(nn.Module):
+    @property
+    def output_len(self):
+        if 'output_len' in self.__dict__:
+            return self.__dict__['output_len']
+        if '_output_len' in self.__dict__:
+            return self.__dict__['_output_len']
+        inout_dim = getattr(self, 'inout_dim', getattr(self, 'out_dim', [14, 8, 52]))
+        res = 1
+        for dim in inout_dim:
+            res *= dim
+        return res
+
+    @output_len.setter
+    def output_len(self, value):
+        self.__dict__['output_len'] = value
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state['scheduler_mode'] = getattr(self, 'scheduler_mode', 'no_nn_scheduler')
+        state['output_len'] = self.output_len
+        state['inout_dim'] = getattr(self, 'inout_dim', [14, 8, 52])
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if 'scheduler_mode' not in self.__dict__:
+            self.scheduler_mode = 'no_nn_scheduler'
+        if 'output_len' not in self.__dict__:
+            inout_dim = getattr(self, 'inout_dim', getattr(self, 'out_dim', [14, 8, 52]))
+            res = 1
+            for d in inout_dim:
+                res *= d
+            self.output_len = res
+        if 'inout_dim' not in self.__dict__:
+            self.inout_dim = getattr(self, 'out_dim', [14, 8, 52])
+
     def __init__(self, m=50, inout_dim=[14,8,52], mlp_hidden_dim=None, cnn_dim=32, a_amp=4.0, b_amp=4.0, d_amp=2.0, scheduler_mode='using_sigma_t_n'):
         super().__init__()
         self.m = m
@@ -214,7 +250,8 @@ class noise_decoder(nn.Module):
         self.apply(_init_weights)
 
     def forward(self, z=None, sigma_t_n=None):
-        if self.scheduler_mode == 'no_nn_scheduler':
+        scheduler_mode = getattr(self, 'scheduler_mode', 'no_nn_scheduler')
+        if scheduler_mode == 'no_nn_scheduler':
             if z is not None:
                 batch_size = z.size(0)
                 device = z.device
@@ -238,7 +275,7 @@ class noise_decoder(nn.Module):
         
         z = z.to(dtype=dec_dtype)
 
-        if self.scheduler_mode == 'using_sigma_t_n':
+        if scheduler_mode == 'using_sigma_t_n':
             h, w = self.inout_dim[1], self.inout_dim[2]
             z_encoded = self.m_encoder(z)
             z_encoded = z_encoded.reshape(batch_size, self.cnn_dim // 2, h, w)
@@ -263,18 +300,40 @@ class noise_decoder(nn.Module):
             a = (torch.sigmoid(a.reshape(batch_size, -1)) - 0.5) * self.a_amp
             b = (torch.sigmoid(b.reshape(batch_size, -1)) - 0.5) * self.b_amp
             d = (torch.sigmoid(d.reshape(batch_size, -1)) - 0.5) * self.d_amp + 1.0 
-        elif self.scheduler_mode == 'no_sigma_t_n':
+        elif scheduler_mode == 'no_sigma_t_n':
             noise_pred = self.m_encoder(z)
             a, b, d = torch.chunk(noise_pred, 3, dim=-1)
 
             a = (torch.sigmoid(a) - 0.5) * self.a_amp
             b = (torch.sigmoid(b) - 0.5) * self.b_amp
             d = (torch.sigmoid(d) - 0.5) * self.d_amp + 1.0
+        else:
+            raise ValueError(f"Unknown scheduler_mode: {scheduler_mode}")
 
         return a, b, d
 
         
 class PolynomialNoiseScheduler(nn.Module):
+    @property
+    def scheduler_mode(self):
+        return getattr(self, '_scheduler_mode', self.__dict__.get('scheduler_mode', 'no_nn_scheduler'))
+
+    @scheduler_mode.setter
+    def scheduler_mode(self, value):
+        self._scheduler_mode = value
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state['scheduler_mode'] = getattr(self, 'scheduler_mode', 'no_nn_scheduler')
+        state['out_dim'] = getattr(self, 'out_dim', [14, 8, 52])
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if 'scheduler_mode' not in self.__dict__:
+            self.scheduler_mode = 'no_nn_scheduler'
+        if 'out_dim' not in self.__dict__:
+            self.out_dim = [14, 8, 52]
     def __init__(self, m=50, out_dim=[14,8,52], sigma_max=80, sigma_min=0.002, rho=1, mlp_hidden_dim=None, cnn_dim=32, scheduler_mode='using_sigma_t_n'):
         super().__init__()
         self.m = m

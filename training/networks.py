@@ -1525,6 +1525,24 @@ from training.auxiliary_latent_enc_n_dec import PolynomialNoiseScheduler, TopKDi
 import torch.nn.functional as F
 @persistence.persistent_class
 class EDMPrecond_with_scheduler(EDMPrecond):
+    @property
+    def scheduler_mode(self):
+        return getattr(self, '_scheduler_mode', self.__dict__.get('scheduler_mode', 'no_nn_scheduler'))
+
+    @scheduler_mode.setter
+    def scheduler_mode(self, value):
+        self._scheduler_mode = value
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state['scheduler_mode'] = getattr(self, 'scheduler_mode', 'no_nn_scheduler')
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if 'scheduler_mode' not in self.__dict__:
+            self.scheduler_mode = 'no_nn_scheduler'
+
     def __init__(self,
         img_resolution,                     # Image resolution.
         img_channels,                       # Number of color channels.
@@ -1546,7 +1564,7 @@ class EDMPrecond_with_scheduler(EDMPrecond):
         self.scheduler_mode = scheduler_mode
 
         if 'label_type' in model_kwargs and model_kwargs['label_type'] == 'classes' and label_dim == 0:
-            if self.scheduler_mode != 'no_nn_scheduler':
+            if getattr(self, 'scheduler_mode', 'no_nn_scheduler') != 'no_nn_scheduler':
                 label_dim = m
         super().__init__(img_resolution=img_resolution, img_channels=img_channels, label_dim=label_dim,
                          use_fp16=use_fp16, sigma_min=sigma_min, sigma_max=sigma_max, sigma_data=sigma_data,
@@ -1564,7 +1582,7 @@ class EDMPrecond_with_scheduler(EDMPrecond):
 
         self.noise_scheduler = PolynomialNoiseScheduler(m=m, out_dim=data_shape, sigma_max=sigma_max, sigma_min=sigma_min, rho=rho, scheduler_mode=self.scheduler_mode)
 
-        if self.scheduler_mode == 'no_nn_scheduler':
+        if getattr(self, 'scheduler_mode', 'no_nn_scheduler') == 'no_nn_scheduler':
             self.latent_encoder = None
         else:
             if latent_encoder is not None:
@@ -1584,7 +1602,7 @@ class EDMPrecond_with_scheduler(EDMPrecond):
         return super().forward(x, sigma, class_labels=class_labels, force_fp32=force_fp32, **model_kwargs)
 
     def generate_latent_z(self, x_t_n, sigma_t_n=None, force_fp32=False):
-        if self.scheduler_mode == 'no_nn_scheduler':
+        if getattr(self, 'scheduler_mode', 'no_nn_scheduler') == 'no_nn_scheduler':
             return None, torch.tensor(0.0)
 
         dtype = torch.bfloat16 if (self.use_fp16 and not force_fp32 and x_t_n.device.type == 'cuda') else (x_t_n.dtype if x_t_n.is_floating_point() else torch.float32)
@@ -1607,7 +1625,7 @@ class EDMPrecond_with_scheduler(EDMPrecond):
             self.noise_scheduler.noise_decoder.to(dtype=dtype)
         batch_size = sigma.shape[0]
 
-        if self.scheduler_mode == 'no_nn_scheduler':
+        if getattr(self, 'scheduler_mode', 'no_nn_scheduler') == 'no_nn_scheduler':
             z = None
         else:
             # make random z, top k if z is None
