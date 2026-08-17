@@ -1610,7 +1610,7 @@ class EDMPrecond_with_scheduler(EDMPrecond):
                 class_labels = z
         return super().forward(x, sigma, class_labels=class_labels, force_fp32=force_fp32, **model_kwargs)
 
-    def generate_latent_z(self, x_t_n, sigma_t_n=None, force_fp32=False):
+    def generate_latent_z(self, x_t_n, sigma_t_n=None, force_fp32=False, force_training=False):
         if getattr(self, 'scheduler_mode', 'no_nn_scheduler') == 'no_nn_scheduler':
             return None, torch.tensor(0.0)
 
@@ -1618,7 +1618,7 @@ class EDMPrecond_with_scheduler(EDMPrecond):
         if hasattr(self, 'latent_encoder') and self.latent_encoder is not None:
             self.latent_encoder.to(dtype=dtype)
             x_t_n = x_t_n.to(dtype=dtype)
-            z, kl_loss = self.latent_encoder(x_t_n, is_training=self.training)
+            z, kl_loss = self.latent_encoder(x_t_n, is_training=(self.training or force_training))
             return z, kl_loss
         else:
             batch_size = x_t_n.shape[0]

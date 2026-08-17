@@ -11,6 +11,7 @@
 from numpy import pad
 import numpy as np
 import torch
+import inspect
 from torch_utils import persistence
 import ambient_utils
 from training.sampler import edm_sampler, edm_sampler_with_scheduler, padding_mask_from_original_shape
@@ -194,7 +195,11 @@ class EDMLoss_with_scheduler:
         get_noise_scheduling_fn = _get_net_attr(net, "get_noise_scheduling")
         assert generate_latent_z_fn is not None and get_noise_scheduling_fn is not None, "net must have generate_latent_z and get_noise_scheduling methods in EDMLoss_with_scheduler"
 
-        z, kl_loss = generate_latent_z_fn(images_f64, current_sigma_f64)
+        # generate_latent_z_fn에 force_training이 있는지 체크 후 있으면 Loss method에선 항상 True 전달
+        if 'force_training' in inspect.signature(generate_latent_z_fn).parameters:
+            z, kl_loss = generate_latent_z_fn(images_f64, current_sigma_f64, force_training=True)
+        else:
+            z, kl_loss = generate_latent_z_fn(images_f64, current_sigma_f64)
         noise_schedule_dict = get_noise_scheduling_fn(sigma_ref_f64, current_sigma_f64, z)
         
         # get sigma in data space (float64): 
