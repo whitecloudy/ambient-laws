@@ -241,7 +241,7 @@ class noise_decoder(nn.Module):
                 nn.SiLU(),
                 nn.Linear(self.mlp_hidden_dim, self.output_len * 3)
             )
-        elif self.scheduler_mode == 'no_nn_scheduler':
+        elif self.scheduler_mode in ['no_nn_scheduler', 'no_nn_scheduler_with_z']:
             # z와 sigma_t_n을 사용하지 않고 a=0, b=0, d=1만 출력하는 모드
             pass
         else:
@@ -251,7 +251,7 @@ class noise_decoder(nn.Module):
 
     def forward(self, z=None, sigma_t_n=None):
         scheduler_mode = getattr(self, 'scheduler_mode', 'no_nn_scheduler')
-        if scheduler_mode == 'no_nn_scheduler':
+        if scheduler_mode in ['no_nn_scheduler', 'no_nn_scheduler_with_z']:
             if z is not None:
                 batch_size = z.size(0)
                 device = z.device
