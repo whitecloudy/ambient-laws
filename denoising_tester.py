@@ -3,6 +3,7 @@ import torch
 import click
 import dnnlib
 from torch_utils import distributed as dist
+from torch_utils import save_utils
 import pickle
 import os
 import json
@@ -215,8 +216,8 @@ def main(**kwargs):
     dist.print0(f'Loading network from "{opt.network_pkl}"...')
 
     if "pkl" in opt.network_pkl:
-        with dnnlib.util.open_url(opt.network_pkl, verbose=(dist.get_rank() == 0)) as f:
-            net = pickle.load(f)['ema'].to(device)
+        data = save_utils.load_pkl(opt.network_pkl, verbose=(dist.get_rank() == 0))
+        net = data['ema'].to(device)
         if opt.config_json is not None:
             with open(opt.config_json, "r", encoding="utf-8") as f:
                 train_opts = json.load(f)
@@ -226,6 +227,15 @@ def main(**kwargs):
             dist.print0(f'Loading config from "{config_filepath}"...')
             with open(config_filepath, "r", encoding="utf-8") as f:
                 train_opts = json.load(f)
+
+        # scheduler_mode 복원/설정 (예: using_sigma_t_n)
+        target_mode = train_opts.get('scheduler_mode', 'using_sigma_t_n')
+        net.scheduler_mode = target_mode
+        if hasattr(net, 'noise_scheduler'):
+            net.noise_scheduler.scheduler_mode = target_mode
+            if hasattr(net.noise_scheduler, 'noise_decoder'):
+                net.noise_scheduler.noise_decoder.scheduler_mode = target_mode
+
     else:
         print("non pkl file is not supported yet.")
         exit(1)
@@ -278,6 +288,28 @@ def main(**kwargs):
         'S_noise': opt.S_noise,
     }
     sampler_kwargs = {k: v for k, v in sampler_kwargs.items() if v is not None}
+
+    get_noise_scheduling_fn = getattr(net, 'get_noise_scheduling', getattr(getattr(net, 'module', None), 'get_noise_scheduling', None))
+    generate_latent_z_fn = getattr(net, 'generate_latent_z', getattr(getattr(net, 'module', None), 'generate_latent_z', None))
+    has_noise_scheduler = get_noise_scheduling_fn is not None
+
+    num_snr_steps = ratio_SNR_steps.shape[0]
+    if has_noise_scheduler:
+        a_stats = {'sum': torch.zeros(num_snr_steps, device=device, dtype=torch.float64),
+                   'sq_sum': torch.zeros(num_snr_steps, device=device, dtype=torch.float64),
+                   'min': torch.full((num_snr_steps,), float('inf'), device=device, dtype=torch.float64),
+                   'max': torch.full((num_snr_steps,), float('-inf'), device=device, dtype=torch.float64),
+                   'count': torch.zeros(num_snr_steps, device=device, dtype=torch.int64)}
+        b_stats = {'sum': torch.zeros(num_snr_steps, device=device, dtype=torch.float64),
+                   'sq_sum': torch.zeros(num_snr_steps, device=device, dtype=torch.float64),
+                   'min': torch.full((num_snr_steps,), float('inf'), device=device, dtype=torch.float64),
+                   'max': torch.full((num_snr_steps,), float('-inf'), device=device, dtype=torch.float64),
+                   'count': torch.zeros(num_snr_steps, device=device, dtype=torch.int64)}
+        d_stats = {'sum': torch.zeros(num_snr_steps, device=device, dtype=torch.float64),
+                   'sq_sum': torch.zeros(num_snr_steps, device=device, dtype=torch.float64),
+                   'min': torch.full((num_snr_steps,), float('inf'), device=device, dtype=torch.float64),
+                   'max': torch.full((num_snr_steps,), float('-inf'), device=device, dtype=torch.float64),
+                   'count': torch.zeros(num_snr_steps, device=device, dtype=torch.int64)}
 
     with torch.inference_mode(True):
         predict_SNR_result_sum_dist_list = torch.zeros(ratio_SNR_steps.shape[0], device=device)
@@ -347,6 +379,25 @@ def main(**kwargs):
                 else:
                     padding_mask = 1
 
+                if has_noise_scheduler:
+                    with torch.no_grad():
+                        sigma_t_n_tensor = padded_signal
+                        if generate_latent_z_fn is not None:
+                            z_input, _ = generate_latent_z_fn(padded_signal, input_sigma)
+                        else:
+                            z_input = None
+                        ref_t_in = torch.full((padded_signal.shape[0],), float(opt.sigma_max or getattr(net, 'sigma_max', 80.0)), device=device, dtype=padded_signal.dtype)
+                        res_sched = get_noise_scheduling_fn(ref_t_in, sigma_t_n_tensor, z=z_input)
+                        if 'abd' in res_sched and res_sched['abd'] is not None:
+                            a_val, b_val, d_val = res_sched['abd']
+                            for val, stat in [(a_val, a_stats), (b_val, b_stats), (d_val, d_stats)]:
+                                val_f64 = val.detach().to(torch.float64)
+                                stat['sum'][idx] += torch.sum(val_f64)
+                                stat['sq_sum'][idx] += torch.sum(val_f64 ** 2)
+                                stat['min'][idx] = torch.minimum(stat['min'][idx], torch.min(val_f64))
+                                stat['max'][idx] = torch.maximum(stat['max'][idx], torch.max(val_f64))
+                                stat['count'][idx] += val_f64.numel()
+
                 denoised_signal, _ =edm_sampler(
                                                     net, 
                                                     latents=padded_signal, 
@@ -374,6 +425,14 @@ def main(**kwargs):
 
         torch.distributed.gather(predict_SNR_result_sum_dist_list, gather_list=collect_predict_SNR_sum_list, dst=0)
 
+        if has_noise_scheduler:
+            for stat in [a_stats, b_stats, d_stats]:
+                torch.distributed.all_reduce(stat['sum'], op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(stat['sq_sum'], op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(stat['min'], op=torch.distributed.ReduceOp.MIN)
+                torch.distributed.all_reduce(stat['max'], op=torch.distributed.ReduceOp.MAX)
+                torch.distributed.all_reduce(stat['count'], op=torch.distributed.ReduceOp.SUM)
+
         predict_SNR_result_dict = []
 
         if dist.get_rank() == 0:
@@ -383,9 +442,45 @@ def main(**kwargs):
             dist.print0("\n=== Denoising Test Results ===")
             for idx, snr_db in enumerate(SNR_steps):
                 mean_snr_ratio = total_predict_SNR_sum[idx] / test_dataset_size
+                out_snr_db = ratio_to_dB(mean_snr_ratio.item())
                 
-                predict_SNR_result_dict.append({"Input SNR": snr_db, "Output SNR": ratio_to_dB(mean_snr_ratio.item())})
-                dist.print0(f"Input SNR: {snr_db:>5.1f} dB  ->  Mean Output SNR (Ratio): {dB_to_ratio(predict_SNR_result_dict[-1]['Output SNR']):>8.4f} ({predict_SNR_result_dict[-1]['Output SNR']:>7.4f} dB)")
+                res_dict = {
+                    "Input SNR": snr_db, 
+                    "Output SNR": out_snr_db
+                }
+                
+                dist.print0(f"Input SNR: {snr_db:>5.1f} dB  ->  Mean Output SNR (Ratio): {dB_to_ratio(out_snr_db):>8.4f} ({out_snr_db:>7.4f} dB)")
+                
+                if has_noise_scheduler:
+                    a_cnt = a_stats['count'][idx].item()
+                    if a_cnt > 0:
+                        a_m = (a_stats['sum'][idx] / a_cnt).item()
+                        a_s = torch.sqrt(torch.clamp(a_stats['sq_sum'][idx] / a_cnt - a_m**2, min=0)).item()
+                        a_min_v = a_stats['min'][idx].item()
+                        a_max_v = a_stats['max'][idx].item()
+                        
+                        b_cnt = b_stats['count'][idx].item()
+                        b_m = (b_stats['sum'][idx] / b_cnt).item()
+                        b_s = torch.sqrt(torch.clamp(b_stats['sq_sum'][idx] / b_cnt - b_m**2, min=0)).item()
+                        b_min_v = b_stats['min'][idx].item()
+                        b_max_v = b_stats['max'][idx].item()
+
+                        d_cnt = d_stats['count'][idx].item()
+                        d_m = (d_stats['sum'][idx] / d_cnt).item()
+                        d_s = torch.sqrt(torch.clamp(d_stats['sq_sum'][idx] / d_cnt - d_m**2, min=0)).item()
+                        d_min_v = d_stats['min'][idx].item()
+                        d_max_v = d_stats['max'][idx].item()
+
+                        res_dict.update({
+                            "a_mean": a_m, "a_std": a_s, "a_min": a_min_v, "a_max": a_max_v,
+                            "b_mean": b_m, "b_std": b_s, "b_min": b_min_v, "b_max": b_max_v,
+                            "d_mean": d_m, "d_std": d_s, "d_min": d_min_v, "d_max": d_max_v,
+                        })
+                        dist.print0(f"  └─ Noise Sched (a): mean={a_m:>7.4f}, std={a_s:>7.4f}, min={a_min_v:>7.4f}, max={a_max_v:>7.4f}")
+                        dist.print0(f"  └─ Noise Sched (b): mean={b_m:>7.4f}, std={b_s:>7.4f}, min={b_min_v:>7.4f}, max={b_max_v:>7.4f}")
+                        dist.print0(f"  └─ Noise Sched (d): mean={d_m:>7.4f}, std={d_s:>7.4f}, min={d_min_v:>7.4f}, max={d_max_v:>7.4f}")
+
+                predict_SNR_result_dict.append(res_dict)
 
         
         if dist.get_rank() == 0:

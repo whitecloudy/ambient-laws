@@ -21,6 +21,7 @@ import tqdm
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
+from torch_utils import save_utils
 import ambient_utils
 import wandb
 import tempfile
@@ -48,7 +49,7 @@ def _mp_save_training_state(net_state, opt_state, nimg, cache_net, path, remove_
     cpu_net.load_state_dict(net_state)
     
     # 3. 디스크 직렬화 (이 작업은 완벽히 독립된 프로세스에서 실행되므로 GIL에 영향을 주지 않음)
-    torch.save(dict(net=cpu_net, optimizer_state=opt_state, nimg=nimg), path)
+    save_utils.save_pt(dict(net=cpu_net, optimizer_state=opt_state, nimg=nimg), path)
 
     # 4. 저장이 완료된 후 이전 파일 삭제
     if remove_path is not None and os.path.exists(remove_path):
@@ -127,8 +128,7 @@ def _mp_save_network_snapshot(safe_data, tensor_states, cache, path, remove_path
         # 3. 최종 저장 딕셔너리에 삽입
         final_dict[k] = cpu_model
             
-    with open(path, 'wb') as f:
-        pickle.dump(final_dict, f)
+    save_utils.save_pkl(final_dict, path)
     
     # 저장이 완료된 후 이전 파일 삭제
     if remove_path is not None and os.path.exists(remove_path):
@@ -371,8 +371,7 @@ def training_loop(
     if resume_pkl is not None:
         dist.print0(f'Loading network weights from "{resume_pkl}"...')
         if dist.get_rank() == 0:
-            with dnnlib.util.open_url(resume_pkl, verbose=True) as f:
-                data = pickle.load(f)
+            data = save_utils.load_pkl(resume_pkl, verbose=True)
             misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=False)
             del data # conserve memory
         
@@ -381,7 +380,7 @@ def training_loop(
                 torch.distributed.broadcast(param, src=0)
     if resume_state_dump:
         dist.print0(f'Loading training state from "{resume_state_dump}"...')
-        data = torch.load(resume_state_dump, map_location=torch.device('cpu'), weights_only=False)
+        data = save_utils.load_pt(resume_state_dump, map_location=torch.device('cpu'), weights_only=False)
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
         if 'nimg' in data:

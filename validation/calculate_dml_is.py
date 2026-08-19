@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import torch_utils.distributed as dist
+import torch_utils.save_utils as save_utils
 
 # ==========================================
 # 🚀 1D ResNet Model Architecture (Self-contained)
@@ -195,12 +196,12 @@ class DMLInceptionScoreCalculator:
         try:
             model = resnet18_mutual()
             if os.path.exists(self.weight_path):
-                model.load_state_dict(torch.load(self.weight_path, map_location='cpu'))
+                model.load_state_dict(save_utils.load_pt(self.weight_path, map_location='cpu'))
                 dist.print0(f"Loaded default weights from {self.weight_path}")
             else:
                 check_weight_file(os.path.dirname(self.weight_path))
                 if os.path.exists(self.weight_path):
-                    model.load_state_dict(torch.load(self.weight_path, map_location='cpu'))
+                    model.load_state_dict(save_utils.load_pt(self.weight_path, map_location='cpu'))
                     dist.print0(f"Downloaded and loaded default weights from {self.weight_path}")
                 else:
                     raise FileNotFoundError(f"Default weight file '{self.weight_path}' could not be loaded.")

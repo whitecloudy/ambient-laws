@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import dnnlib
 from torch_utils import distributed as dist
+from torch_utils import save_utils
 import joblib
 from huggingface_hub import hf_hub_download
 import json
@@ -296,8 +297,8 @@ def main(task, network_pkl, outdir, subdirs, seeds, data_norm, class_idx, max_ba
     dist.print0(f'Loading network from "{network_pkl}"...')
 
     if "pkl" in network_pkl:
-        with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
-            net = pickle.load(f)['ema'].to(device)
+        data = save_utils.load_pkl(network_pkl, verbose=(dist.get_rank() == 0))
+        net = data['ema'].to(device)
     else:
         net = load_hf_checkpoint(network_pkl).to(device)
 

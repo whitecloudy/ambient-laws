@@ -18,6 +18,7 @@ import torch
 import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
+from torch_utils import save_utils
 import joblib
 from huggingface_hub import hf_hub_download
 from training.dataset import renewRfProcessedDataset,  pad_collate_fn
@@ -368,8 +369,8 @@ def main(network_pkl, config_json, subdirs, flip_dataset, seed, max_batch_size, 
     dist.print0(f'Loading network from "{network_pkl}"...')
 
     if "pkl" in network_pkl:
-        with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
-            net = pickle.load(f)['ema'].to(device)
+        data = save_utils.load_pkl(network_pkl, verbose=(dist.get_rank() == 0))
+        net = data['ema'].to(device)
         if config_json is not None:
             with open(config_json, "r", encoding="utf-8") as f:
                 opts = json.load(f)
