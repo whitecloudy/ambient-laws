@@ -167,6 +167,8 @@ def parse_int_list(s):
 
 @click.option('--noise_type',               help='Noise distribution type',     metavar='static|dynamic|boosted',   type=click.Choice(['static', 'dynamic', 'boosted']), default='static', show_default=True)
 
+@click.option('--force_no_nn_scheduler',    help='Force noise scheduling to operate in no_nn_scheduler mode (a=0, b=0, d=1) even if model has noise_scheduler', is_flag=True)
+@click.option('--scheduler_mode',            help='Override scheduler mode for the network', metavar='STR',          type=str, default=None, show_default=True)
 @click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
 @click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
@@ -229,12 +231,27 @@ def main(**kwargs):
                 train_opts = json.load(f)
 
         # scheduler_mode 복원/설정 (예: using_sigma_t_n)
-        target_mode = train_opts.get('scheduler_mode', 'using_sigma_t_n')
+        target_mode = opt.scheduler_mode if opt.scheduler_mode is not None else train_opts.get('scheduler_mode', 'using_sigma_t_n')
         net.scheduler_mode = target_mode
         if hasattr(net, 'noise_scheduler'):
             net.noise_scheduler.scheduler_mode = target_mode
             if hasattr(net.noise_scheduler, 'noise_decoder'):
                 net.noise_scheduler.noise_decoder.scheduler_mode = target_mode
+        elif hasattr(getattr(net, 'module', None), 'noise_scheduler'):
+            net.module.noise_scheduler.scheduler_mode = target_mode
+            if hasattr(net.module.noise_scheduler, 'noise_decoder'):
+                net.module.noise_scheduler.noise_decoder.scheduler_mode = target_mode
+
+        if opt.force_no_nn_scheduler:
+            dist.print0('Forcing noise scheduler to "no_nn_scheduler" mode for noise scheduling.')
+            if hasattr(net, 'noise_scheduler'):
+                net.noise_scheduler.scheduler_mode = 'no_nn_scheduler'
+                if hasattr(net.noise_scheduler, 'noise_decoder'):
+                    net.noise_scheduler.noise_decoder.scheduler_mode = 'no_nn_scheduler'
+            elif hasattr(getattr(net, 'module', None), 'noise_scheduler'):
+                net.module.noise_scheduler.scheduler_mode = 'no_nn_scheduler'
+                if hasattr(net.module.noise_scheduler, 'noise_decoder'):
+                    net.module.noise_scheduler.noise_decoder.scheduler_mode = 'no_nn_scheduler'
 
     else:
         print("non pkl file is not supported yet.")

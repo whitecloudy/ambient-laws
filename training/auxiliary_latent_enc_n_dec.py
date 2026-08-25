@@ -367,11 +367,12 @@ class PolynomialNoiseScheduler(nn.Module):
             sigma_t_n_mean = torch.sqrt(torch.mean(sigma_t_n_f64 ** 2, dim=list(range(1, sigma_t_n_f64.ndim))))
         else:
             sigma_t_n_mean = sigma_t_n_f64.abs()
-        sigma_t_n_mean_rho = sigma_t_n_mean ** (1 / self.rho)
+        sigma_t_n_mean_clamped = torch.clamp(sigma_t_n_mean, min=self.sigma_min, max=self.sigma_max)
+        sigma_t_n_mean_rho = sigma_t_n_mean_clamped ** (1 / self.rho)
 
         tau_n = (self.sigma_max_rho - sigma_t_n_mean_rho) / (self.sigma_max_rho - self.sigma_min_rho)
 
-        return tau_n
+        return torch.clamp(tau_n, min=0.0, max=1.0)
 
     def __compute_coefficients(self, z, sigma_t_n):
         a, b, d = self.noise_decoder(z, sigma_t_n) # 각각 [B, output_len]
@@ -395,7 +396,7 @@ class PolynomialNoiseScheduler(nn.Module):
         d_f64 = abd[2].to(torch.float64)
         t_f64 = t.to(torch.float64)
         tau_n_f64 = tau_n.to(torch.float64)
-        sigma_t_n_f64 = sigma_t_n.to(torch.float64)
+        sigma_t_n_f64 = torch.clamp(sigma_t_n.to(torch.float64), min=self.sigma_min, max=self.sigma_max)
 
         f_t = self.__compute_f(a_f64, b_f64, d_f64, t_f64)
         f_tau = self.__compute_f(a_f64, b_f64, d_f64, tau_n_f64)
