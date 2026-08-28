@@ -568,6 +568,9 @@ def training_loop(
                                 else:
                                     val_original_shape = None
 
+                                if (loss_kwargs.class_name != 'training.loss.EDMLoss_boosted_sigma') and no_asm:
+                                    val_current_sigma = torch.zeros_like(val_current_sigma)
+
                                 val_loss_out = loss_fn(net=ema, images=val_images, labels=val_labels, current_sigma=val_current_sigma, augment_pipe=None, original_shape=val_original_shape)
                                 if len(val_loss_out) == 4:
                                     val_loss, _, _, val_kl_loss = val_loss_out
