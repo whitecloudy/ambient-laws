@@ -239,6 +239,8 @@ class noise_decoder(nn.Module):
             self.m_encoder = nn.Sequential(
                 nn.Linear(m, self.mlp_hidden_dim),
                 nn.SiLU(),
+                nn.Linear(self.mlp_hidden_dim, self.mlp_hidden_dim),
+                nn.SiLU(),
                 nn.Linear(self.mlp_hidden_dim, self.output_len * 3)
             )
         elif self.scheduler_mode in ['no_nn_scheduler', 'no_nn_scheduler_with_z']:
