@@ -57,6 +57,9 @@ class EDMLoss:
             padding_mask = torch.ones_like(images)
 
         current_sigma = current_sigma * padding_mask
+
+        if self.no_asm:
+            current_sigma = torch.zeros_like(current_sigma)
         
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
@@ -174,6 +177,10 @@ class EDMLoss_with_scheduler:
         else:
             padding_mask = torch.ones_like(images)
 
+        orig_current_sigma_f64 = current_sigma_f64
+        if self.no_asm:
+            current_sigma_f64 = torch.zeros_like(current_sigma_f64)
+
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device, dtype=torch.float64)
         # sample a sigma in reference space
         sigma_ref_f64 = (rnd_normal * self.P_std + self.P_mean).exp()
@@ -197,9 +204,9 @@ class EDMLoss_with_scheduler:
 
         # generate_latent_z_fn에 force_training이 있는지 체크 후 있으면 Loss method에선 항상 True 전달
         if 'force_training' in inspect.signature(generate_latent_z_fn).parameters:
-            z, kl_loss = generate_latent_z_fn(images_f64, current_sigma_f64, force_training=True)
+            z, kl_loss = generate_latent_z_fn(images_f64, orig_current_sigma_f64, force_training=True)
         else:
-            z, kl_loss = generate_latent_z_fn(images_f64, current_sigma_f64)
+            z, kl_loss = generate_latent_z_fn(images_f64, orig_current_sigma_f64)
         noise_schedule_dict = get_noise_scheduling_fn(sigma_ref_f64, current_sigma_f64, z)
         
         # get sigma in data space (float64): 
@@ -365,6 +372,9 @@ class EDMLoss_loss_scaling_test:
             padding_mask = torch.ones_like(images)
 
         current_sigma = current_sigma * padding_mask
+
+        if self.no_asm:
+            current_sigma = torch.zeros_like(current_sigma)
         
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
@@ -498,6 +508,9 @@ class EDMLoss_dynamic_sigma:
             padding_mask = 1
         
         current_sigma = current_sigma * padding_mask
+
+        if self.no_asm:
+            current_sigma = torch.zeros_like(current_sigma)
         
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
@@ -623,7 +636,7 @@ class EDMLoss_boosted_sigma:
         normalized_current_sigma = (current_sigma / (torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim)), keepdim=True)**0.5)).to(torch.float64).to(images.device)
 
         if self.no_asm:
-            current_sigma = 0.0
+            current_sigma = torch.zeros_like(current_sigma)
         
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
