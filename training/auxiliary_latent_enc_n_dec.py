@@ -237,11 +237,11 @@ class noise_decoder(nn.Module):
         elif self.scheduler_mode == 'no_sigma_t_n':
             # using_sigma_t_n이 False일 때: sigma_t_n을 사용하지 않고 MLP layer로 z만 다룸
             self.m_encoder = nn.Sequential(
-                nn.Linear(m, self.mlp_hidden_dim),
+                nn.Linear(m, self.mlp_hidden_dim//2),
                 nn.SiLU(),
-                nn.Linear(self.mlp_hidden_dim, self.mlp_hidden_dim),
+                nn.Linear(self.mlp_hidden_dim//2, self.mlp_hidden_dim//2),
                 nn.SiLU(),
-                nn.Linear(self.mlp_hidden_dim, self.output_len * 3)
+                nn.Linear(self.mlp_hidden_dim//2, self.output_len * 3)
             )
         elif self.scheduler_mode in ['no_nn_scheduler', 'no_nn_scheduler_with_z']:
             # z와 sigma_t_n을 사용하지 않고 a=0, b=0, d=1만 출력하는 모드
