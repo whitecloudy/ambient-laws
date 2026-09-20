@@ -248,10 +248,10 @@ import ambient_utils
 from glob import glob
 import warnings
 
-def find_npz_files(dir_path : str, recursive=True):
+def find_npz_files(dir_path : str, recursive=True, followlinks=True):
     file_paths = []
     if recursive:
-        for root, dirs, files in os.walk(dir_path):
+        for root, dirs, files in os.walk(dir_path, followlinks=followlinks):
             for file in files:
                 if file.endswith('.npz'):
                     file_paths.append(os.path.join(root, file))
