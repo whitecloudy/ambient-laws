@@ -179,6 +179,7 @@ def parse_int_list(s):
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
 @click.option('--data_norm',               help='Data normalization value for the RF data.',                        type=float, default=1.0, show_default=True)
 @click.option('--allow_tf32',              is_flag=True)
+@click.option('--bf16',                    help='Enable bfloat16 mixed precision for model computation', is_flag=True)
 def main(**kwargs):
     dist.init()
 
@@ -399,12 +400,13 @@ def main(**kwargs):
                 if has_noise_scheduler:
                     with torch.no_grad():
                         sigma_t_n_tensor = padded_signal
-                        if generate_latent_z_fn is not None:
-                            z_input, _ = generate_latent_z_fn(padded_signal, input_sigma)
-                        else:
-                            z_input = None
-                        ref_t_in = torch.full((padded_signal.shape[0],), float(opt.sigma_max or getattr(net, 'sigma_max', 80.0)), device=device, dtype=padded_signal.dtype)
-                        res_sched = get_noise_scheduling_fn(ref_t_in, sigma_t_n_tensor, z=z_input)
+                        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opt.bf16):
+                            if generate_latent_z_fn is not None:
+                                z_input, _ = generate_latent_z_fn(padded_signal, input_sigma)
+                            else:
+                                z_input = None
+                            ref_t_in = torch.full((padded_signal.shape[0],), float(opt.sigma_max or getattr(net, 'sigma_max', 80.0)), device=device, dtype=padded_signal.dtype)
+                            res_sched = get_noise_scheduling_fn(ref_t_in, sigma_t_n_tensor, z=z_input)
                         if 'abd' in res_sched and res_sched['abd'] is not None:
                             a_val, b_val, d_val = res_sched['abd']
                             for val, stat in [(a_val, a_stats), (b_val, b_stats), (d_val, d_stats)]:
@@ -415,18 +417,21 @@ def main(**kwargs):
                                 stat['max'][idx] = torch.maximum(stat['max'][idx], torch.max(val_f64))
                                 stat['count'][idx] += val_f64.numel()
 
-                denoised_signal, _ =edm_sampler(
-                                                    net, 
-                                                    latents=padded_signal, 
-                                                    sigma_max=input_sigma, 
-                                                    padding_mask=padding_mask,
-                                                    latents_already_noisy=True,
-                                                    **sampler_kwargs
-                                                )
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opt.bf16):
+                    denoised_signal, _ =edm_sampler(
+                                                        net, 
+                                                        latents=padded_signal, 
+                                                        sigma_max=input_sigma, 
+                                                        padding_mask=padding_mask,
+                                                        latents_already_noisy=True,
+                                                        **sampler_kwargs
+                                                    )
                 # denoised_signal = padded_signal
                 
                 mask_slice = (slice(0, denoised_signal.shape[0]), )+tuple(slice(0, dim) for dim in original_shape[0])
                 denoised_signal = denoised_signal[mask_slice]
+                
+                denoised_signal = denoised_signal.to(true_signal.dtype)
 
                 denoised_signal = denoised_signal * data_norm
 
