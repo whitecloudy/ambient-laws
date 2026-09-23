@@ -118,6 +118,7 @@ def parse_int_list(s):
 @click.option('--not_dynamic_noise_sigma_model', help='The model used to predict with dynamic noise sigma for each sample.', is_flag=True, default=False)
 @click.option('--noise_mean_alter_way', help='Whether to use alternative way to add noise, which is to directly add noise with the given sigma without multiplying with the clean image.', is_flag=True, default=False)
 @click.option('--only_additive_noise', help='Whether to only use additive noise for corruption without natural noise.', is_flag=True)
+@click.option('--snr_range', help='Target SNR range in dB (e.g. "5,20") for natural noise corruption. Overrides additive_noise_sigma and multiply_noise_sigma if set.', type=str, default=None, show_default=True)
 
 # Consistency params
 @click.option("--consistency_batch_size", help="Batch size for the consistency loss.", type=int, default=32)
@@ -189,9 +190,9 @@ def main(**kwargs):
     else:
         resume_options = None
 
+    wandb_id = None
     if dist.get_rank() == 0 and opts.wandb:
         # If there is resume_options is exist, and we are resuming from a certain checkpoint, then we will load and search for wandb ID. And if it exists, we will resume the wandb run only.
-        wandb_id = None
         if resume_options is not None:
             if 'wandb_id' in resume_options:
                 wandb_id = resume_options['wandb_id']
@@ -217,7 +218,8 @@ def main(**kwargs):
                                         normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
                                         multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, 
                                     noise_mean_alter_way=opts.noise_mean_alter_way,
-                                    noise_mean_flag=not opts.dynamic_noise_sigma)
+                                    noise_mean_flag=not opts.dynamic_noise_sigma,
+                                    snr_range=opts.snr_range)
     elif opts.task == 'WIDAR':
         # dataset_kwargs for WIDAR dataset
         # TMP: 512 to 256 time scale for now to reduce the computational cost.
@@ -226,7 +228,8 @@ def main(**kwargs):
                                     only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=complex_merge_axis,
                                     transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                     normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm)
+                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm,
+                                    snr_range=opts.snr_range)
         # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
         #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
         #                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
@@ -239,11 +242,15 @@ def main(**kwargs):
                                     only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=complex_merge_axis,
                                     transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                     normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm)
+                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm,
+                                    snr_range=opts.snr_range)
 
 
     else:
         raise ValueError(f'Unknown task: {opts.task}')
+
+    if opts.snr_range is not None:
+        dist.print0(f'Using SNR range for natural noise corruption: {opts.snr_range} (additive_noise_sigma and multiply_noise_sigma are ignored)')
         
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=4, persistent_workers=True)
 

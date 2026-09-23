@@ -261,6 +261,21 @@ def find_npz_files(dir_path : str, recursive=True, followlinks=True):
                 file_paths.append(os.path.join(dir_path, file))
     return file_paths
 
+def parse_snr_range(snr_range):
+    if snr_range is None:
+        return None
+    if isinstance(snr_range, str):
+        s = snr_range.strip()
+        if not s or s.lower() == 'none':
+            return None
+        parts = [float(x.strip()) for x in s.split(',')]
+        assert len(parts) == 2, f"snr_range must contain exactly 2 numbers separated by comma (e.g. '5,20'), got '{snr_range}'"
+        return (min(parts), max(parts))
+    if isinstance(snr_range, (tuple, list)):
+        assert len(snr_range) == 2, f"snr_range must contain 2 elements, got {snr_range}"
+        return (float(min(snr_range)), float(max(snr_range)))
+    raise ValueError(f"Unsupported type for snr_range: {type(snr_range)}")
+
 class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
     def __init__(self, 
                  path,                   # Path to files.
@@ -284,8 +299,10 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  use_labels  = False,
                  flip_keep_dataset = False,
                  only_additive_noise = False,
+                 snr_range = None,
                  **super_kwargs):
         self.minimum_sigma = sigma
+        self.snr_range = parse_snr_range(snr_range)
         assert additive_noise_sigma >= 0.0, "additive_noise_sigma must be non-negative"
         self.additive_noise_sigma = additive_noise_sigma
         assert multiply_noise_sigma >= 1.0, "multiply_noise_sigma must be greater than or equal to 1.0"
@@ -404,6 +421,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 only_additive_noise=self.only_additive_noise,
                 image_corruption_seed=self._image_corruption_seed,
                 image_noise_seed=self._image_noise_seed,
+                snr_range=self.snr_range,
             )
         else:
             self.corruption_collate_fn = CorruptionCollateFn(
@@ -413,6 +431,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 only_additive_noise=self.only_additive_noise,
                 image_corruption_seed=self._image_corruption_seed,
                 image_noise_seed=self._image_noise_seed,
+                snr_range=self.snr_range,
             )
         self.noise_mean_collate_fn = NoiseMeanCollateFn(self._noise_mean_flag, self._noise_mean_alter_way)
 
@@ -502,6 +521,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             "noise": np.random.randn(*csi_data.shape),
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
+            'snr_range': self.snr_range,
             'complex_merge_axis': return_complex_merge_axis,
             'axis_name': self._axis_name,
         }
@@ -697,21 +717,28 @@ class ComplexViewCollateFn(object):
 class CorruptionCollateFn(object):
     """
     이미지에 노이즈를 추가하여 손상시키는 Collate Function.
-    additive_noise_sigma와 multiply_noise_sigma를 이용해 노이즈 레벨을 조절합니다.
+    additive_noise_sigma와 multiply_noise_sigma 또는 snr_range를 이용해 노이즈 레벨을 조절합니다.
     """
     def __init__(self, additive_noise_sigma=0.0, multiply_noise_sigma=1.0, 
                  corruption_probability_per_image=0.0, only_additive_noise=False,
-                 image_corruption_seed=112154, image_noise_seed=445481):
+                 image_corruption_seed=112154, image_noise_seed=445481,
+                 snr_range=None):
         self.additive_noise_sigma = additive_noise_sigma
         self.multiply_noise_sigma = multiply_noise_sigma
         self.corruption_probability_per_image = corruption_probability_per_image
         self.only_additive_noise = only_additive_noise
         self._image_corruption_seed = image_corruption_seed
         self._image_noise_seed = image_noise_seed
+        self.snr_range = parse_snr_range(snr_range)
         self.__name__ = "CorruptionCollateFn"
 
     def __call__(self, batch):
-        if not ((self.additive_noise_sigma > 0.0 or self.multiply_noise_sigma > 1.0) and self.corruption_probability_per_image > 0.0):
+        if self.snr_range is not None:
+            active = (self.corruption_probability_per_image > 0.0)
+        else:
+            active = ((self.additive_noise_sigma > 0.0 or self.multiply_noise_sigma > 1.0) and self.corruption_probability_per_image > 0.0)
+
+        if not active:
             for item in batch:
                 if self.only_additive_noise:
                     item['sigma'] = np.zeros_like(item['sigma'])
@@ -730,20 +757,46 @@ class CorruptionCollateFn(object):
                 torch_gen.manual_seed(int(idx + self._image_noise_seed + 4454))
 
                 corruption_label = 1
-                noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
-                
-                target_noise_sigma = noise_sigma_data * self.multiply_noise_sigma + self.additive_noise_sigma
-
-                if self.only_additive_noise:
-                    target_noise_sigma = target_noise_sigma - noise_sigma_data
-                    sigma_will_be_added = target_noise_sigma
-                    final_noise_sigma = target_noise_sigma
+                if np.iscomplexobj(csi_data):
+                    noise_r = torch.randn(csi_data.shape, generator=torch_gen).numpy()
+                    noise_i = torch.randn(csi_data.shape, generator=torch_gen).numpy()
+                    noise_image = (noise_r + 1j * noise_i) / np.sqrt(2.0)
                 else:
-                    # 추가될 노이즈의 분산 = 목표 분산 - 현재 분산
-                    sigma_will_be_added_squared = (target_noise_sigma ** 2) - (noise_sigma_data ** 2)
-                    # 분산이 음수가 되는 경우를 방지 (수치적 오류 등)
-                    sigma_will_be_added = np.sqrt(np.maximum(0, sigma_will_be_added_squared))
-                    final_noise_sigma = target_noise_sigma
+                    noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
+
+                if self.snr_range is not None:
+                    target_snr_db = np_gen.uniform(self.snr_range[0], self.snr_range[1])
+                    ratio_snr = 10.0 ** (target_snr_db / 10.0)
+
+                    signal_power = np.mean(np.abs(csi_data) ** 2)
+                    target_sigma_rms = np.sqrt(signal_power / ratio_snr)
+
+                    current_sigma_rms = np.sqrt(np.mean(noise_sigma_data ** 2))
+                    if current_sigma_rms > 1e-12:
+                        target_noise_sigma = (noise_sigma_data / current_sigma_rms) * target_sigma_rms
+                    else:
+                        target_noise_sigma = np.full_like(noise_sigma_data, target_sigma_rms)
+
+                    if self.only_additive_noise:
+                        sigma_will_be_added = target_noise_sigma
+                        final_noise_sigma = target_noise_sigma
+                    else:
+                        sigma_will_be_added_squared = np.maximum(0.0, (target_noise_sigma ** 2) - (noise_sigma_data ** 2))
+                        sigma_will_be_added = np.sqrt(sigma_will_be_added_squared)
+                        final_noise_sigma = np.maximum(target_noise_sigma, noise_sigma_data)
+                else:
+                    target_noise_sigma = noise_sigma_data * self.multiply_noise_sigma + self.additive_noise_sigma
+
+                    if self.only_additive_noise:
+                        target_noise_sigma = target_noise_sigma - noise_sigma_data
+                        sigma_will_be_added = target_noise_sigma
+                        final_noise_sigma = target_noise_sigma
+                    else:
+                        # 추가될 노이즈의 분산 = 목표 분산 - 현재 분산
+                        sigma_will_be_added_squared = (target_noise_sigma ** 2) - (noise_sigma_data ** 2)
+                        # 분산이 음수가 되는 경우를 방지 (수치적 오류 등)
+                        sigma_will_be_added = np.sqrt(np.maximum(0, sigma_will_be_added_squared))
+                        final_noise_sigma = target_noise_sigma
 
                 csi_data = csi_data + (noise_image * sigma_will_be_added).astype(csi_data.dtype)
                 noise_sigma_data = final_noise_sigma
@@ -764,20 +817,27 @@ def sigma_mean(sigma):
 class AlternativeCorruptionCollateFn(object):
     """
     이미지에 노이즈를 추가하여 손상시키는 Collate Function.
-    additive_noise_sigma와 multiply_noise_sigma를 이용해 노이즈 레벨을 조절합니다.
+    additive_noise_sigma와 multiply_noise_sigma 또는 snr_range를 이용해 노이즈 레벨을 조절합니다.
     """
     def __init__(self, additive_noise_sigma=0.0, multiply_noise_sigma=1.0, 
                  corruption_probability_per_image=0.0, only_additive_noise=False,
-                 image_corruption_seed=112154, image_noise_seed=445481):
+                 image_corruption_seed=112154, image_noise_seed=445481,
+                 snr_range=None):
         self.additive_noise_sigma = additive_noise_sigma
         self.corruption_probability_per_image = corruption_probability_per_image
         self.only_additive_noise = only_additive_noise
         self._image_corruption_seed = image_corruption_seed
         self._image_noise_seed = image_noise_seed
+        self.snr_range = parse_snr_range(snr_range)
         self.__name__ = "AlternativeCorruptionCollateFn"
 
     def __call__(self, batch):
-        if not ((self.additive_noise_sigma > 0.0) and self.corruption_probability_per_image > 0.0):
+        if self.snr_range is not None:
+            active = (self.corruption_probability_per_image > 0.0)
+        else:
+            active = ((self.additive_noise_sigma > 0.0) and self.corruption_probability_per_image > 0.0)
+
+        if not active:
             for item in batch:
                 if self.only_additive_noise:
                     item['sigma'] = np.zeros_like(item['sigma'])
@@ -796,26 +856,52 @@ class AlternativeCorruptionCollateFn(object):
                 torch_gen.manual_seed(int(idx + self._image_noise_seed + 4454))
 
                 corruption_label = 1
-                noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
-
-                sqrt_E_sigma_n_power2 = sigma_mean(noise_sigma_data)
-
-                multiply_noise_sigma = self.additive_noise_sigma/sqrt_E_sigma_n_power2 + 1.0
-
-                target_noise_sigma = noise_sigma_data * multiply_noise_sigma 
-
-                if self.only_additive_noise:
-                    # sigma_target = sigma/(E[sigma^2]^0.5) * sigma_additive
-                    # sigma/(E[sigma^2]^0.5) : Normalized sigma
-                    target_noise_sigma = target_noise_sigma - noise_sigma_data
-                    sigma_will_be_added = target_noise_sigma
-                    final_noise_sigma = target_noise_sigma
+                if np.iscomplexobj(csi_data):
+                    noise_r = torch.randn(csi_data.shape, generator=torch_gen).numpy()
+                    noise_i = torch.randn(csi_data.shape, generator=torch_gen).numpy()
+                    noise_image = (noise_r + 1j * noise_i) / np.sqrt(2.0)
                 else:
-                    # 추가될 노이즈의 분산 = 목표 분산 - 현재 분산
-                    sigma_will_be_added_squared = (target_noise_sigma ** 2) - (noise_sigma_data ** 2)
-                    # 분산이 음수가 되는 경우를 방지 (수치적 오류 등)
-                    sigma_will_be_added = np.sqrt(np.maximum(0, sigma_will_be_added_squared))
-                    final_noise_sigma = target_noise_sigma
+                    noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
+
+                if self.snr_range is not None:
+                    target_snr_db = np_gen.uniform(self.snr_range[0], self.snr_range[1])
+                    ratio_snr = 10.0 ** (target_snr_db / 10.0)
+
+                    signal_power = np.mean(np.abs(csi_data) ** 2)
+                    target_sigma_rms = np.sqrt(signal_power / ratio_snr)
+
+                    current_sigma_rms = np.sqrt(np.mean(noise_sigma_data ** 2))
+                    if current_sigma_rms > 1e-12:
+                        target_noise_sigma = (noise_sigma_data / current_sigma_rms) * target_sigma_rms
+                    else:
+                        target_noise_sigma = np.full_like(noise_sigma_data, target_sigma_rms)
+
+                    if self.only_additive_noise:
+                        sigma_will_be_added = target_noise_sigma
+                        final_noise_sigma = target_noise_sigma
+                    else:
+                        sigma_will_be_added_squared = np.maximum(0.0, (target_noise_sigma ** 2) - (noise_sigma_data ** 2))
+                        sigma_will_be_added = np.sqrt(sigma_will_be_added_squared)
+                        final_noise_sigma = np.maximum(target_noise_sigma, noise_sigma_data)
+                else:
+                    sqrt_E_sigma_n_power2 = sigma_mean(noise_sigma_data)
+
+                    multiply_noise_sigma = self.additive_noise_sigma/sqrt_E_sigma_n_power2 + 1.0
+
+                    target_noise_sigma = noise_sigma_data * multiply_noise_sigma 
+
+                    if self.only_additive_noise:
+                        # sigma_target = sigma/(E[sigma^2]^0.5) * sigma_additive
+                        # sigma/(E[sigma^2]^0.5) : Normalized sigma
+                        target_noise_sigma = target_noise_sigma - noise_sigma_data
+                        sigma_will_be_added = target_noise_sigma
+                        final_noise_sigma = target_noise_sigma
+                    else:
+                        # 추가될 노이즈의 분산 = 목표 분산 - 현재 분산
+                        sigma_will_be_added_squared = (target_noise_sigma ** 2) - (noise_sigma_data ** 2)
+                        # 분산이 음수가 되는 경우를 방지 (수치적 오류 등)
+                        sigma_will_be_added = np.sqrt(np.maximum(0, sigma_will_be_added_squared))
+                        final_noise_sigma = target_noise_sigma
 
                 csi_data = csi_data + (noise_image * sigma_will_be_added).astype(csi_data.dtype)
                 noise_sigma_data = final_noise_sigma
@@ -1127,6 +1213,7 @@ class WiDARDataset(Dataset):
                  only_positive = False,
                  resolution = (3, 256, 30),
                  max_size = None,
+                 snr_range = None,
                  ):
         self.dir_path = path
         self.transform = transform
@@ -1139,6 +1226,7 @@ class WiDARDataset(Dataset):
         self.transpose = tuple(transpose) if transpose is not None else None
         self.view_as_complex = view_as_complex
         self.complex_merge_axis = complex_merge_axis
+        self.snr_range = parse_snr_range(snr_range)
         self.additive_noise_sigma = additive_noise_sigma
         self.multiply_noise_sigma = multiply_noise_sigma
         self.corruption_probability_per_image = corruption_probability_per_image
@@ -1229,6 +1317,7 @@ class WiDARDataset(Dataset):
                 only_additive_noise=self.only_additive_noise,
                 image_corruption_seed=self.image_corruption_seed,
                 image_noise_seed=self.image_noise_seed,
+                snr_range=self.snr_range,
             )
         else:
             self.corruption_collate_fn = CorruptionCollateFn(
@@ -1238,6 +1327,7 @@ class WiDARDataset(Dataset):
                 only_additive_noise=self.only_additive_noise,
                 image_corruption_seed=self.image_corruption_seed,
                 image_noise_seed=self.image_noise_seed,
+                snr_range=self.snr_range,
             )
         self.noise_mean_collate_fn = NoiseMeanCollateFn(self.noise_mean_flag, self.noise_mean_alter_way)
 
@@ -1377,6 +1467,7 @@ class WiDARDataset(Dataset):
             'idx': idx,
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
+            'snr_range': self.snr_range,
             'complex_merge_axis': return_complex_merge_axis,
             'axis_name': axis_name,
         }
@@ -1483,6 +1574,7 @@ class XRF55Dataset(Dataset):
                  only_positive = False,
                  resolution = (3, 500, 90),
                  max_size = None,
+                 snr_range = None,
                  ):
         self.dir_path = path
         self.transform = transform
@@ -1495,6 +1587,7 @@ class XRF55Dataset(Dataset):
         self.transpose = tuple(transpose) if transpose is not None else None
         self.view_as_complex = view_as_complex
         self.complex_merge_axis = complex_merge_axis
+        self.snr_range = parse_snr_range(snr_range)
         self.additive_noise_sigma = additive_noise_sigma
         self.multiply_noise_sigma = multiply_noise_sigma
         self.corruption_probability_per_image = corruption_probability_per_image
@@ -1583,6 +1676,7 @@ class XRF55Dataset(Dataset):
                 only_additive_noise=self.only_additive_noise,
                 image_corruption_seed=self.image_corruption_seed,
                 image_noise_seed=self.image_noise_seed,
+                snr_range=self.snr_range,
             )
         else:
             self.corruption_collate_fn = CorruptionCollateFn(
@@ -1592,6 +1686,7 @@ class XRF55Dataset(Dataset):
                 only_additive_noise=self.only_additive_noise,
                 image_corruption_seed=self.image_corruption_seed,
                 image_noise_seed=self.image_noise_seed,
+                snr_range=self.snr_range,
             )
         self.noise_mean_collate_fn = NoiseMeanCollateFn(self.noise_mean_flag, self.noise_mean_alter_way)
 
@@ -1732,6 +1827,7 @@ class XRF55Dataset(Dataset):
             'idx': idx,
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
+            'snr_range': self.snr_range,
             'complex_merge_axis': return_complex_merge_axis,
             'axis_name': axis_name,
         }
