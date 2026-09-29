@@ -521,7 +521,6 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             "noise": np.random.randn(*csi_data.shape),
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
-            'snr_range': self.snr_range,
             'complex_merge_axis': return_complex_merge_axis,
             'axis_name': self._axis_name,
         }
@@ -1467,7 +1466,6 @@ class WiDARDataset(Dataset):
             'idx': idx,
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
-            'snr_range': self.snr_range,
             'complex_merge_axis': return_complex_merge_axis,
             'axis_name': axis_name,
         }
@@ -1827,7 +1825,6 @@ class XRF55Dataset(Dataset):
             'idx': idx,
             'corruption_label': corruption_label,
             'additive_noise_sigma': self.additive_noise_sigma,
-            'snr_range': self.snr_range,
             'complex_merge_axis': return_complex_merge_axis,
             'axis_name': axis_name,
         }

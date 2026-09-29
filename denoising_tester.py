@@ -277,6 +277,7 @@ def main(**kwargs):
     dataset_kwargs.multiply_noise_sigma = 1.0
     dataset_kwargs.only_additive_noise = False
     dataset_kwargs.noise_mean_flag = False
+    dataset_kwargs.snr_range = None
 
     data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=8, prefetch_factor=4)
         
