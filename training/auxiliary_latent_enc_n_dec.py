@@ -209,7 +209,7 @@ class noise_decoder(nn.Module):
             output_len *= dim
         self.output_len = output_len
 
-        if self.scheduler_mode in ['using_sigma_t_n', 'using_sigma_t_n_wo_z']:
+        if self.scheduler_mode in ['using_sigma_t_n', 'using_sigma_t_n_wo_z', 'only_above_sigma_t_n']:
             m_encoder_output_len = cnn_dim//2 * inout_dim[1] * inout_dim[2]
             
             # 잠재 변수 z를 받아 다항식 계수를 생성하는 2-layer MLP
@@ -277,7 +277,7 @@ class noise_decoder(nn.Module):
         
         z = z.to(dtype=dec_dtype)
 
-        if scheduler_mode in ['using_sigma_t_n', 'using_sigma_t_n_wo_z']:
+        if scheduler_mode in ['using_sigma_t_n', 'using_sigma_t_n_wo_z', 'only_above_sigma_t_n']:
             h, w = self.inout_dim[1], self.inout_dim[2]
             z_encoded = self.m_encoder(z)
             z_encoded = z_encoded.reshape(batch_size, self.cnn_dim // 2, h, w)
@@ -323,6 +323,8 @@ class PolynomialNoiseScheduler(nn.Module):
     @scheduler_mode.setter
     def scheduler_mode(self, value):
         self._scheduler_mode = value
+        if hasattr(self, 'noise_decoder'):
+            self.noise_decoder.scheduler_mode = value
 
     def __getstate__(self):
         state = super().__getstate__()
@@ -407,7 +409,15 @@ class PolynomialNoiseScheduler(nn.Module):
         sigma_t_n_rho = sigma_t_n_f64 ** (1 / self.rho)
 
         sigma_below = self.__compute_sigma_below_tau(f_t, f_tau, sigma_t_n_rho)
-        sigma_above = self.__compute_sigma_above_tau(f_t, f_1, f_tau, sigma_t_n_rho)
+        if self.scheduler_mode == 'only_above_sigma_t_n':
+            # sigma_t_n 이하의 t(t >= tau_n인 구간)에서는 사전에 계산된 a, b, d 대신
+            # no_nn_scheduler(a=0, b=0, d=1 -> f(t)=t, f(tau)=tau, f(1)=1)와 동일하게 처리
+            f_t_no_nn = t_f64
+            f_tau_no_nn = tau_n_f64
+            f_1_no_nn = torch.tensor(1.0, dtype=torch.float64, device=t.device)
+            sigma_above = self.__compute_sigma_above_tau(f_t_no_nn, f_1_no_nn, f_tau_no_nn, sigma_t_n_rho)
+        else:
+            sigma_above = self.__compute_sigma_above_tau(f_t, f_1, f_tau, sigma_t_n_rho)
 
         # Align dimensions for condition check
         t_aligned = t_f64
