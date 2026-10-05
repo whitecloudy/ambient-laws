@@ -5,4 +5,11 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-# empty
+def __getattr__(name):
+    if name in ('RenewSemanticCommunicationDataset', 'renewSemanticCommunicationDataset'):
+        from training.semantic_comm_dataset import (
+            RenewSemanticCommunicationDataset,
+            renewSemanticCommunicationDataset,
+        )
+        return locals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

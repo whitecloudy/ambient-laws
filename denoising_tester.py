@@ -232,7 +232,15 @@ def main(**kwargs):
                 train_opts = json.load(f)
 
         # scheduler_mode 복원/설정 (예: using_sigma_t_n)
-        target_mode = opt.scheduler_mode if opt.scheduler_mode is not None else train_opts.get('scheduler_mode', 'using_sigma_t_n')
+        target_mode = (
+            opt.scheduler_mode
+            if opt.scheduler_mode is not None
+            else train_opts.get('network_kwargs', {}).get(
+                'scheduler_mode',
+                train_opts.get('scheduler_mode', getattr(net, 'scheduler_mode', 'using_sigma_t_n'))
+            )
+        )
+        dist.print0(f'Setting scheduler_mode to "{target_mode}"...')
         net.scheduler_mode = target_mode
         if hasattr(net, 'noise_scheduler'):
             net.noise_scheduler.scheduler_mode = target_mode
@@ -245,6 +253,7 @@ def main(**kwargs):
 
         if opt.force_no_nn_scheduler:
             dist.print0('Forcing noise scheduler to "no_nn_scheduler" mode for noise scheduling.')
+            net.scheduler_mode = 'no_nn_scheduler'
             if hasattr(net, 'noise_scheduler'):
                 net.noise_scheduler.scheduler_mode = 'no_nn_scheduler'
                 if hasattr(net.noise_scheduler, 'noise_decoder'):

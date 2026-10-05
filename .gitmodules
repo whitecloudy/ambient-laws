@@ -1,0 +1,3 @@
+[submodule "misc/ADJSCC"]
+	path = misc/ADJSCC
+	url = git@github.com:whitecloudy/ADJSCC.git

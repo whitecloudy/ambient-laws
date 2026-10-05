@@ -1880,6 +1880,13 @@ class XRF55Dataset(Dataset):
         return (var_sum / var_count), np.sqrt(noise_var_sum / noise_var_count)
 
 
+def __getattr__(name):
+    if name in ('RenewSemanticCommunicationDataset', 'renewSemanticCommunicationDataset'):
+        import training.semantic_comm_dataset as _scd
+        return getattr(_scd, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 
 if __name__ == "__main__":
     import sys

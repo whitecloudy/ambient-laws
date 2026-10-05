@@ -253,7 +253,7 @@ class noise_decoder(nn.Module):
 
     def forward(self, z=None, sigma_t_n=None):
         scheduler_mode = getattr(self, 'scheduler_mode', 'no_nn_scheduler')
-        if scheduler_mode in ['no_nn_scheduler', 'no_nn_scheduler_with_z']:
+        if scheduler_mode in ['no_nn_scheduler', 'no_nn_scheduler_with_z'] or not hasattr(self, 'm_encoder'):
             if z is not None:
                 batch_size = z.size(0)
                 device = z.device
