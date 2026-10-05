@@ -52,7 +52,7 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler|edm_with_latent_z',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler', 'edm_with_latent_z']), default='edm', show_default=True)
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
@@ -137,7 +137,7 @@ def parse_int_list(s):
 @click.option('--m_dim',             help='Latent z dimension m for scheduler', metavar='INT', type=int, default=50, show_default=True)
 @click.option('--k_top',             help='Top-k selection k for scheduler', metavar='INT', type=int, default=15, show_default=True)
 @click.option('--rho',               help='Rho parameter for scheduler', metavar='FLOAT', type=float, default=7.0, show_default=True)
-@click.option('--kl_coeff',          help='KL loss coefficient for EDMLoss_with_scheduler', metavar='FLOAT', type=float, default=1.0, show_default=True)
+@click.option('--kl_coeff',          help='KL loss coefficient for EDMLoss_with_scheduler or EDMLoss_with_latent_z', metavar='FLOAT', type=float, default=1.0, show_default=True)
 @click.option('--scheduler_mode',    help='Scheduler mode for edm_with_scheduler', metavar='using_sigma_t_n|no_sigma_t_n|no_nn_scheduler|using_sigma_t_n_wo_z|no_nn_scheduler_with_z|only_above_sigma_t_n', type=click.Choice(['using_sigma_t_n', 'no_sigma_t_n', 'no_nn_scheduler', 'using_sigma_t_n_wo_z', 'no_nn_scheduler_with_z', 'only_above_sigma_t_n']), default='using_sigma_t_n', show_default=True)
 
 # Validation params
@@ -393,6 +393,9 @@ def main(**kwargs):
         c.loss_kwargs.sigma_loss_scaling = opts.sigma_loss_scaling
     elif opts.precond == 'edm_with_scheduler':
         c.loss_kwargs.class_name = 'training.loss.EDMLoss_with_scheduler'
+        c.loss_kwargs.kl_coeff = opts.kl_coeff
+    elif opts.precond == 'edm_with_latent_z':
+        c.loss_kwargs.class_name = 'training.loss.EDMLoss_with_latent_z'
         c.loss_kwargs.kl_coeff = opts.kl_coeff
     else:
         assert False, f"Unsupported precond: {opts.precond}"
