@@ -51,7 +51,7 @@ def parse_int_list(s):
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
+@click.option('--arch',          help='Network architecture', metavar='ddpmpp|rf_dit|rf_dit_large|rf_dit_small|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler|edm_with_latent_z',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler', 'edm_with_latent_z']), default='edm', show_default=True)
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
@@ -150,6 +150,15 @@ def parse_int_list(s):
 @click.option('--wandb', help='Use wandb to log training progress',  type=bool, default=True)
 @click.option('--wandb_group', help='Wandb group name',                   type=str, default='Test')
 @click.option('--debug_test', help='Whether to run a quick test with 1 batch to verify the training loop works.', is_flag=True)
+
+# RF_DiT architecture options
+@click.option('--num_dit_blocks', help='Number of DiT blocks for RF_DiT [default: 5]', type=int, default=None)
+@click.option('--dit_hidden_dim', help='Hidden dimension of DiT blocks for RF_DiT [default: 256]', type=int, default=None)
+@click.option('--dit_num_heads', help='Number of attention heads for DiT blocks [default: 8]', type=int, default=None)
+@click.option('--dit_mlp_ratio', help='MLP expansion ratio for DiT blocks [default: 4.0]', type=float, default=None)
+@click.option('--num_blocks_per_stage', help='Number of residual blocks per stage in RF_DiT enc/dec [default: 4]', type=int, default=None)
+@click.option('--causal_conv', help='Enable causal 2D conv along time dimension for RF_DiT [default: True]', type=bool, default=None)
+@click.option('--pos_embed_type', help='Positional embedding mode for RF_DiT (learnable_2d, sincos_2d, hybrid_1d_t_sincos_c_learnable)', type=click.Choice(['learnable_2d', 'sincos_2d', 'hybrid_1d_t_sincos_c_learnable']), default=None)
 
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
@@ -337,6 +346,51 @@ def main(**kwargs):
         c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55, hidden_dim=512, num_block=16)
     elif opts.arch == 'rf_transformer_MIMO_default':
         c.network_kwargs.update(model_type='RF_transformer_MIMO', sample_rate=1, input_dim=[8, 26])
+    elif opts.arch == 'rf_dit':
+        c.network_kwargs.update(
+            model_type='RF_DiT',
+            model_channels=64,
+            channel_mult=[1, 2],
+            num_blocks_per_stage=4,
+            num_dit_blocks=5,
+            dit_hidden_dim=256,
+            dit_num_heads=8,
+            dit_mlp_ratio=4.0,
+            causal_conv=True,
+            pos_embed_type='learnable_2d',
+            resample_filter=[1, 1],
+            label_type='downlink' if opts.cond else 'no_label',
+        )
+    elif opts.arch == 'rf_dit_large':
+        c.network_kwargs.update(
+            model_type='RF_DiT',
+            model_channels=128,
+            channel_mult=[1, 2],
+            num_blocks_per_stage=4,
+            num_dit_blocks=8,
+            dit_hidden_dim=512,
+            dit_num_heads=8,
+            dit_mlp_ratio=4.0,
+            causal_conv=True,
+            pos_embed_type='learnable_2d',
+            resample_filter=[1, 1],
+            label_type='downlink' if opts.cond else 'no_label',
+        )
+    elif opts.arch == 'rf_dit_small':
+        c.network_kwargs.update(
+            model_type='RF_DiT',
+            model_channels=32,
+            channel_mult=[1, 2],
+            num_blocks_per_stage=2,
+            num_dit_blocks=3,
+            dit_hidden_dim=128,
+            dit_num_heads=4,
+            dit_mlp_ratio=4.0,
+            causal_conv=True,
+            pos_embed_type='learnable_2d',
+            resample_filter=[1, 1],
+            label_type='downlink' if opts.cond else 'no_label',
+        )
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
@@ -344,8 +398,10 @@ def main(**kwargs):
     if not opts.not_dynamic_noise_sigma_model:
         if (opts.arch in ['ddpmpp', 'ddpmpp_256', 'ddpmpp_192']):
             c.network_kwargs.update(dynamic_noise=True)
+        elif opts.arch.startswith('rf_dit'):
+            c.network_kwargs.update(dynamic_noise=False)
         else:
-            raise ValueError(f'Dynamic noise sigma model is only supported for ddpmpp architectures for now, but got {opts.arch}')
+            raise ValueError(f'Dynamic noise sigma model is only supported for ddpmpp and rf_dit architectures for now, but got {opts.arch}')
     
     # Select batch size per GPU.
     batch_gpu = opts.batch_gpu
@@ -416,6 +472,20 @@ def main(**kwargs):
         c.network_kwargs.model_channels = opts.cbase
     if opts.cres is not None:
         c.network_kwargs.channel_mult = opts.cres
+    if opts.num_dit_blocks is not None:
+        c.network_kwargs.num_dit_blocks = opts.num_dit_blocks
+    if opts.dit_hidden_dim is not None:
+        c.network_kwargs.dit_hidden_dim = opts.dit_hidden_dim
+    if opts.dit_num_heads is not None:
+        c.network_kwargs.dit_num_heads = opts.dit_num_heads
+    if opts.dit_mlp_ratio is not None:
+        c.network_kwargs.dit_mlp_ratio = opts.dit_mlp_ratio
+    if opts.num_blocks_per_stage is not None:
+        c.network_kwargs.num_blocks_per_stage = opts.num_blocks_per_stage
+    if opts.causal_conv is not None:
+        c.network_kwargs.causal_conv = opts.causal_conv
+    if opts.pos_embed_type is not None:
+        c.network_kwargs.pos_embed_type = opts.pos_embed_type
     if opts.augment:
         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=opts.augment)
         c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
@@ -506,6 +576,14 @@ def main(**kwargs):
         dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
         dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
         dist.print0(f'Network architecture:    {opts.arch}')
+        if opts.arch.startswith('rf_dit'):
+            dist.print0(f'  Model channels:        {c.network_kwargs.get("model_channels", 64)}')
+            dist.print0(f'  Enc/Dec blocks/stage:  {c.network_kwargs.get("num_blocks_per_stage", 4)}')
+            dist.print0(f'  DiT blocks:            {c.network_kwargs.get("num_dit_blocks", 5)}')
+            dist.print0(f'  DiT hidden dim:        {c.network_kwargs.get("dit_hidden_dim", 256)}')
+            dist.print0(f'  DiT num heads:         {c.network_kwargs.get("dit_num_heads", 8)}')
+            dist.print0(f'  Causal conv on T:      {c.network_kwargs.get("causal_conv", True)}')
+            dist.print0(f'  Positional embed:      {c.network_kwargs.get("pos_embed_type", "learnable_2d")}')
         dist.print0(f'Preconditioning & loss:  {opts.precond}')
         dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
         dist.print0(f'Batch size:              {c.batch_size}')

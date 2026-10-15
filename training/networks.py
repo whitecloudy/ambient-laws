@@ -883,9 +883,17 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         return aux
 
 
+#----------------------------------------------------------------------------
+# RF_DiT: Complex-valued Diffusion Transformer with Convolutional Encoder-Decoder
+# and U-ViT style skip connections.
+from training.rf_dit import RF_DiT
+
+
+
+
 @persistence.persistent_class
 class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
-    def __init__(self,
+    def __init__(
         img_resolution,                     # Image resolution at input/output.
         in_channels,                        # Number of color channels at input.
         out_channels,                       # Number of color channels at output.
@@ -1449,7 +1457,20 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
-        self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels, out_channels=img_channels, label_dim=label_dim, **model_kwargs)
+        model_in_channels = model_kwargs.pop('in_channels', None)
+        model_out_channels = model_kwargs.pop('out_channels', None)
+        if model_in_channels is None:
+            if model_type == 'RF_DiT' and img_channels % 2 == 0:
+                model_in_channels = img_channels // 2
+            else:
+                model_in_channels = img_channels
+        if model_out_channels is None:
+            if model_type == 'RF_DiT' and img_channels % 2 == 0:
+                model_out_channels = img_channels // 2
+            else:
+                model_out_channels = img_channels
+
+        self.model = globals()[model_type](img_resolution=img_resolution, in_channels=model_in_channels, out_channels=model_out_channels, label_dim=label_dim, **model_kwargs)
 
     def forward(self, x : torch.Tensor, sigma : torch.Tensor, class_labels=None, force_fp32=False, **model_kwargs):
         x = x.to(torch.float32)

@@ -357,6 +357,21 @@ def training_loop(
             labels = None
         misc.print_module_summary(net, [images, sigma, labels], max_nesting=2, verbose=dist.get_rank() == 0)
 
+        # Profile FLOPs per sample (excluding batch size effect)
+        if dist.get_rank() == 0:
+            try:
+                from calflops import calculate_flops
+                sample_args = [images[:1], sigma[:1]] if labels is None else [images[:1], sigma[:1], labels[:1]]
+                was_training = net.training
+                net.eval()
+                try:
+                    flops, macs, _ = calculate_flops(model=net, args=sample_args, output_as_string=True, print_results=False)
+                    dist.print0(f'Model complexity (per sample, batch=1): FLOPs = {flops}, MACs = {macs}\n')
+                finally:
+                    net.train(was_training)
+            except Exception as e:
+                dist.print0(f'Warning: Failed to calculate FLOPs: {e}\n')
+
     # Setup optimizer.
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     dist.print0('Setting up optimizer...')
