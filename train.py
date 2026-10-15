@@ -82,6 +82,8 @@ def parse_int_list(s):
 @click.option('--bench',         help='Enable cuDNN benchmarking', metavar='BOOL',                  type=bool, default=True, show_default=True)
 @click.option('--cache',         help='Cache dataset in CPU memory', metavar='BOOL',                type=bool, default=True, show_default=True)
 @click.option('--workers',       help='DataLoader worker processes', metavar='INT',                 type=click.IntRange(min=1), default=1, show_default=True)
+@click.option('--compile', 'compile_network', help='Enable torch.compile for the training network', is_flag=True, default=False)
+@click.option('--compile_mode',  help='torch.compile mode', metavar='default|reduce-overhead|max-autotune', type=click.Choice(['default', 'reduce-overhead', 'max-autotune']), default='default', show_default=True)
 
 # I/O-related.
 @click.option("--expr_id",      help="Experiment ID", type=str, default="test")
@@ -558,6 +560,8 @@ def main(**kwargs):
     c.no_asm = opts.no_asm
     c.debug_test = opts.debug_test
     c.temp_save = opts.temp_save
+    c.compile_network = opts.compile_network
+    c.compile_mode = opts.compile_mode
 
     # Print options.
     if dist.get_rank() == 0:
@@ -588,6 +592,7 @@ def main(**kwargs):
         dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
         dist.print0(f'Batch size:              {c.batch_size}')
         dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
+        dist.print0(f'torch.compile:           {opts.compile_network}' + (f' (mode={opts.compile_mode})' if opts.compile_network else ''))
         dist.print0()
 
     # Dry run?
