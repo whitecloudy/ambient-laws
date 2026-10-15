@@ -32,7 +32,9 @@ def init_weight_xavier(module):
 
 @torch.jit.script
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    if x.ndim == 4 and scale.ndim == 3:
+        return x * (1 + scale.unsqueeze(2)) + shift.unsqueeze(2)
+    return x * (1 + scale) + shift
 
 
 class DiffusionEmbedding(nn.Module):
@@ -69,8 +71,7 @@ class DiffusionEmbedding(nn.Module):
         dims = torch.arange(embed_dim).unsqueeze(0)  # [1, E]
         table = steps * torch.exp(-math.log(max_step)
                                   * dims / embed_dim)  # [T, E]
-        table = torch.view_as_real(torch.exp(1j * table))
-        return table
+        return torch.stack([table.cos(), table.sin()], dim=1)
 
 # TODO: Replace MLP with nn.Embedding
 class MLPConditionEmbedding(nn.Module):
@@ -106,8 +107,7 @@ class PositionEmbedding(nn.Module):
         dims = torch.arange(hidden_dim).unsqueeze(0)          # [1,E]
         table = steps * torch.exp(-math.log(max_len)
                                   * dims / hidden_dim)     # [P,E]
-        table = torch.view_as_real(torch.exp(1j * table))
-        return table
+        return torch.stack([table.cos(), table.sin()], dim=0).unsqueeze(0)
 
 
 class DiA(nn.Module):
@@ -142,22 +142,20 @@ class DiA(nn.Module):
         """
         Embedding diffusion step t with adaptive layer-norm.
         Embedding condition c with cross-attention.
-        - Input:\\
-          x, [B, N, H, 2], \\ 
-          t, [B, H, 2], \\
-          c, [B, N, H, 2], \\
+        - Input:
+          x, [2, B, N, H]
+          t, [2, B, H]
+          c, [2, B, N, H]
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
-            t).chunk(6, dim=1)
+            t).chunk(6, dim=2)
         mod_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + \
-            gate_msa.unsqueeze(
-                1) * self.s_attn(mod_x, mod_x, mod_x)
+            gate_msa.unsqueeze(2) * self.s_attn(mod_x, mod_x, mod_x)
         x = x + self.x_attn(queries=self.normc(c),
                             keys=self.norm2(x), values=self.norm2(x))
         x = x + \
-            gate_mlp.unsqueeze(
-                1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
+            gate_mlp.unsqueeze(2) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -174,7 +172,7 @@ class FinalLayer(nn.Module):
         self.apply(init_weight_zero)
 
     def forward(self, x, t):
-        shift, scale = self.adaLN_modulation(t).chunk(2, dim=1)
+        shift, scale = self.adaLN_modulation(t).chunk(2, dim=2)
         x = x + modulate(self.norm(x), shift, scale)
         x = self.linear(x)
         return x
@@ -184,12 +182,12 @@ class SpatialDiffusion(nn.Module):
     """
     Process each sample of a sequence.
     Take CSI diffusion as an example.
-    - Input:\\
-      x, [B, S, A, 2], \\
-      t, [B], \\
-      c, [B, C, 2], \\
+    - Input:
+      x, [2, B, S, A]
+      t, [B]
+      c, [2, B, C]
     - Output:
-      n, [B, S*A, 2]
+      n, [2, B, S*A]
     """
 
     def __init__(self, num_spatial_block,
@@ -225,8 +223,8 @@ class SpatialDiffusion(nn.Module):
             DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(self.num_block)
         ])
         self.adaMLP = nn.Sequential(
-            # Flatten [B, S, A, 2] to [B, S*A, 2]
-            nn.Flatten(start_dim=1, end_dim=-2),
+            # Flatten [2, B, S, A] to [2, B, S*A]
+            nn.Flatten(start_dim=2, end_dim=-1),
             cm.ComplexLinear(self.input_len*self.hidden_dim, self.output_dim),
             cm.ComplexSiLU(),
             cm.ComplexLinear(self.output_dim, self.output_dim),
@@ -248,12 +246,12 @@ class tfdiff_mimo(nn.Module):
     """
     Signal Modulation and Augmentation via Generative Diffusion Model.
     Take CSI diffusion as an example.
-    - Input:\\
-      x, [B, N, S, A, 2], \\
-      t, [B], \\
-      c, [B, N, C, 2], \\
+    - Input:
+      x, [2, B, N, S, A], or torch.complex64 [B, N, S, A]
+      t, [B]
+      c, [2, B, N, C]
     - Output:
-      n, [B, N, S, A, 2]
+      n, [2, B, N, S, A], or torch.complex64 [B, N, S, A]
     """
 
     def __init__(self, 
@@ -296,36 +294,66 @@ class tfdiff_mimo(nn.Module):
     # S : number of subcarriers.
     # A : number of antennas.
     # C : number of conditions.
-    # x : [B, N, S, A, 2]
-    # t : [B]
-    # c : [B, N, C, 2]
     def forward(self, x, noise_labels, class_labels, augment_labels=None, **kwargs):
-        x = x
-        
+        is_complex_input = torch.is_complex(x)
+        is_legacy = False
+
+        if is_complex_input:
+            x = torch.stack([x.real, x.imag], dim=1)
+        elif x.ndim >= 3 and x.shape[-1] == 2:
+            if x.shape[1] != 2:
+                is_legacy = True
+                perm = [0, x.ndim - 1] + list(range(1, x.ndim - 1))
+                x = x.permute(*perm)
+            elif list(x.shape[2:-1]) == list(self.extra_dim):
+                is_legacy = True
+                perm = [0, x.ndim - 1] + list(range(1, x.ndim - 1))
+                x = x.permute(*perm)
+
+        # Convert class_labels if provided
+        c = class_labels
+        if c is not None:
+            if torch.is_complex(c):
+                c = torch.stack([c.real, c.imag], dim=1)
+            elif c.ndim == 2:
+                c = torch.stack([c, torch.zeros_like(c)], dim=1)
+            elif c.ndim >= 3 and c.shape[-1] == 2:
+                if c.shape[1] != 2:
+                    perm = [0, c.ndim - 1] + list(range(1, c.ndim - 1))
+                    c = c.permute(*perm)
+                elif list(c.shape[2:-1]) == list(self.cond_dim):
+                    perm = [0, c.ndim - 1] + list(range(1, c.ndim - 1))
+                    c = c.permute(*perm)
+            c = c.to(x.dtype)
+
         # Cast inputs to x's dtype to support dynamic precision (float16, bfloat16, float32)
         noise_labels = noise_labels.to(x.dtype)
-        if class_labels is not None:
-            class_labels = class_labels.to(x.dtype)
             
         if self.dynamic_noise:
+            if noise_labels.shape[0] == x.shape[0]:
+                noise_labels = noise_labels.unsqueeze(1)
             while noise_labels.ndim < x.ndim:
                 noise_labels = noise_labels.unsqueeze(-1)
                 
             if noise_labels.shape != x.shape:
                 noise_labels = noise_labels.expand_as(x)
-            # dynamic_noise=True 일 때 noise_labels 최종 shape: [B, C, H, W]
-        else:   #If not dynamic noise but when we receive dynamic noise label
+        else:   # If not dynamic noise but when we receive dynamic noise label
             if noise_labels.ndim > 1:   # Expect only [Batch, ]
                 noise_labels = torch.sqrt(torch.mean(torch.flatten(noise_labels, start_dim=1)**2, dim=1))
-            # dynamic_noise=False 일 때 noise_labels 최종 shape: [B]
 
         t = noise_labels
-        c = class_labels
 
-        x_s = x.reshape([-1]+self.extra_dim+[2])  # [B*N, A, S, 2] (e.g. [B*N, 8, 26, 2])
-        c_s = c.reshape([-1]+self.cond_dim+[2])  # [B*N, A, S, 2] (e.g. [B*N, 8, 26, 2])
+        B = x.shape[0]
+        x_s = x.permute(0, 2, 1, 3, 4).reshape([-1, 2] + self.extra_dim)  # [B*N, 2, A, S]
+        c_s = c.permute(0, 2, 1, 3, 4).reshape([-1, 2] + self.cond_dim)   # [B*N, 2, A, S]
         x_s = self.spatial_block(x_s, t.repeat_interleave(
-            self.sample_rate), c_s)  # [B*N, A*S, 2]
-        x = x_s.reshape([-1, self.sample_rate] +
-                        self.extra_dim+[2])  # [B, N, A, S, 2] (e.g. [B, N, 8, 26, 2])
+            self.sample_rate), c_s)  # [B*N, 2, A*S]
+        x = x_s.reshape([B, self.sample_rate, 2] +
+                        self.extra_dim).permute(0, 2, 1, 3, 4)  # [B, 2, N, A, S]
+
+        if is_complex_input:
+            return torch.complex(x[:, 0], x[:, 1])
+        if is_legacy:
+            perm = [0] + list(range(2, x.ndim)) + [1]
+            return x.permute(*perm)
         return x

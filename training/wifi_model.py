@@ -38,7 +38,14 @@ def init_weight_xavier(module):
 
 @torch.jit.script
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    if x.ndim == 4 and scale.ndim == 3:
+        return x * (1 + scale.unsqueeze(2)) + shift.unsqueeze(2)
+    return x * (1 + scale) + shift
+
+
+@torch.jit.script
+def dit_gate_add(x: torch.Tensor, gate: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    return x + gate.unsqueeze(2) * out
 
 
 class DiffusionEmbedding(nn.Module):
@@ -75,8 +82,7 @@ class DiffusionEmbedding(nn.Module):
         dims = torch.arange(embed_dim).unsqueeze(0)  # [1, E]
         table = steps * torch.exp(-math.log(max_step)
                                   * dims / embed_dim)  # [T, E]
-        table = torch.view_as_real(torch.exp(1j * table))
-        return table
+        return torch.stack([table.cos(), table.sin()], dim=1)
     
 @persistence.persistent_class
 class PositionalEmbedding(torch.nn.Module):
@@ -92,7 +98,7 @@ class PositionalEmbedding(torch.nn.Module):
         freqs = (1 / self.max_positions) ** freqs
         x = x.view(-1)
         x = x.ger(freqs.to(x.dtype))
-        x = torch.stack([x.cos(), x.sin()], dim=-1)
+        x = torch.stack([x.cos(), x.sin()], dim=1)
         return x
 
 
@@ -134,8 +140,7 @@ class PositionEmbedding(nn.Module):
         dims = torch.arange(hidden_dim).unsqueeze(0)          # [1,E]
         table = steps * torch.exp(-math.log(max_len)
                                   * dims / hidden_dim)     # [P,E]
-        table = torch.view_as_real(torch.exp(1j * table))
-        return table
+        return torch.stack([table.cos(), table.sin()], dim=0).unsqueeze(0)
 
 
 class DiA(nn.Module):
@@ -164,20 +169,15 @@ class DiA(nn.Module):
         """
         Embedding diffusion step t with adaptive layer-norm.
         Embedding condition c with cross-attention.
-        - Input:\\
-          x, [B, N, H, 2], \\ 
-          t, [B, H, 2], \\
-          c, [B, N, H, 2], \\
+        - Input:
+          x, [2, B, N, H]
+          c, [2, B, H] (or [2, B, N, H])
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
-            c).chunk(6, dim=1)
+            c).chunk(6, dim=2)
         mod_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = x + \
-            gate_msa.unsqueeze(
-                1) * self.attn(mod_x, mod_x, mod_x)
-        x = x + \
-            gate_mlp.unsqueeze(
-                1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = dit_gate_add(x, gate_msa, self.attn(mod_x, mod_x, mod_x))
+        x = dit_gate_add(x, gate_mlp, self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)))
         return x
 
 
@@ -194,7 +194,7 @@ class FinalLayer(nn.Module):
         self.apply(init_weight_zero)
 
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=2)
         x = modulate(self.norm(x), shift, scale)
         x = self.linear(x)
         return x
@@ -243,54 +243,74 @@ class tfdiff_WiFi(nn.Module):
         ])
         self.final_layer = FinalLayer(self.hidden_dim, self.output_dim)
 
-    def forward(self, x, noise_labels, class_labels, augment_labels=None):
+    def forward(self, x, noise_labels, class_labels=None, augment_labels=None, **kwargs):
         """
         Args:
-            x: Input tensor of shape [Batch_size, Sequence_length, Feature_dimension]
-               or [Batch_size, Antenna, Sequence_length, Feature_dimension].
-               (예: [B, sample_rate, input_dim] 또는 [B, A, sample_rate, F] 형태의 torch.complex64 텐서.
-               4차원일 경우 Antenna 차원을 Feature_dimension으로 병합하여 [B, sample_rate, A * F]로 변환됨)
+            x: Input tensor of shape [2, Batch_size, Sequence_length, Feature_dimension]
+               or [2, Batch_size, Antenna, Sequence_length, Feature_dimension],
+               or torch.complex64 tensor.
             noise_labels: Noise labels tensor.
             class_labels: Class labels tensor.
         """
-        x = x
-        
+        is_complex_input = torch.is_complex(x)
+        is_legacy = False
+
+        if is_complex_input:
+            x = torch.stack([x.real, x.imag], dim=1)
+        elif x.ndim >= 3 and x.shape[-1] == 2:
+            if x.shape[1] != 2:
+                is_legacy = True
+                perm = [0, x.ndim - 1] + list(range(1, x.ndim - 1))
+                x = x.permute(*perm)
+            elif (x.ndim == 4 and x.shape[-2] == self.input_dim) or (x.ndim == 5 and x.shape[1] * x.shape[3] == self.input_dim):
+                is_legacy = True
+                perm = [0, x.ndim - 1] + list(range(1, x.ndim - 1))
+                x = x.permute(*perm)
+
+        # Convert class_labels if provided
+        c = class_labels
+        if c is not None:
+            if torch.is_complex(c):
+                c = torch.stack([c.real, c.imag], dim=1)
+            elif c.ndim == 2:
+                c = torch.stack([c, torch.zeros_like(c)], dim=1)
+            elif c.ndim >= 3 and c.shape[-1] == 2 and c.shape[1] != 2:
+                perm = [0, c.ndim - 1] + list(range(1, c.ndim - 1))
+                c = c.permute(*perm)
+            c = c.to(x.dtype)
+
         # Cast inputs to x's dtype to support dynamic precision (float16, bfloat16, float32)
         noise_labels = noise_labels.to(x.dtype)
-        if class_labels is not None:
-            class_labels = class_labels.to(x.dtype)
             
         antenna_reshape = False
 
         if x.ndim == 5:
-            B, A, S, F, C = x.shape
-            # [B, A, S, F] -> [B, S, A, F] -> [B, S, A * F]
-            x = x.permute(0, 2, 1, 3, 4).reshape(B, S, A * F, C)
+            B, _, A, S, F = x.shape
+            # [B, 2, A, S, F] -> [B, 2, S, A, F] -> [B, 2, S, A * F]
+            x = x.permute(0, 1, 3, 2, 4).reshape(B, 2, S, A * F)
             antenna_reshape = True
-            if noise_labels.shape == (B, A, S, F, C):
-                noise_labels = noise_labels.permute(0, 2, 1, 3, 4).reshape(B, S, A * F, C)
+            if noise_labels.shape == (B, 2, A, S, F):
+                noise_labels = noise_labels.permute(0, 1, 3, 2, 4).reshape(B, 2, S, A * F)
+            elif noise_labels.shape == (B, A, S, F):
+                noise_labels = noise_labels.permute(0, 2, 1, 3).reshape(B, S, A * F)
         
         if self.dynamic_noise:
+            if noise_labels.shape[0] == x.shape[0]:
+                noise_labels = noise_labels.unsqueeze(1)
             while noise_labels.ndim < x.ndim:
                 noise_labels = noise_labels.unsqueeze(-1)
                 
             if noise_labels.shape != x.shape:
                 noise_labels = noise_labels.expand_as(x)
-            # dynamic_noise=True 일 때 noise_labels 최종 shape: [B, C, H, W]
-        else:   #If not dynamic noise but when we receive dynamic noise label
+        else:   # If not dynamic noise but when we receive dynamic noise label
             if noise_labels.ndim > 1:   # Expect only [Batch, ]
                 noise_labels = torch.sqrt(torch.mean(torch.flatten(noise_labels, start_dim=1)**2, dim=1))
-            # dynamic_noise=False 일 때 noise_labels 최종 shape: [B]
 
         t = noise_labels
-        c = class_labels
-
-        if c.ndim == 2:
-            c = torch.stack([c, torch.zeros_like(c)], dim=-1)
 
         x = self.p_embed(x)
         t = self.t_embed(t)
-        if self.c_embed is not None:
+        if self.c_embed is not None and c is not None:
             c = self.c_embed(c)
             c = c + t
         else:
@@ -300,7 +320,12 @@ class tfdiff_WiFi(nn.Module):
         x = self.final_layer(x, c)
 
         if antenna_reshape:
-            # [B, S, A * F] -> [B, S, A, F] -> [B, A, S, F]
-            x = x.view(B, S, A, F, 2).permute(0, 2, 1, 3, 4)
+            # [B, 2, S, A * F] -> [B, 2, S, A, F] -> [B, 2, A, S, F]
+            x = x.view(B, 2, S, A, F).permute(0, 1, 3, 2, 4)
         
+        if is_complex_input:
+            return torch.complex(x[:, 0], x[:, 1])
+        if is_legacy:
+            perm = [0] + list(range(2, x.ndim)) + [1]
+            return x.permute(*perm)
         return x

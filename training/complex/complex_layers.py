@@ -18,6 +18,10 @@ from .complex_functions import complex_dropout, complex_dropout2d, complex_dropo
 from .complex_functions import complex_sigmoid, complex_tanh, complex_opposite
 
 def apply_complex(fr, fi, input, dtype = torch.complex64):
+    if not torch.is_complex(input) and isinstance(input, torch.Tensor) and input.ndim >= 2 and input.shape[1] == 2:
+        out_r = fr(input[:, 0]) - fi(input[:, 1])
+        out_i = fr(input[:, 1]) + fi(input[:, 0])
+        return torch.stack([out_r, out_i], dim=1)
     return (fr(input.real)-fi(input.imag)).type(dtype) \
             + 1j*(fr(input.imag)+fi(input.real)).type(dtype)
 
@@ -186,6 +190,8 @@ class NaiveComplexBatchNorm1d(Module):
         self.bn_i = BatchNorm1d(num_features, eps, momentum, affine, track_running_stats)
 
     def forward(self,input):
+        if not torch.is_complex(input) and isinstance(input, torch.Tensor) and input.ndim >= 2 and input.shape[1] == 2:
+            return torch.stack([self.bn_r(input[:, 0]), self.bn_i(input[:, 1])], dim=1)
         return self.bn_r(input.real).type(torch.complex64) +1j*self.bn_i(input.imag).type(torch.complex64)
 
 class NaiveComplexBatchNorm2d(Module):
@@ -199,6 +205,8 @@ class NaiveComplexBatchNorm2d(Module):
         self.bn_i = BatchNorm2d(num_features, eps, momentum, affine, track_running_stats)
 
     def forward(self,input):
+        if not torch.is_complex(input) and isinstance(input, torch.Tensor) and input.ndim >= 2 and input.shape[1] == 2:
+            return torch.stack([self.bn_r(input[:, 0]), self.bn_i(input[:, 1])], dim=1)
         return self.bn_r(input.real).type(torch.complex64) +1j*self.bn_i(input.imag).type(torch.complex64)
 
 class NaiveComplexBatchNorm3d(Module):
@@ -212,6 +220,8 @@ class NaiveComplexBatchNorm3d(Module):
         self.bn_i = BatchNorm3d(num_features, eps, momentum, affine, track_running_stats)
 
     def forward(self,input):
+        if not torch.is_complex(input) and isinstance(input, torch.Tensor) and input.ndim >= 2 and input.shape[1] == 2:
+            return torch.stack([self.bn_r(input[:, 0]), self.bn_i(input[:, 1])], dim=1)
         return self.bn_r(input.real).type(torch.complex64) +1j*self.bn_i(input.imag).type(torch.complex64)
     
 class NaiveComplexLayerNorm(Module):
@@ -224,6 +234,8 @@ class NaiveComplexLayerNorm(Module):
         self.ln_i = LayerNorm(normalized_shape, eps, elementwise_affine)
 
     def forward(self,input):
+        if not torch.is_complex(input) and isinstance(input, torch.Tensor) and input.ndim >= 2 and input.shape[1] == 2:
+            return torch.stack([self.ln_r(input[:, 0]), self.ln_i(input[:, 1])], dim=1)
         return self.ln_r(input.real).type(torch.complex64) +1j*self.ln_i(input.imag).type(torch.complex64)
 
 class _ComplexBatchNorm(Module):
@@ -272,6 +284,9 @@ class _ComplexBatchNorm(Module):
 class ComplexBatchNorm2d(_ComplexBatchNorm):
 
     def forward(self, input):
+        is_2channel = not torch.is_complex(input) and isinstance(input, torch.Tensor) and input.ndim >= 2 and input.shape[1] == 2
+        if is_2channel:
+            input = torch.complex(input[:, 0], input[:, 1])
         exponential_average_factor = 0.0
 
         if self.training and self.track_running_stats:
@@ -339,12 +354,17 @@ class ComplexBatchNorm2d(_ComplexBatchNorm):
                     +1j*(self.weight[None,:,2,None,None]*input.real+self.weight[None,:,1,None,None]*input.imag+\
                     self.bias[None,:,1,None,None]).type(torch.complex64)
 
+        if is_2channel:
+            return torch.stack([input.real, input.imag], dim=1)
         return input
 
 
 class ComplexBatchNorm1d(_ComplexBatchNorm):
 
     def forward(self, input):
+        is_2channel = not torch.is_complex(input) and isinstance(input, torch.Tensor) and input.ndim >= 2 and input.shape[1] == 2
+        if is_2channel:
+            input = torch.complex(input[:, 0], input[:, 1])
 
         exponential_average_factor = 0.0
 
@@ -414,6 +434,8 @@ class ComplexBatchNorm1d(_ComplexBatchNorm):
 
 
         del Crr, Cri, Cii, Rrr, Rii, Rri, det, s, t
+        if is_2channel:
+            return torch.stack([input.real, input.imag], dim=1)
         return input
 
 class ComplexGRUCell(Module):
