@@ -14,107 +14,21 @@ from .complex import complex_module as cm
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """
     Modulate complex tensor x with complex shift and scale.
-    x: [B, 2, N, H] or [B, 2, H]
-    shift, scale: [B, 2, H]
+    x: [B, N, H, 2] or [B, H, 2]
+    shift, scale: [B, H, 2]
     """
-    if x.ndim == 4 and scale.ndim == 3:
-        return x * (1.0 + scale.unsqueeze(2)) + shift.unsqueeze(2)
-    return x * (1.0 + scale) + shift
-
-
-@torch.jit.script
-def dit_gate_add(x: torch.Tensor, gate: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    """
-    Fused gating multiply and residual add for DiT:
-    x: [B, 2, N, H]
-    gate: [B, 2, H]
-    out: [B, 2, N, H]
-    """
-    return x + gate.unsqueeze(2) * out
-
-
-@torch.jit.script
-def unet_modulate_adaptive(h_norm: torch.Tensor, params: torch.Tensor, B: int, C: int) -> torch.Tensor:
-    """
-    Fused adaptive scale & shift modulation for ComplexUNetBlock:
-    h_norm: [B, 2, C, T, W]
-    params: [B, C * 4]
-    """
-    scale_r, scale_i, shift_r, shift_i = params.chunk(4, dim=-1)
-    scale = torch.stack([scale_r, scale_i], dim=1).view(B, 2, C, 1, 1)
-    shift = torch.stack([shift_r, shift_i], dim=1).view(B, 2, C, 1, 1)
-    return h_norm * (1.0 + scale) + shift
-
-
-@torch.jit.script
-def unet_modulate_shift(h_norm: torch.Tensor, params: torch.Tensor, B: int, C: int) -> torch.Tensor:
-    """
-    Fused shift modulation for ComplexUNetBlock:
-    h_norm: [B, 2, C, T, W]
-    params: [B, C * 2]
-    """
-    shift_r, shift_i = params.chunk(2, dim=-1)
-    shift = torch.stack([shift_r, shift_i], dim=1).view(B, 2, C, 1, 1)
-    return h_norm + shift
-
-
-@torch.jit.script
-def residual_add(h: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-    return h + skip
-
-
-@torch.jit.script
-def resample_residual_scale(conv_x: torch.Tensor, skip_x: torch.Tensor, scale: float) -> torch.Tensor:
-    return (conv_x + skip_x) * scale
-
-
-@torch.jit.script
-def complex_combine_conv(rr: torch.Tensor, ii: torch.Tensor, ir: torch.Tensor, ri: torch.Tensor) -> torch.Tensor:
-    return torch.stack((rr - ii, ir + ri), dim=1)
-
-
-@torch.jit.script
-def sincos_2d_table(t_len: int, c_len: int, H: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    half_dim = H // 2
-    rem_dim = H - half_dim
-
-    t_steps = torch.arange(t_len, device=device, dtype=torch.float32).unsqueeze(1)
-    t_dims = torch.arange(half_dim, device=device, dtype=torch.float32).unsqueeze(0)
-    denom_t = float(max(1, half_dim))
-    t_freq = t_steps * torch.exp(-math.log(10000.0) * t_dims / denom_t)
-
-    c_steps = torch.arange(c_len, device=device, dtype=torch.float32).unsqueeze(1)
-    c_dims = torch.arange(rem_dim, device=device, dtype=torch.float32).unsqueeze(0)
-    denom_c = float(max(1, rem_dim))
-    c_freq = c_steps * torch.exp(-math.log(10000.0) * c_dims / denom_c)
-
-    t_freq_2d = t_freq.unsqueeze(1).expand(t_len, c_len, half_dim)
-    c_freq_2d = c_freq.unsqueeze(0).expand(t_len, c_len, rem_dim)
-    table = torch.cat([t_freq_2d, c_freq_2d], dim=-1).reshape(1, t_len * c_len, H)
-    return torch.stack([table.cos(), table.sin()], dim=1).to(dtype=dtype)
-
-
-@torch.jit.script
-def hybrid_t_freq_table(t_len: int, c_len: int, H: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    t_steps = torch.arange(t_len, device=device, dtype=torch.float32).unsqueeze(1)
-    dims = torch.arange(H, device=device, dtype=torch.float32).unsqueeze(0)
-    t_freq = t_steps * torch.exp(-math.log(10000.0) * dims / float(H))
-    t_pe = torch.stack([t_freq.cos(), t_freq.sin()], dim=0).unsqueeze(0).to(dtype=dtype)
-    return t_pe.unsqueeze(3).expand(1, 2, t_len, c_len, H).reshape(1, 2, t_len * c_len, H)
-
-
-@torch.jit.script
-def fourier_embed(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    x_proj = x.ger((2.0 * math.pi * freqs).to(x.dtype))
-    return torch.cat([x_proj.cos(), x_proj.sin()], dim=1)
+    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 def pad_to_power_of_two(x: torch.Tensor):
     """
     Pad spatial dimensions T and C to the nearest power of two.
-    Supports 5D [B, 2, A, T, C] or 4D [B, A, T, C].
+    Supports 5D [B, A, T, C, 2] or 4D [B, A, T, C].
     """
-    orig_H, orig_W = x.shape[-2], x.shape[-1]
+    if x.ndim == 5:
+        orig_H, orig_W = x.shape[2], x.shape[3]
+    else:
+        orig_H, orig_W = x.shape[-2], x.shape[-1]
 
     target_H = 1 << (orig_H - 1).bit_length() if orig_H > 0 else 0
     target_W = 1 << (orig_W - 1).bit_length() if orig_W > 0 else 0
@@ -122,17 +36,21 @@ def pad_to_power_of_two(x: torch.Tensor):
     pad_w = target_W - orig_W
 
     if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
+        if x.ndim == 5:
+            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h), mode='constant', value=0)
+        else:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='constant', value=0)
 
     return x, pad_h, pad_w, orig_H, orig_W
 
 
-@torch.jit.script
 def unpad_from_power_of_two(x: torch.Tensor, pad_h: int, pad_w: int, orig_H: int, orig_W: int) -> torch.Tensor:
     """
     Unpad spatial dimensions T and C back to original shape.
     """
     if pad_h > 0 or pad_w > 0:
+        if x.ndim == 5:
+            return x[:, :, :orig_H, :orig_W, :]
         return x[..., :orig_H, :orig_W]
     return x
 
@@ -152,17 +70,7 @@ class NaiveComplexGroupNorm(nn.Module):
         self.gn_i = nn.GroupNorm(num_groups=num_groups, num_channels=num_channels, eps=eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, 2, C, T, W] or legacy [B, C, T, W, 2]
-        is_legacy = False
-        if x.ndim == 5:
-            if x.shape[-1] == 2 and x.shape[1] != 2:
-                is_legacy = True
-            elif x.shape[-1] == 2 and x.shape[1] == 2 and x.shape[2] != self.gn_r.num_channels:
-                is_legacy = True
-        if is_legacy:
-            x = x.permute(0, 4, 1, 2, 3)
-
-        x_r, x_i = x[:, 0], x[:, 1]
+        x_r, x_i = x.unbind(-1)
         w_r = self.gn_r.weight.to(x_r.dtype) if self.gn_r.weight is not None else None
         b_r = self.gn_r.bias.to(x_r.dtype) if self.gn_r.bias is not None else None
         w_i = self.gn_i.weight.to(x_i.dtype) if self.gn_i.weight is not None else None
@@ -176,10 +84,7 @@ class NaiveComplexGroupNorm(nn.Module):
         else:
             out_r = F.group_norm(x_r, self.gn_r.num_groups, w_r, b_r, self.gn_r.eps)
             out_i = F.group_norm(x_i, self.gn_i.num_groups, w_i, b_i, self.gn_i.eps)
-        out = torch.stack([out_r, out_i], dim=1)
-        if is_legacy:
-            out = out.permute(0, 2, 3, 4, 1)
-        return out
+        return torch.stack([out_r, out_i], dim=-1)
 
 
 class ComplexConv2d(nn.Module):
@@ -250,17 +155,8 @@ class ComplexConv2d(nn.Module):
             nn.init.constant_(self.conv_i.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, 2, C_in, T, C_sub] or legacy [B, C_in, T, C_sub, 2]
-        is_legacy = False
-        if x.ndim == 5:
-            if x.shape[-1] == 2 and x.shape[1] != 2:
-                is_legacy = True
-            elif x.shape[-1] == 2 and x.shape[1] == 2 and x.shape[2] != self.in_channels:
-                is_legacy = True
-        if is_legacy:
-            x = x.permute(0, 4, 1, 2, 3)
-
-        x_r, x_i = x[:, 0], x[:, 1]
+        # x: [B, C_in, T, C_sub, 2]
+        x_r, x_i = x.unbind(-1)
 
         # 1. FIR Downsampling / Upsampling matching RF_SongUNet
         if self.down and self.resample_filter is not None:
@@ -314,14 +210,12 @@ class ComplexConv2d(nn.Module):
         w_i = self.conv_i.weight.to(x_i.dtype)
         b_i = self.conv_i.bias.to(x_i.dtype) if self.conv_i.bias is not None else None
 
-        conv_rr = F.conv2d(x_r, w_r, b_r, padding=0, stride=self.stride, dilation=self.dilation)
-        conv_ii = F.conv2d(x_i, w_i, b_i, padding=0, stride=self.stride, dilation=self.dilation)
-        conv_ir = F.conv2d(x_i, w_r, b_r, padding=0, stride=self.stride, dilation=self.dilation)
-        conv_ri = F.conv2d(x_r, w_i, b_i, padding=0, stride=self.stride, dilation=self.dilation)
-        out = complex_combine_conv(conv_rr, conv_ii, conv_ir, conv_ri)
-        if is_legacy:
-            out = out.permute(0, 2, 3, 4, 1)
-        return out
+        out_r = F.conv2d(x_r, w_r, b_r, padding=0, stride=self.stride, dilation=self.dilation) - \
+                F.conv2d(x_i, w_i, b_i, padding=0, stride=self.stride, dilation=self.dilation)
+        out_i = F.conv2d(x_i, w_r, b_r, padding=0, stride=self.stride, dilation=self.dilation) + \
+                F.conv2d(x_r, w_i, b_i, padding=0, stride=self.stride, dilation=self.dilation)
+
+        return torch.stack([out_r, out_i], dim=-1)
 
 
 
@@ -346,7 +240,7 @@ class ComplexResample2d(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return resample_residual_scale(self.conv(x), self.skip(x), 1.0 / math.sqrt(2.0))
+        return (self.conv(x) + self.skip(x)) * (1.0 / math.sqrt(2.0))
 
 
 class ComplexUNetBlock(nn.Module):
@@ -389,34 +283,24 @@ class ComplexUNetBlock(nn.Module):
             self.skip = nn.Identity()
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        # x: [B, 2, in_channels, T, C_sub] or legacy [B, in_channels, T, C_sub, 2]
+        # x: [B, in_channels, T, C_sub, 2]
         # emb: [B, emb_channels]
-        is_legacy = False
-        if x.ndim == 5:
-            if x.shape[-1] == 2 and x.shape[1] != 2:
-                is_legacy = True
-            elif x.shape[-1] == 2 and x.shape[1] == 2 and x.shape[2] != self.in_channels:
-                is_legacy = True
-        if is_legacy:
-            x = x.permute(0, 4, 1, 2, 3)
-
         orig = x
 
         h = self.conv0(self.act0(self.norm0(x)))
 
-        B = x.shape[0]
-        params = self.affine(emb).to(x.dtype)
+        params = self.affine(emb).to(x.dtype).view(x.shape[0], self.out_channels, 1, 1, -1)
         h_norm = self.norm1(h)
         if self.adaptive_scale:
-            h = self.act1(unet_modulate_adaptive(h_norm, params, B, self.out_channels))
+            scale = params[..., :2]
+            shift = params[..., 2:]
+            h = self.act1(h_norm * (1.0 + scale) + shift)
         else:
-            h = self.act1(unet_modulate_shift(h_norm, params, B, self.out_channels))
+            shift = params[..., :2]
+            h = self.act1(h_norm + shift)
 
         h = self.conv1(self.dropout(h))
-        out = residual_add(h, self.skip(orig))
-        if is_legacy:
-            out = out.permute(0, 2, 3, 4, 1)
-        return out
+        return h + self.skip(orig)
 
 
 class ComplexPositionalEmbedding2D(nn.Module):
@@ -434,32 +318,51 @@ class ComplexPositionalEmbedding2D(nn.Module):
         self.max_c = max_c
 
         if pos_embed_type == 'learnable_2d':
-            self.pos_embed = nn.Parameter(torch.randn(1, 2, max_t, max_c, hidden_dim) * 0.02)
+            self.pos_embed = nn.Parameter(torch.randn(1, max_t, max_c, hidden_dim, 2) * 0.02)
         elif pos_embed_type == 'sincos_2d':
             pass
         elif pos_embed_type == 'hybrid_1d_t_sincos_c_learnable':
-            self.c_pos_embed = nn.Parameter(torch.randn(1, 2, 1, max_c, hidden_dim) * 0.02)
+            self.c_pos_embed = nn.Parameter(torch.randn(1, 1, max_c, hidden_dim, 2) * 0.02)
         else:
             raise ValueError(f"Unknown pos_embed_type: {pos_embed_type}")
 
     def forward(self, x: torch.Tensor, t_len: int, c_len: int) -> torch.Tensor:
-        # x: [B, 2, N, hidden_dim], where N = t_len * c_len
-        B, _, N, H = x.shape
+        # x: [B, N, hidden_dim, 2], where N = t_len * c_len
+        B, N, H, _ = x.shape
         device = x.device
         dtype = x.dtype
 
         if self.pos_embed_type == 'learnable_2d':
-            pe = self.pos_embed[:, :, :t_len, :c_len, :]
-            pe = pe.reshape(1, 2, N, H).to(device=device, dtype=dtype)
+            pe = self.pos_embed[:, :t_len, :c_len, :, :]
+            pe = pe.reshape(1, N, H, 2).to(device=device, dtype=dtype)
             return x + pe
 
         elif self.pos_embed_type == 'sincos_2d':
-            pe = sincos_2d_table(t_len, c_len, H, device, dtype)
+            half_dim = H // 2
+            rem_dim = H - half_dim
+
+            t_steps = torch.arange(t_len, device=device, dtype=torch.float32).unsqueeze(1)
+            t_dims = torch.arange(half_dim, device=device, dtype=torch.float32).unsqueeze(0)
+            t_freq = t_steps * torch.exp(-math.log(10000.0) * t_dims / max(1, half_dim))
+
+            c_steps = torch.arange(c_len, device=device, dtype=torch.float32).unsqueeze(1)
+            c_dims = torch.arange(rem_dim, device=device, dtype=torch.float32).unsqueeze(0)
+            c_freq = c_steps * torch.exp(-math.log(10000.0) * c_dims / max(1, rem_dim))
+
+            t_freq_2d = t_freq.unsqueeze(1).expand(t_len, c_len, half_dim)
+            c_freq_2d = c_freq.unsqueeze(0).expand(t_len, c_len, rem_dim)
+            table = torch.cat([t_freq_2d, c_freq_2d], dim=-1).reshape(1, N, H)
+            pe = torch.stack([table.cos(), table.sin()], dim=-1).to(device=device, dtype=dtype)
             return cm.complex_mul(x, pe)
 
         elif self.pos_embed_type == 'hybrid_1d_t_sincos_c_learnable':
-            t_pe = hybrid_t_freq_table(t_len, c_len, H, device, dtype)
-            c_pe = self.c_pos_embed[:, :, :, :c_len, :].expand(1, 2, t_len, c_len, H).reshape(1, 2, N, H).to(device=device, dtype=dtype)
+            t_steps = torch.arange(t_len, device=device, dtype=torch.float32).unsqueeze(1)
+            dims = torch.arange(H, device=device, dtype=torch.float32).unsqueeze(0)
+            t_freq = t_steps * torch.exp(-math.log(10000.0) * dims / H)
+            t_pe = torch.stack([t_freq.cos(), t_freq.sin()], dim=-1).to(device=device, dtype=dtype)
+            t_pe = t_pe.unsqueeze(1).expand(t_len, c_len, H, 2).reshape(1, N, H, 2)
+
+            c_pe = self.c_pos_embed[:, :, :c_len, :, :].expand(1, t_len, c_len, H, 2).reshape(1, N, H, 2).to(device=device, dtype=dtype)
             x = x + c_pe
             return cm.complex_mul(x, t_pe)
 
@@ -493,15 +396,15 @@ class DiTBlock(nn.Module):
             nn.init.constant_(self.adaLN_modulation[1].l_i.bias, 0)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        # x: [B, 2, N, hidden_dim]
-        # c: [B, 2, hidden_dim]
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=2)
+        # x: [B, N, hidden_dim, 2]
+        # c: [B, hidden_dim, 2]
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         mod_x = modulate(self.norm1(x), shift_msa, scale_msa)
         attn_out = self.attn(mod_x, mod_x, mod_x)
-        x = dit_gate_add(x, gate_msa, attn_out)
+        x = x + gate_msa.unsqueeze(1) * attn_out
         mod_x2 = modulate(self.norm2(x), shift_mlp, scale_mlp)
         mlp_out = self.mlp(mod_x2)
-        x = dit_gate_add(x, gate_mlp, mlp_out)
+        x = x + gate_mlp.unsqueeze(1) * mlp_out
         return x
 
 
@@ -529,7 +432,7 @@ class FinalLayer(nn.Module):
             nn.init.constant_(self.linear.l_i.bias, 0)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=2)
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm(x), shift, scale)
         x = self.linear(x)
         return x
@@ -557,7 +460,9 @@ class FourierEmbedding(torch.nn.Module):
         self.register_buffer('freqs', torch.randn(num_channels // 2) * scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return fourier_embed(x, self.freqs)
+        x = x.ger((2.0 * np.pi * self.freqs).to(x.dtype))
+        x = torch.cat([x.cos(), x.sin()], dim=1)
+        return x
 
 
 @persistence.persistent_class
@@ -601,10 +506,6 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
             encdec_channel_mult = channel_mult
 
         self.img_resolution = img_resolution
-        if isinstance(img_resolution, int):
-            self.img_h = self.img_w = img_resolution
-        else:
-            self.img_h, self.img_w = img_resolution[0], img_resolution[1]
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.label_dim = label_dim
@@ -725,46 +626,27 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
         orig_ndim = x.ndim
         is_complex_input = torch.is_complex(x)
         is_concat_real_imag = False
-        is_legacy_5d = False
-
         if is_complex_input:
-            x = torch.stack([x.real, x.imag], dim=1)
-        elif x.ndim == 5:
-            if x.shape[1] != 2 and x.shape[-1] == 2:
-                is_legacy_5d = True
-                x = x.permute(0, 4, 1, 2, 3)
-            elif x.shape[1] == 2 and x.shape[-1] == 2:
-                if x.shape[2] == self.img_h or (x.shape[1] == self.in_channels and x.shape[2] != self.in_channels):
-                    is_legacy_5d = True
-                    x = x.permute(0, 4, 1, 2, 3)
-                else:
-                    is_legacy_5d = False
-            elif x.shape[1] == 2:
-                is_legacy_5d = False
-        elif x.ndim >= 3 and x.shape[-1] == 2 and x.shape[1] != 2:
-            is_legacy_5d = True
-            perm = [0, x.ndim - 1] + list(range(1, x.ndim - 1))
-            x = x.permute(*perm)
+            x = torch.stack([x.real, x.imag], dim=-1)
         elif x.ndim == 4:
             if x.shape[1] == 2 * self.in_channels:
                 # 4D tensor where real and imag are concatenated along antenna dimension [B, 2*A, T, C]
                 is_concat_real_imag = True
-                x = torch.stack([x[:, :self.in_channels], x[:, self.in_channels:]], dim=1)
+                x = torch.stack([x[:, :self.in_channels], x[:, self.in_channels:]], dim=-1)
             else:
                 # 4D float tensor with in_channels, treat as real-only with zero imaginary part
-                x = torch.stack([x, torch.zeros_like(x)], dim=1)
+                x = torch.stack([x, torch.zeros_like(x)], dim=-1)
 
         # Pad spatial dimensions to power of two
         x, pad_h, pad_w, orig_H, orig_W = pad_to_power_of_two(x)
 
         # Process noise labels
-        B = x.shape[0]
         if noise_labels.ndim > 1:
             noise_labels = torch.sqrt(torch.mean(torch.flatten(noise_labels, start_dim=1)**2, dim=1))
         if noise_labels.ndim == 0:
-            noise_labels = noise_labels.unsqueeze(0).repeat(B)
-        elif noise_labels.shape[0] == 1 and B > 1:
-            noise_labels = noise_labels.repeat(B)
+            noise_labels = noise_labels.unsqueeze(0).repeat(x.shape[0])
+        elif noise_labels.shape[0] == 1 and x.shape[0] > 1:
+            noise_labels = noise_labels.repeat(x.shape[0])
         emb = self.map_noise(noise_labels.to(torch.float32))
         emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) # swap sin/cos
 
@@ -778,7 +660,7 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
             if tmp is not None:
                 tmp = tmp.to(torch.float32)
                 if self.training and self.label_dropout and self.label_type != 'no_label':
-                    dropout_mask = (torch.rand([B, 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
+                    dropout_mask = (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
                     while dropout_mask.ndim < tmp.ndim:
                         dropout_mask = dropout_mask.unsqueeze(-1)
                     tmp = tmp * dropout_mask
@@ -807,15 +689,15 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
                 down_idx += 1
 
         # 3. Patchification / Tokenization for DiT
-        B, _, C_enc, t_down, c_down = x.shape
+        B, C_enc, t_down, c_down, _ = x.shape
         N = t_down * c_down
 
-        x_tokens = x.permute(0, 1, 3, 4, 2).reshape(B, 2, N, C_enc)
+        x_tokens = x.permute(0, 2, 3, 1, 4).reshape(B, N, C_enc, 2)
         x_tokens = self.token_proj(x_tokens)
         x_tokens = self.pos_embed(x_tokens, t_down, c_down)
 
         # DiT Complex conditioning
-        c_dit = self.c_proj(emb).to(x.dtype).view(B, self.dit_hidden_dim, 2).permute(0, 2, 1)
+        c_dit = self.c_proj(emb).to(x.dtype).view(B, self.dit_hidden_dim, 2)
 
         for dit_block in self.dit_blocks:
             x_tokens = dit_block(x_tokens, c_dit)
@@ -823,7 +705,7 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
         x_tokens = self.final_layer(x_tokens, c_dit)
 
         # Unpatchify back to spatial grid
-        x = x_tokens.reshape(B, 2, t_down, c_down, C_enc).permute(0, 1, 4, 2, 3)
+        x = x_tokens.reshape(B, t_down, c_down, C_enc, 2).permute(0, 3, 1, 2, 4)
 
         # 4. Convolutional Decoder with U-ViT Skips
         up_idx = 0
@@ -832,7 +714,7 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
                 x = self.upsamplers[up_idx](x)
                 up_idx += 1
             skip = skips.pop()
-            x = torch.cat([x, skip], dim=2)
+            x = torch.cat([x, skip], dim=1)
             for block in stage:
                 x = block(x, emb)
 
@@ -841,11 +723,10 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
         out = unpad_from_power_of_two(out, pad_h, pad_w, orig_H, orig_W)
 
         if is_complex_input:
-            return torch.complex(out[:, 0], out[:, 1])
+            out_r, out_i = out.unbind(-1)
+            return torch.complex(out_r, out_i)
         if is_concat_real_imag:
-            return torch.cat([out[:, 0], out[:, 1]], dim=1)
-        if is_legacy_5d:
-            return out.permute(0, 2, 3, 4, 1)
+            return torch.cat(out.unbind(-1), dim=1)
         if orig_ndim == 4:
-            return out[:, 0]
+            return out[..., 0]
         return out

@@ -33,28 +33,28 @@ def forward_with_dtype(mod, input):
         return mod(input)
 
 def apply_complex(F_r, F_i, X):
-    X_r, X_i = X[:, 0], X[:, 1]
+    X_r, X_i = X.unbind(-1)
     out_r = forward_with_dtype(F_r, X_r) - forward_with_dtype(F_i, X_i)
     out_i = forward_with_dtype(F_r, X_i) + forward_with_dtype(F_i, X_r)
-    return torch.stack((out_r, out_i), dim=1)
+    return torch.stack((out_r, out_i), dim=-1)
 
 def apply_complex_sep(F_r, F_i, X):
-    X_r, X_i = X[:, 0], X[:, 1]
-    return torch.stack((forward_with_dtype(F_r, X_r), forward_with_dtype(F_i, X_i)), dim=1)
+    X_r, X_i = X.unbind(-1)
+    return torch.stack((forward_with_dtype(F_r, X_r), forward_with_dtype(F_i, X_i)), dim=-1)
 
 @torch.jit.script
 def complex_mul(X, Y):
-    X_r, X_i = X[:, 0], X[:, 1]
-    Y_r, Y_i = Y[:, 0], Y[:, 1]
+    X_r, X_i = X.unbind(-1)
+    Y_r, Y_i = Y.unbind(-1)
     Z_r = torch.mul(X_r, Y_r) - torch.mul(X_i, Y_i)
     Z_i = torch.mul(X_r, Y_i) + torch.mul(X_i, Y_r)
-    return torch.stack((Z_r, Z_i), dim=1)
+    return torch.stack((Z_r, Z_i), dim=-1)
 
 @torch.jit.script
 def complex_bmm(X, Y):
     B = X.shape[0]
-    X_r, X_i = X[:, 0], X[:, 1]
-    Y_r, Y_i = Y[:, 0], Y[:, 1]
+    X_r, X_i = X.unbind(-1)
+    Y_r, Y_i = Y.unbind(-1)
     X_c = torch.cat([X_r, X_i], dim=0)
     Y_c1 = torch.cat([Y_r, Y_i], dim=0)
     Y_c2 = torch.cat([Y_i, Y_r], dim=0)
@@ -62,42 +62,24 @@ def complex_bmm(X, Y):
     M2 = torch.bmm(X_c, Y_c2)
     Z_r = M1[:B] - M1[B:]
     Z_i = M2[:B] + M2[B:]
-    return torch.stack((Z_r, Z_i), dim=1)
+    return torch.stack((Z_r, Z_i), dim=-1)
 
 @torch.jit.script
 def complex_softmax(X):
-    X_r, X_i = X[:, 0], X[:, 1]
-    return torch.stack((F.softmax(X_r, dim=-1), F.softmax(X_i, dim=-1)), dim=1)
-
-@torch.jit.script
-def complex_scale_softmax(scores: torch.Tensor, scale: float) -> torch.Tensor:
-    s_r = scores[:, 0] * scale
-    s_i = scores[:, 1] * scale
-    return torch.stack((F.softmax(s_r, dim=-1), F.softmax(s_i, dim=-1)), dim=1)
-
-@torch.jit.script
-def complex_combine_linear(rr: torch.Tensor, ii: torch.Tensor, ir: torch.Tensor, ri: torch.Tensor) -> torch.Tensor:
-    return torch.stack((rr - ii, ir + ri), dim=1)
+    X_r, X_i = X.unbind(-1)
+    return torch.stack((F.softmax(X_r, dim=-1), F.softmax(X_i, dim=-1)), dim=-1)
 
 @torch.jit.script
 def transpose_qkv(x, num_heads: int):
-    # x: [B, 2, N, C] -> [B, 2, N, num_heads, head_dim]
-    B, _, N, C = x.shape
-    head_dim = C // num_heads
-    x = x.reshape(B, 2, N, num_heads, head_dim)
-    # Permute to fold heads into batch: [B, num_heads, 2, N, head_dim] -> [B * num_heads, 2, N, head_dim]
-    x = x.permute(0, 3, 1, 2, 4).reshape(-1, 2, N, head_dim)
-    return x
+    x = x.reshape(x.shape[0], x.shape[1], num_heads, -1, 2)
+    x = x.transpose(1, 2)
+    return x.reshape(-1, x.shape[2], x.shape[3], 2)
 
 @torch.jit.script
 def transpose_output(x, num_heads: int):
-    # x: [B * num_heads, 2, N, head_dim] -> [B, num_heads, 2, N, head_dim]
-    head_dim = x.shape[-1]
-    N = x.shape[2]
-    x = x.reshape(-1, num_heads, 2, N, head_dim)
-    # Permute back to [B, 2, N, num_heads, head_dim]
-    x = x.permute(0, 2, 3, 1, 4)
-    return x.reshape(x.shape[0], 2, N, -1)  # [B, 2, N, C]
+    x = x.reshape(-1, num_heads, x.shape[1], x.shape[2], 2)
+    x = x.transpose(1, 2)
+    return x.reshape(x.shape[0], x.shape[1], -1, 2)
 
 
 class ComplexDropout(nn.Module):
@@ -109,7 +91,7 @@ class ComplexDropout(nn.Module):
         if self.p == 0.0 or not self.training:
             return X
         mask_shape = list(X.shape)
-        mask_shape[1] = 1
+        mask_shape[-1] = 1
         mask = torch.ones(mask_shape, device=X.device, dtype=X.dtype)
         mask = F.dropout(mask, p=self.p, training=True)
         return X * mask
@@ -192,7 +174,7 @@ class NaiveComplexLayerNorm(nn.Module):
         self.ln_i = nn.LayerNorm(normalized_shape, eps, elementwise_affine)
 
     def forward(self, X):
-        X_r, X_i = X[:, 0], X[:, 1]
+        X_r, X_i = X.unbind(-1)
         w_r = self.ln_r.weight.to(X_r.dtype) if self.ln_r.weight is not None else None
         b_r = self.ln_r.bias.to(X_r.dtype) if self.ln_r.bias is not None else None
         w_i = self.ln_i.weight.to(X_i.dtype) if self.ln_i.weight is not None else None
@@ -200,7 +182,7 @@ class NaiveComplexLayerNorm(nn.Module):
         return torch.stack((
             F.layer_norm(X_r, self.ln_r.normalized_shape, w_r, b_r, self.ln_r.eps),
             F.layer_norm(X_i, self.ln_i.normalized_shape, w_i, b_i, self.ln_i.eps)
-        ), dim=1)
+        ), dim=-1)
 
 
 class ComplexLinear(nn.Module):
@@ -210,16 +192,14 @@ class ComplexLinear(nn.Module):
         self.l_i = nn.Linear(in_features, out_features, bias=bias, dtype=torch.float32)
 
     def forward(self, X):
-        X_r, X_i = X[:, 0], X[:, 1]
+        X_r, X_i = X.unbind(-1)
         w_r = self.l_r.weight.to(X_r.dtype)
         b_r = self.l_r.bias.to(X_r.dtype) if self.l_r.bias is not None else None
         w_i = self.l_i.weight.to(X_i.dtype)
         b_i = self.l_i.bias.to(X_i.dtype) if self.l_i.bias is not None else None
-        rr = F.linear(X_r, w_r, b_r)
-        ii = F.linear(X_i, w_i, b_i)
-        ir = F.linear(X_i, w_r, b_r)
-        ri = F.linear(X_r, w_i, b_i)
-        return complex_combine_linear(rr, ii, ir, ri)
+        out_r = F.linear(X_r, w_r, b_r) - F.linear(X_i, w_i, b_i)
+        out_i = F.linear(X_i, w_r, b_r) + F.linear(X_r, w_i, b_i)
+        return torch.stack((out_r, out_i), dim=-1)
 
 
 class ComplexMLP(nn.Module):
@@ -296,7 +276,7 @@ class ComplexResidual3d(nn.Module):
         return self.relu2(Y)
 
 
-# [2, 32, 32, 10, 10, 3] -> [2, 32, 10, 32*10*3]
+# [32 32 10 10 3] -> [32 10 32*10*3]
 class ComplexSegment(nn.Module):
     def __init__(self, input_channels, seg_channels, seg_size):
         super().__init__()
@@ -311,7 +291,7 @@ class ComplexSegment(nn.Module):
 
     def forward(self, X):
         Y = self.seg_conv(X)
-        Y = Y.transpose(2, 3)
+        Y = Y.transpose(1, 2)
         Y = self.flt(Y)
         return Y
 
@@ -323,9 +303,6 @@ class Complex2Real(nn.Module):
         self.linear2 = nn.Linear(2, 1)
 
     def forward(self, X):
-        # X: [B, 2, ...] -> permute complex dim to end for Linear projection
-        perm = [0] + list(range(2, X.ndim)) + [1]
-        X = X.permute(*perm)
         X = self.linear1(X)
         X = self.linear2(F.relu(X))
         return X.squeeze(dim=-1)
@@ -333,18 +310,19 @@ class Complex2Real(nn.Module):
 
 class ComplexDotProductAttention(nn.Module):
     """
-    Query shape: [B, 2, query_num, query_key_dim]
-    Key shape: [B, 2, key_value_num, query_key_dim]
-    Value shape: [B, 2, key_value_num, value_dim]
+    Query shape: [batch_size, query_num, query_key_dim]
+    Key shape: [batch_size, key_value_num, query_key_dim]
+    Value shape: [batch_size, key_value_num, value_dim]
     """
     def __init__(self, dropout, **kwargs):
         super(ComplexDotProductAttention, self).__init__(**kwargs)
         self.dropout = ComplexDropout(dropout)
 
     def forward(self, queries, keys, values):
-        query_key_dim = queries.shape[-1]
-        scores = complex_bmm(queries, keys.transpose(-2, -1))
-        self.attention_weights = complex_scale_softmax(scores, 1.0 / math.sqrt(query_key_dim))
+        query_key_dim = queries.shape[-2]
+        self.attention_weights = complex_softmax(
+            complex_bmm(queries, keys.transpose(1, 2)) / math.sqrt(query_key_dim)
+        )
         Y = complex_bmm(self.dropout(self.attention_weights), values)
         return Y
 
@@ -385,17 +363,16 @@ class ComplexPositionalEncoding(nn.Module):
     def __init__(self, hidden_dim, dropout, max_len=10000):
         super(ComplexPositionalEncoding, self).__init__()
         self.dropout = ComplexDropout(dropout)
-        pcode = torch.zeros((1, 2, max_len, hidden_dim), dtype=torch.float32)
+        pcode = torch.zeros((1, max_len, hidden_dim, 2), dtype=torch.float32)
         pos = torch.arange(max_len, dtype=torch.float32).reshape(-1, 1) / torch.pow(
             10000, torch.arange(0, hidden_dim, dtype=torch.float32) / hidden_dim
         )
-        pcode[0, 0, :, :] = torch.cos(pos)
-        pcode[0, 1, :, :] = torch.sin(pos)
+        pcode[:, :, :, 0] = torch.cos(pos)
+        pcode[:, :, :, 1] = torch.sin(pos)
         self.register_buffer("pcode", pcode, persistent=False)
 
     def forward(self, X):
-        # X: [B, 2, seq_len, hidden_dim]
-        X = complex_mul(X, self.pcode[:, :, : X.shape[2], :].to(X.device))
+        X = complex_mul(X, self.pcode[:, : X.shape[1], :, :].to(X.device))
         Y = self.dropout(X)
         return Y
 
