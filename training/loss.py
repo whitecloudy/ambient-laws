@@ -21,6 +21,14 @@ from training.sampler import edm_sampler, edm_sampler_with_scheduler, padding_ma
 def from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, sigma_t, sigma_t_n):
     return (1 - (sigma_t_n / sigma_t) ** 2) * x0_pred + ((sigma_t_n / sigma_t) ** 2) * noisy_input
 
+
+def _get_net_attr(n, name):
+    if hasattr(n, name):
+        return getattr(n, name)
+    elif hasattr(n, 'module') and hasattr(n.module, name):
+        return getattr(n.module, name)
+    return None
+
 #----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
 # of Diffusion-Based Generative Models" (EDM).
@@ -331,6 +339,151 @@ class EDMLoss_with_scheduler:
             loss_consistency_part = self.consistency_coeff * consistency_weight * consistency_loss
             loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
 
+        loss = loss * padding_mask
+        return loss, x0_pred, return_sigma, kl_loss
+
+
+#----------------------------------------------------------------------------
+# Improved loss function proposed in the paper "Elucidating the Design Space
+# of Diffusion-Based Generative Models" (EDM) with Latent z and KL regularization.
+
+@persistence.persistent_class
+class EDMLoss_with_latent_z:
+    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
+                 num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False,
+                 kl_coeff=1.0, **kwargs):
+        self.P_mean = P_mean
+        self.P_std = P_std
+        self.sigma_data = sigma_data
+
+        self.no_asm = no_asm
+
+        self.num_consistency_steps = num_consistency_steps
+        self.num_primes = num_primes
+        self.consistency_coeff = consistency_coeff
+        self.consistency_batch_size = consistency_batch_size_per_gpu
+        self.with_weight = with_weight
+        self.with_grad = with_grad
+        self.kl_coeff = kl_coeff
+
+    def __call__(self, net, images, labels=None, current_sigma=0.0, augment_pipe=None, original_shape=None):
+        current_sigma = torch.as_tensor(current_sigma, device=images.device, dtype=images.dtype)
+        while current_sigma.ndim < images.ndim:
+            current_sigma = current_sigma.unsqueeze(-1)
+        current_sigma = current_sigma.expand_as(images)
+
+        if original_shape is not None:
+            padding_mask = padding_mask_from_original_shape(original_shape, images.shape)
+        else:
+            padding_mask = torch.ones_like(images)
+
+        orig_current_sigma = current_sigma
+        current_sigma = current_sigma * padding_mask
+
+        if self.no_asm:
+            current_sigma = torch.zeros_like(current_sigma)
+        
+        rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device, dtype=images.dtype)
+        # sample a sigma in [current_sigma, sigma_T]
+        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+        sigma = torch.clamp(sigma, min=current_sigma + 1e-6)
+
+        generate_latent_z_fn = _get_net_attr(net, "generate_latent_z")
+        assert generate_latent_z_fn is not None, "net must have generate_latent_z method in EDMLoss_with_latent_z"
+
+        # generate_latent_z_fn에 force_training이 있는지 체크 후 있으면 Loss method에선 항상 True 전달
+        if 'force_training' in inspect.signature(generate_latent_z_fn).parameters:
+            z, kl_loss = generate_latent_z_fn(images, orig_current_sigma, force_training=True)
+        else:
+            z, kl_loss = generate_latent_z_fn(images, orig_current_sigma)
+
+        y, augment_labels = (images, None)
+        
+        # add additional noise to reach the level sigma
+        diff_sq = torch.clamp(sigma ** 2 - current_sigma ** 2, min=1e-12)
+        n = torch.randn_like(y) * torch.sqrt(diff_sq)
+
+        noisy_input = (y + n) * padding_mask
+
+        scheduler_mode = getattr(net, 'scheduler_mode', getattr(getattr(net, 'module', None), 'scheduler_mode', None))
+        is_classes = (hasattr(net, 'model') and getattr(net.model, 'label_type', None) == 'classes') or (hasattr(net, 'module') and hasattr(net.module, 'model') and getattr(net.module.model, 'label_type', None) == 'classes')
+        
+        if scheduler_mode == 'using_sigma_t_n_wo_z':
+            class_labels_to_pass = labels
+            z_to_pass = None
+        else:
+            class_labels_to_pass = z if (labels is None or is_classes or (isinstance(labels, torch.Tensor) and labels.ndim >= 2 and labels.shape[-1] == 0)) else labels
+            z_to_pass = z
+
+        x0_pred = net(noisy_input, sigma, class_labels=class_labels_to_pass, augment_labels=augment_labels, z=z_to_pass)
+
+        # sigma가 0으로 남아있는걸 제거해서 nan 생성 방지
+        if isinstance(sigma, torch.Tensor):
+            nonzero_sigma = torch.where(sigma < 1e-8, torch.tensor(1e-8, dtype=sigma.dtype, device=sigma.device), sigma)
+        elif sigma < 1e-8:
+            nonzero_sigma = 1e-8
+        else:
+            nonzero_sigma = sigma
+
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
+
+        # loss weight depends on sigma
+        weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
+        if kl_loss is not None:
+            kl_loss_tensor = kl_loss.to(y.dtype) if isinstance(kl_loss, torch.Tensor) else torch.tensor(kl_loss, dtype=y.dtype, device=y.device)
+            loss = weight * ((D_yn - y) ** 2) + self.kl_coeff * kl_loss_tensor
+        else:
+            loss = weight * ((D_yn - y) ** 2)
+        return_sigma = sigma
+    
+        # consistency loss
+        if self.consistency_coeff > 0:
+            # sample a new_sigma in [sigma, 0]
+            new_rnd_normal = torch.randn_like(rnd_normal)
+            new_sigma = (new_rnd_normal * self.P_std + self.P_mean).exp()
+            new_sigma = torch.clamp(new_sigma, max=sigma)
+
+            # we will only keep the first batch_size / self.num_primes part of the batch
+            consistency_batch_size = self.consistency_batch_size
+            if noisy_input.shape[0] < consistency_batch_size:
+                consistency_batch_size = noisy_input.shape[0]
+            c_noisy_input = noisy_input[:consistency_batch_size]
+            c_sigma = sigma[:consistency_batch_size]
+            c_new_sigma = new_sigma[:consistency_batch_size]
+            c_class_labels = class_labels_to_pass[:consistency_batch_size] if class_labels_to_pass is not None else None
+            c_z = z_to_pass[:consistency_batch_size] if z_to_pass is not None else None
+            c_edm_padding_mask = padding_mask[:consistency_batch_size]
+
+            # repeat everything num_primes times
+            c_noisy_input = c_noisy_input.repeat_interleave(self.num_primes, dim=0)
+            c_sigma = c_sigma.repeat_interleave(self.num_primes, dim=0)
+            c_new_sigma = c_new_sigma.repeat_interleave(self.num_primes, dim=0)
+            if c_class_labels is not None:
+                c_class_labels = c_class_labels.repeat_interleave(self.num_primes, dim=0)
+            if c_z is not None:
+                c_z = c_z.repeat_interleave(self.num_primes, dim=0)
+            c_edm_padding_mask = c_edm_padding_mask.repeat_interleave(self.num_primes, dim=0)
+
+            # run sampler from sigma -> new_sigma
+            with torch.no_grad() if not self.with_grad else torch.enable_grad():
+                x_t_prime = edm_sampler(net, c_noisy_input, class_labels=c_class_labels, num_steps=self.num_consistency_steps, 
+                                        sigma_min=c_new_sigma, sigma_max=c_sigma, padding_mask=c_edm_padding_mask) 
+            x_t_prime = x_t_prime.to(images.dtype)
+            # get predictions for x_t_prime
+            x0_pred_prime = net(x_t_prime, c_new_sigma, class_labels=c_class_labels, z=c_z)
+            # group together predictions
+            x0_pred_prime = x0_pred_prime.reshape(consistency_batch_size, self.num_primes, *x0_pred_prime.shape[1:])
+            # average predictions
+            average_x0_pred_prime = x0_pred_prime.mean(dim=1)
+            # check difference to x0_pred
+            consistency_loss = ((average_x0_pred_prime - x0_pred[:consistency_batch_size]) ** 2)
+            consistency_weight = weight[:consistency_batch_size] if self.with_weight else 1.0
+            
+            # In-place 연산 방지
+            loss_consistency_part = self.consistency_coeff * consistency_weight * consistency_loss
+            loss = torch.cat([loss[:consistency_batch_size] + loss_consistency_part, loss[consistency_batch_size:]], dim=0)
+        
         loss = loss * padding_mask
         return loss, x0_pred, return_sigma, kl_loss
 

@@ -63,13 +63,14 @@ def save_training_state(dir, net, optimizer, cur_nimg, remove_path=None):
         return None
 
     unwrapped_net = net.module if hasattr(net, 'module') else net
+    raw_model = getattr(unwrapped_net, '_orig_mod', unwrapped_net)
     
     # -------------------------------------------------------------------
     # [핵심 변경 사항 2] CPU 복사본 생성 후 share_memory_() 호출
     # - 프로세스 간 통신(IPC) 시 텐서 데이터가 복사되는 병목을 원천 차단합니다.
     # -------------------------------------------------------------------
     net_state_cpu = {}
-    for k, v in unwrapped_net.state_dict().items():
+    for k, v in raw_model.state_dict().items():
         t = v.detach().cpu().clone()
         t.share_memory_()  # 다른 프로세스에서 읽을 수 있도록 공유 메모리에 등록
         net_state_cpu[k] = t
@@ -93,7 +94,7 @@ def save_training_state(dir, net, optimizer, cur_nimg, remove_path=None):
     # -------------------------------------------------------------------
     if not hasattr(save_training_state, "_cpu_net_cache"):
         temp_buf = io.BytesIO()
-        torch.save(unwrapped_net, temp_buf)
+        torch.save(raw_model, temp_buf)
         temp_buf.seek(0)
         save_training_state._cpu_net_cache = torch.load(temp_buf, map_location='cpu', weights_only=False)
         save_training_state._cpu_net_cache.eval().requires_grad_(False)
@@ -236,6 +237,8 @@ def training_loop(
     debug_test          = False,
     temp_save           = False,   
     grad_clip           = 1000,
+    compile_network     = False,    # Enable torch.compile for the training network
+    compile_mode        = 'default',# torch.compile mode: 'default', 'reduce-overhead', 'max-autotune'
 ):
     # Initialize.
     start_time = time.time()
@@ -357,14 +360,27 @@ def training_loop(
             labels = None
         misc.print_module_summary(net, [images, sigma, labels], max_nesting=2, verbose=dist.get_rank() == 0)
 
+        # Profile FLOPs per sample (excluding batch size effect)
+        if dist.get_rank() == 0:
+            try:
+                from calflops import calculate_flops
+                sample_args = [images[:1], sigma[:1]] if labels is None else [images[:1], sigma[:1], labels[:1]]
+                was_training = net.training
+                net.eval()
+                try:
+                    flops, macs, _ = calculate_flops(model=net, args=sample_args, output_as_string=True, print_results=False)
+                    dist.print0(f'Model complexity (per sample, batch=1): FLOPs = {flops}, MACs = {macs}\n')
+                finally:
+                    net.train(was_training)
+            except Exception as e:
+                dist.print0(f'Warning: Failed to calculate FLOPs: {e}\n')
+
     # Setup optimizer.
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     dist.print0('Setting up optimizer...')
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     # augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     augment_pipe = None
-    dist.print0('Setting DDP...')
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=True, find_unused_parameters=True)
     ema = copy.deepcopy(net).eval().requires_grad_(False)
 
     # Resume training from previous snapshot.
@@ -387,6 +403,14 @@ def training_loop(
             nimg = int(data['nimg'])
         del data # conserve memory
     torch.cuda.empty_cache()
+
+    # Compile network if requested
+    if compile_network:
+        dist.print0(f'Compiling network with torch.compile(mode="{compile_mode}")...')
+        net = torch.compile(net, mode=compile_mode)
+
+    dist.print0('Setting DDP...')
+    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=True, find_unused_parameters=True)
 
     # Train.
     dist.print0(f'Training for {total_kimg} kimg...')
@@ -472,7 +496,8 @@ def training_loop(
         if ema_rampup_ratio is not None:
             ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
         ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
-        for p_ema, p_net in zip(ema.parameters(), net.parameters()):
+        raw_net = getattr(net, '_orig_mod', net)
+        for p_ema, p_net in zip(ema.parameters(), raw_net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
 
         # Perform maintenance tasks once per tick.

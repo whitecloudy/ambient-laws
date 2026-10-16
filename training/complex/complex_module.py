@@ -33,34 +33,40 @@ def forward_with_dtype(mod, input):
         return mod(input)
 
 def apply_complex(F_r, F_i, X):
-    X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
+    X_r, X_i = X.unbind(-1)
     out_r = forward_with_dtype(F_r, X_r) - forward_with_dtype(F_i, X_i)
     out_i = forward_with_dtype(F_r, X_i) + forward_with_dtype(F_i, X_r)
     return torch.stack((out_r, out_i), dim=-1)
 
 def apply_complex_sep(F_r, F_i, X):
-    X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
+    X_r, X_i = X.unbind(-1)
     return torch.stack((forward_with_dtype(F_r, X_r), forward_with_dtype(F_i, X_i)), dim=-1)
 
 @torch.jit.script
 def complex_mul(X, Y):
-    X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
-    Y_r, Y_i = [y.squeeze(dim=-1) for y in torch.split(Y, 1, dim=-1)]
+    X_r, X_i = X.unbind(-1)
+    Y_r, Y_i = Y.unbind(-1)
     Z_r = torch.mul(X_r, Y_r) - torch.mul(X_i, Y_i)
     Z_i = torch.mul(X_r, Y_i) + torch.mul(X_i, Y_r)
     return torch.stack((Z_r, Z_i), dim=-1)
 
 @torch.jit.script
 def complex_bmm(X, Y):
-    X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
-    Y_r, Y_i = [y.squeeze(dim=-1) for y in torch.split(Y, 1, dim=-1)]
-    Z_r = torch.bmm(X_r, Y_r) - torch.bmm(X_i, Y_i)
-    Z_i = torch.bmm(X_r, Y_i) + torch.bmm(X_i, Y_r)
+    B = X.shape[0]
+    X_r, X_i = X.unbind(-1)
+    Y_r, Y_i = Y.unbind(-1)
+    X_c = torch.cat([X_r, X_i], dim=0)
+    Y_c1 = torch.cat([Y_r, Y_i], dim=0)
+    Y_c2 = torch.cat([Y_i, Y_r], dim=0)
+    M1 = torch.bmm(X_c, Y_c1)
+    M2 = torch.bmm(X_c, Y_c2)
+    Z_r = M1[:B] - M1[B:]
+    Z_i = M2[:B] + M2[B:]
     return torch.stack((Z_r, Z_i), dim=-1)
 
 @torch.jit.script
 def complex_softmax(X):
-    X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
+    X_r, X_i = X.unbind(-1)
     return torch.stack((F.softmax(X_r, dim=-1), F.softmax(X_i, dim=-1)), dim=-1)
 
 @torch.jit.script
@@ -94,31 +100,26 @@ class ComplexDropout(nn.Module):
 class ComplexGELU(nn.Module):
     def __init__(self, approximate='none'):
         super().__init__()
-        self.gelu_r = nn.GELU(approximate)
-        self.gelu_i = nn.GELU(approximate)
+        self.approximate = approximate
     
     def forward(self, X):
-        return apply_complex_sep(self.gelu_r, self.gelu_i, X)
+        return F.gelu(X, approximate=self.approximate)
 
 
 class ComplexSiLU(nn.Module):
     def __init__(self):
         super().__init__()
-        self.silu_r = nn.SiLU()
-        self.silu_i = nn.SiLU()
 
     def forward(self, X):
-        return apply_complex_sep(self.silu_r, self.silu_i, X)
+        return F.silu(X)
 
 
 class ComplexReLU(nn.Module):
     def __init__(self):
         super().__init__()
-        self.relu_r = nn.ReLU()
-        self.relu_i = nn.ReLU()
 
     def forward(self, X):
-        return apply_complex_sep(self.relu_r, self.relu_i, X)
+        return F.relu(X)
 
 
 class ComplexAvgPool3d(nn.Module):
@@ -173,7 +174,15 @@ class NaiveComplexLayerNorm(nn.Module):
         self.ln_i = nn.LayerNorm(normalized_shape, eps, elementwise_affine)
 
     def forward(self, X):
-        return apply_complex_sep(self.ln_r, self.ln_i, X)
+        X_r, X_i = X.unbind(-1)
+        w_r = self.ln_r.weight.to(X_r.dtype) if self.ln_r.weight is not None else None
+        b_r = self.ln_r.bias.to(X_r.dtype) if self.ln_r.bias is not None else None
+        w_i = self.ln_i.weight.to(X_i.dtype) if self.ln_i.weight is not None else None
+        b_i = self.ln_i.bias.to(X_i.dtype) if self.ln_i.bias is not None else None
+        return torch.stack((
+            F.layer_norm(X_r, self.ln_r.normalized_shape, w_r, b_r, self.ln_r.eps),
+            F.layer_norm(X_i, self.ln_i.normalized_shape, w_i, b_i, self.ln_i.eps)
+        ), dim=-1)
 
 
 class ComplexLinear(nn.Module):
@@ -183,7 +192,14 @@ class ComplexLinear(nn.Module):
         self.l_i = nn.Linear(in_features, out_features, bias=bias, dtype=torch.float32)
 
     def forward(self, X):
-        return apply_complex(self.l_r, self.l_i, X)
+        X_r, X_i = X.unbind(-1)
+        w_r = self.l_r.weight.to(X_r.dtype)
+        b_r = self.l_r.bias.to(X_r.dtype) if self.l_r.bias is not None else None
+        w_i = self.l_i.weight.to(X_i.dtype)
+        b_i = self.l_i.bias.to(X_i.dtype) if self.l_i.bias is not None else None
+        out_r = F.linear(X_r, w_r, b_r) - F.linear(X_i, w_i, b_i)
+        out_i = F.linear(X_i, w_r, b_r) + F.linear(X_r, w_i, b_i)
+        return torch.stack((out_r, out_i), dim=-1)
 
 
 class ComplexMLP(nn.Module):
