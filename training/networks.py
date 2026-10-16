@@ -887,6 +887,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 # RF_DiT: Complex-valued Diffusion Transformer with Convolutional Encoder-Decoder
 # and U-ViT style skip connections.
 from training.rf_dit import RF_DiT
+from training.rf_dit_real import RF_DiT_Real
 
 
 
