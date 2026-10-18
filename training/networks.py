@@ -886,8 +886,16 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 #----------------------------------------------------------------------------
 # RF_DiT: Complex-valued Diffusion Transformer with Convolutional Encoder-Decoder
 # and U-ViT style skip connections.
-from training.rf_dit import RF_DiT
-from training.rf_dit_real import RF_DiT_Real
+try:
+    from training.rf_dit import RF_DiT
+except ImportError:
+    pass
+
+try:
+    from training.rf_dit_real import RF_DiT_Real
+except ImportError:
+    pass
+
 
 
 
@@ -1470,6 +1478,14 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
                 model_out_channels = img_channels // 2
             else:
                 model_out_channels = img_channels
+
+        if model_type not in globals():
+            if model_type == 'RF_DiT_Real':
+                from training.rf_dit_real import RF_DiT_Real
+                globals()['RF_DiT_Real'] = RF_DiT_Real
+            elif model_type == 'RF_DiT':
+                from training.rf_dit import RF_DiT
+                globals()['RF_DiT'] = RF_DiT
 
         self.model = globals()[model_type](img_resolution=img_resolution, in_channels=model_in_channels, out_channels=model_out_channels, label_dim=label_dim, **model_kwargs)
 

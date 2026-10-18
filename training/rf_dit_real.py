@@ -7,6 +7,25 @@ import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
 from torch_utils import persistence
 
+try:
+    from training.networks import (
+        weight_init,
+        Linear,
+        Conv2d,
+        GroupNorm,
+        PositionalEmbedding,
+        FourierEmbedding,
+    )
+except ImportError:
+    from .networks import (
+        weight_init,
+        Linear,
+        Conv2d,
+        GroupNorm,
+        PositionalEmbedding,
+        FourierEmbedding,
+    )
+
 
 @torch.jit.script
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -53,42 +72,51 @@ def unpad_from_power_of_two(x: torch.Tensor, pad_h: int, pad_w: int, orig_H: int
     return x
 
 
-class RealLinear(nn.Linear):
+@persistence.persistent_class
+class RealLinear(Linear):
     """
-    Linear layer that casts weight and bias to input dtype to support mixed precision (e.g. BF16).
+    Linear layer that casts weight and bias to input dtype to support mixed precision (e.g. BF16),
+    inheriting from networks.py Linear and initialized via weight_init.
     """
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        w = self.weight.to(input.dtype)
-        b = self.bias.to(input.dtype) if self.bias is not None else None
-        return F.linear(input, w, b)
+    def __init__(self, in_features, out_features, bias=True, init_mode='xavier_uniform', init_weight=1, init_bias=0):
+        super().__init__(
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            init_mode=init_mode,
+            init_weight=init_weight,
+            init_bias=init_bias,
+        )
 
 
-class RealGroupNorm(nn.Module):
+@persistence.persistent_class
+class RealGroupNorm(GroupNorm):
     """
     Group Normalization for real-valued tensors with shape [B, C, T, W].
+    Inherits from networks.py GroupNorm.
     When causal=True, normalizes independently per time-step (B*T, C, 1, W)
     to strictly prevent future information leakage across the T dimension.
     """
     def __init__(self, num_channels: int, num_groups: int = 32, min_channels_per_group: int = 4, eps: float = 1e-5, causal: bool = False):
-        super().__init__()
+        super().__init__(num_channels=num_channels, num_groups=num_groups, min_channels_per_group=min_channels_per_group, eps=eps)
         self.causal = causal
-        num_groups = min(num_groups, max(1, num_channels // min_channels_per_group))
-        self.gn = nn.GroupNorm(num_groups=num_groups, num_channels=num_channels, eps=eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.gn.weight.to(x.dtype) if self.gn.weight is not None else None
-        b = self.gn.bias.to(x.dtype) if self.gn.bias is not None else None
         if self.causal:
             B, C, T, W = x.shape
             x_t = x.permute(0, 2, 1, 3).reshape(B * T, C, 1, W)
-            out = F.group_norm(x_t, self.gn.num_groups, w, b, self.gn.eps).reshape(B, T, C, W).permute(0, 2, 1, 3)
+            w = self.weight.to(x.dtype) if self.weight is not None else None
+            b = self.bias.to(x.dtype) if self.bias is not None else None
+            out = F.group_norm(x_t, self.num_groups, w, b, self.eps).reshape(B, T, C, W).permute(0, 2, 1, 3)
             return out
-        return F.group_norm(x, self.gn.num_groups, w, b, self.gn.eps)
+        return super().forward(x)
 
 
-class RealConv2d(nn.Module):
+@persistence.persistent_class
+class RealConv2d(Conv2d):
     """
     Real 2D Convolution operating on [B, C_in, T, W].
+    Inherits from networks.py Conv2d, utilizing its weight_init routine.
     Supports RF_SongUNet-style resample_filter for anti-aliasing downsampling and upsampling,
     as well as causal convolution along the T dimension.
     """
@@ -104,47 +132,33 @@ class RealConv2d(nn.Module):
         down: bool = False,
         up: bool = False,
         resample_filter = [1, 1],
+        init_mode: str = 'xavier_uniform',
+        init_weight: float = 1.0,
+        init_bias: float = 0.0,
     ):
-        super().__init__()
-        assert not (down and up), "Cannot specify both down=True and up=True"
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel=kernel_size,
+            bias=bias,
+            up=up,
+            down=down,
+            resample_filter=resample_filter,
+            init_mode=init_mode,
+            init_weight=init_weight,
+            init_bias=init_bias,
+            stride=stride,
+        )
         self.causal = causal
-        self.down = down
-        self.up = up
-
         if isinstance(kernel_size, int):
             self.kernel_size = (kernel_size, kernel_size)
         else:
             self.kernel_size = tuple(kernel_size)
 
-        if isinstance(stride, int):
-            self.stride = (stride, stride)
-        else:
-            self.stride = tuple(stride)
-
         if isinstance(dilation, int):
             self.dilation = (dilation, dilation)
         else:
             self.dilation = tuple(dilation)
-
-        # Setup resample_filter matching RF_SongUNet
-        if (down or up) and resample_filter is not None:
-            f_h = torch.as_tensor(resample_filter[0] if isinstance(resample_filter[0], (list, tuple)) else resample_filter, dtype=torch.float32)
-            f_w = torch.as_tensor(resample_filter[1] if len(resample_filter) > 1 and isinstance(resample_filter[1], (list, tuple)) else resample_filter, dtype=torch.float32)
-            f = f_h.ger(f_w)
-            f = f.unsqueeze(0).unsqueeze(1) / (f_h.sum() * f_w.sum())
-            self.register_buffer('resample_filter', f)
-        else:
-            self.register_buffer('resample_filter', None)
-
-        self.conv = nn.Conv2d(
-            in_channels, out_channels, kernel_size=self.kernel_size,
-            stride=self.stride, dilation=self.dilation, padding=0, bias=bias
-        )
-        nn.init.kaiming_normal_(self.conv.weight)
-        if bias:
-            nn.init.constant_(self.conv.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C_in, T, W]
@@ -173,6 +187,9 @@ class RealConv2d(nn.Module):
             x = F.conv_transpose2d(x, f_tile, groups=self.in_channels, stride=(2, 2))
 
         # 2. Main convolution weights (w)
+        if self.weight is None:
+            return x
+
         k_t, k_c = self.kernel_size
         d_t, d_c = self.dilation
 
@@ -191,18 +208,28 @@ class RealConv2d(nn.Module):
         if pad_c_total > 0 or pad_t_total > 0:
             x = F.pad(x, (pad_c_left, pad_c_right, pad_t_top, pad_t_bottom))
 
-        w = self.conv.weight.to(x.dtype)
-        b = self.conv.bias.to(x.dtype) if self.conv.bias is not None else None
+        w = self.weight.to(x.dtype)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
 
         return F.conv2d(x, w, b, padding=0, stride=self.stride, dilation=self.dilation)
 
+    @property
+    def conv(self):
+        class _ConvProxy:
+            pass
+        proxy = _ConvProxy()
+        proxy.weight = self.weight
+        proxy.bias = self.bias
+        return proxy
 
+
+@persistence.persistent_class
 class RealResample2d(nn.Module):
     """
     Real Resampling layer for 2x downsampling or 2x upsampling with RF_SongUNet FIR filter.
     Includes residual projection matching RF_SongUNet.
     """
-    def __init__(self, channels: int, down: bool = False, up: bool = False, causal: bool = False, resample_filter=[1, 1]):
+    def __init__(self, channels: int, down: bool = False, up: bool = False, causal: bool = False, resample_filter=[1, 1], init=dict()):
         super().__init__()
         assert down ^ up, "Must specify exactly one of down=True or up=True"
         self.down = down
@@ -210,17 +237,18 @@ class RealResample2d(nn.Module):
         self.causal = causal
         self.conv = RealConv2d(
             channels, channels, kernel_size=3,
-            down=down, up=up, resample_filter=resample_filter, causal=causal
+            down=down, up=up, resample_filter=resample_filter, causal=causal, **init
         )
         self.skip = RealConv2d(
             channels, channels, kernel_size=1,
-            down=down, up=up, resample_filter=resample_filter, causal=causal
+            down=down, up=up, resample_filter=resample_filter, causal=causal, **init
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (self.conv(x) + self.skip(x)) * (1.0 / math.sqrt(2.0))
 
 
+@persistence.persistent_class
 class RealUNetBlock(nn.Module):
     """
     Real ResNet Block with diffusion conditioning modulation.
@@ -235,6 +263,8 @@ class RealUNetBlock(nn.Module):
         dropout: float = 0.0,
         adaptive_scale: bool = True,
         kernel: int = 3,
+        init: dict = dict(),
+        init_zero: dict = dict(init_weight=0),
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -243,20 +273,18 @@ class RealUNetBlock(nn.Module):
 
         self.norm0 = RealGroupNorm(in_channels, causal=causal_conv)
         self.act0 = nn.SiLU()
-        self.conv0 = RealConv2d(in_channels, out_channels, kernel_size=kernel, causal=causal_conv)
+        self.conv0 = RealConv2d(in_channels, out_channels, kernel_size=kernel, causal=causal_conv, **init)
 
         num_affine = 2 if adaptive_scale else 1
-        self.affine = RealLinear(emb_channels, out_channels * num_affine)
-        nn.init.constant_(self.affine.weight, 0)
-        nn.init.constant_(self.affine.bias, 0)
+        self.affine = RealLinear(emb_channels, out_channels * num_affine, **init)
 
         self.norm1 = RealGroupNorm(out_channels, causal=causal_conv)
         self.act1 = nn.SiLU()
-        self.conv1 = RealConv2d(out_channels, out_channels, kernel_size=kernel, causal=causal_conv)
+        self.conv1 = RealConv2d(out_channels, out_channels, kernel_size=kernel, causal=causal_conv, **init_zero)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         if in_channels != out_channels:
-            self.skip = RealConv2d(in_channels, out_channels, kernel_size=1, causal=False)
+            self.skip = RealConv2d(in_channels, out_channels, kernel_size=1, causal=False, **init)
         else:
             self.skip = nn.Identity()
 
@@ -278,6 +306,8 @@ class RealUNetBlock(nn.Module):
 
         h = self.conv1(self.dropout(h))
         return h + self.skip(orig)
+
+
 
 
 class RealPositionalEmbedding2D(nn.Module):
@@ -369,12 +399,22 @@ class RealPositionalEmbedding2D(nn.Module):
         return x
 
 
+@persistence.persistent_class
 class RealMultiHeadAttention(nn.Module):
     """
     Multi-Head Attention using PyTorch scaled_dot_product_attention (SDPA).
     Enables FlashAttention / memory-efficient attention automatically on CUDA.
     """
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        init: dict = dict(),
+        init_zero: dict = dict(init_weight=0),
+        init_attn = None,
+    ):
         super().__init__()
         assert hidden_dim % num_heads == 0, f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
         self.hidden_dim = hidden_dim
@@ -382,8 +422,9 @@ class RealMultiHeadAttention(nn.Module):
         self.head_dim = hidden_dim // num_heads
         self.dropout = dropout
 
-        self.qkv_proj = RealLinear(hidden_dim, 3 * hidden_dim, bias=bias)
-        self.out_proj = RealLinear(hidden_dim, hidden_dim, bias=bias)
+        qkv_init = init_attn if init_attn is not None else init
+        self.qkv_proj = RealLinear(hidden_dim, 3 * hidden_dim, bias=bias, **qkv_init)
+        self.out_proj = RealLinear(hidden_dim, hidden_dim, bias=bias, **init_zero)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, N, H]
@@ -397,27 +438,38 @@ class RealMultiHeadAttention(nn.Module):
         return self.out_proj(out)
 
 
+@persistence.persistent_class
 class RealDiTBlock(nn.Module):
     """
     Real DiT Transformer block with adaLN-Zero modulation.
     """
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0, mlp_ratio: float = 4.0):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        mlp_ratio: float = 4.0,
+        init: dict = dict(),
+        init_zero: dict = dict(init_weight=0),
+        init_attn = None,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
-        self.attn = RealMultiHeadAttention(hidden_dim, num_heads, dropout=dropout, bias=True)
+        self.attn = RealMultiHeadAttention(
+            hidden_dim, num_heads, dropout=dropout, bias=True,
+            init=init, init_zero=init_zero, init_attn=init_attn,
+        )
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
         self.mlp = nn.Sequential(
-            RealLinear(hidden_dim, mlp_hidden_dim, bias=True),
+            RealLinear(hidden_dim, mlp_hidden_dim, bias=True, **init),
             nn.SiLU(),
-            RealLinear(mlp_hidden_dim, hidden_dim, bias=True),
+            RealLinear(mlp_hidden_dim, hidden_dim, bias=True, **init_zero),
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            RealLinear(hidden_dim, 6 * hidden_dim, bias=True)
+            RealLinear(hidden_dim, 6 * hidden_dim, bias=True, **init_zero)
         )
-        nn.init.constant_(self.adaLN_modulation[1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[1].bias, 0)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         # x: [B, N, hidden_dim]
@@ -432,54 +484,24 @@ class RealDiTBlock(nn.Module):
         return x
 
 
+@persistence.persistent_class
 class RealFinalLayer(nn.Module):
     """
     Final projection layer of DiT with adaLN-Zero modulation.
     """
-    def __init__(self, hidden_dim: int, out_dim: int):
+    def __init__(self, hidden_dim: int, out_dim: int, init_zero: dict = dict(init_weight=0)):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
-        self.linear = RealLinear(hidden_dim, out_dim, bias=True)
+        self.linear = RealLinear(hidden_dim, out_dim, bias=True, **init_zero)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            RealLinear(hidden_dim, 2 * hidden_dim, bias=True)
+            RealLinear(hidden_dim, 2 * hidden_dim, bias=True, **init_zero)
         )
-        nn.init.constant_(self.adaLN_modulation[1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[1].bias, 0)
-        nn.init.constant_(self.linear.weight, 0)
-        nn.init.constant_(self.linear.bias, 0)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm(x), shift, scale)
         x = self.linear(x)
-        return x
-
-
-class PositionalEmbedding(torch.nn.Module):
-    def __init__(self, num_channels: int, max_positions: int = 10000, endpoint: bool = False):
-        super().__init__()
-        self.num_channels = num_channels
-        self.max_positions = max_positions
-        self.endpoint = endpoint
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        freqs = torch.arange(start=0, end=self.num_channels // 2, dtype=torch.float32, device=x.device)
-        freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
-        freqs = (1.0 / self.max_positions) ** freqs
-        x = x.ger(freqs.to(x.dtype))
-        x = torch.cat([x.cos(), x.sin()], dim=1)
-        return x
-
-
-class FourierEmbedding(torch.nn.Module):
-    def __init__(self, num_channels: int, scale: float = 16.0):
-        super().__init__()
-        self.register_buffer('freqs', torch.randn(num_channels // 2) * scale)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.ger((2.0 * np.pi * self.freqs).to(x.dtype))
-        x = torch.cat([x.cos(), x.sin()], dim=1)
         return x
 
 
@@ -518,6 +540,9 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
         encoder_type: str = 'standard',
         decoder_type: str = 'standard',
         resample_filter = [1, 1],
+        init = None,
+        init_zero = None,
+        init_attn = None,
         **kwargs
     ):
         super().__init__()
@@ -538,6 +563,13 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
         emb_channels = model_channels * channel_mult_emb
         noise_channels = model_channels * channel_mult_noise
 
+        if init is None:
+            init = dict(init_mode='xavier_uniform')
+        if init_zero is None:
+            init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
+        if init_attn is None:
+            init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
+
         # Noise timestep embedding
         if embedding_type == 'positional':
             self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True)
@@ -546,24 +578,24 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
 
         # Class / condition label embedding
         if label_dim != 0 and label_type == 'classes':
-            self.map_label = RealLinear(label_dim, noise_channels)
+            self.map_label = RealLinear(label_dim, noise_channels, **init)
         elif label_dim != 0 and label_type == 'downlink':
             self.map_label = nn.Sequential(
-                RealLinear(label_dim, noise_channels * 2),
+                RealLinear(label_dim, noise_channels * 2, **init),
                 nn.SiLU(),
-                RealLinear(noise_channels * 2, noise_channels * 2),
+                RealLinear(noise_channels * 2, noise_channels * 2, **init),
             )
         else:
             self.map_label = None
 
-        self.map_augment = RealLinear(augment_dim, noise_channels, bias=False) if augment_dim else None
+        self.map_augment = RealLinear(augment_dim, noise_channels, bias=False, **init) if augment_dim else None
 
         in_emb = noise_channels * (3 if (self.map_label is not None and label_type == 'downlink') else 1)
-        self.map_layer0 = RealLinear(in_emb, emb_channels * 2)
-        self.map_layer1 = RealLinear(emb_channels * 2, emb_channels)
+        self.map_layer0 = RealLinear(in_emb, emb_channels * 2, **init)
+        self.map_layer1 = RealLinear(emb_channels * 2, emb_channels, **init)
 
         # Stem convolution
-        self.stem = RealConv2d(in_channels, model_channels, kernel_size=3, causal=causal_conv)
+        self.stem = RealConv2d(in_channels, model_channels, kernel_size=3, causal=causal_conv, **init)
 
         # Encoder stages
         self.enc_blocks = nn.ModuleList()
@@ -578,19 +610,22 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
                 stage_blocks.append(
                     RealUNetBlock(
                         cin, c_target, emb_channels,
-                        causal_conv=causal_conv, dropout=dropout
+                        causal_conv=causal_conv, dropout=dropout,
+                        init=init, init_zero=init_zero,
                     )
                 )
             self.enc_blocks.append(stage_blocks)
             c_curr = c_target
 
             if level < len(encdec_channel_mult) - 1:
-                self.downsamplers.append(RealResample2d(c_curr, down=True, causal=causal_conv, resample_filter=resample_filter))
+                self.downsamplers.append(
+                    RealResample2d(c_curr, down=True, causal=causal_conv, resample_filter=resample_filter, init=init)
+                )
 
         c_bottleneck = c_curr
 
         # Tokenization & DiT projection
-        self.token_proj = RealLinear(c_bottleneck, dit_hidden_dim)
+        self.token_proj = RealLinear(c_bottleneck, dit_hidden_dim, **init)
         H_res = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
         W_res = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
         max_t = 1 << int(np.ceil(np.log2(max(1, H_res))))
@@ -598,14 +633,18 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
         self.pos_embed = RealPositionalEmbedding2D(pos_embed_type, dit_hidden_dim, max_t=max_t, max_c=max_c)
 
         # Projection from real emb to conditioning for DiT adaLN-Zero
-        self.c_proj = RealLinear(emb_channels, dit_hidden_dim)
+        self.c_proj = RealLinear(emb_channels, dit_hidden_dim, **init)
 
         # DiT Blocks
+        dit_init_zero = dict(init_mode='xavier_uniform', init_weight=0, init_bias=0)
         self.dit_blocks = nn.ModuleList([
-            RealDiTBlock(dit_hidden_dim, dit_num_heads, dropout=dropout, mlp_ratio=dit_mlp_ratio)
+            RealDiTBlock(
+                dit_hidden_dim, dit_num_heads, dropout=dropout, mlp_ratio=dit_mlp_ratio,
+                init=init, init_zero=dit_init_zero, init_attn=init_attn,
+            )
             for _ in range(num_dit_blocks)
         ])
-        self.final_layer = RealFinalLayer(dit_hidden_dim, c_bottleneck)
+        self.final_layer = RealFinalLayer(dit_hidden_dim, c_bottleneck, init_zero=dit_init_zero)
 
         # Decoder stages
         self.dec_blocks = nn.ModuleList()
@@ -617,7 +656,9 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
             c_stage = model_channels * mult
 
             if level < len(encdec_channel_mult) - 1:
-                self.upsamplers.append(RealResample2d(c_curr, up=True, causal=causal_conv, resample_filter=resample_filter))
+                self.upsamplers.append(
+                    RealResample2d(c_curr, up=True, causal=causal_conv, resample_filter=resample_filter, init=init)
+                )
 
             # Concatenation of skip: input channels = c_curr + c_stage
             cin_first = c_curr + c_stage
@@ -627,14 +668,15 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
                 stage_blocks.append(
                     RealUNetBlock(
                         cin, c_stage, emb_channels,
-                        causal_conv=causal_conv, dropout=dropout
+                        causal_conv=causal_conv, dropout=dropout,
+                        init=init, init_zero=init_zero,
                     )
                 )
             self.dec_blocks.append(stage_blocks)
             c_curr = c_stage
 
         # Final output projection
-        self.out_conv = RealConv2d(c_curr, out_channels, kernel_size=3, causal=causal_conv)
+        self.out_conv = RealConv2d(c_curr, out_channels, kernel_size=3, causal=causal_conv, **init_zero)
 
     def forward(self, x: torch.Tensor, noise_labels: torch.Tensor, class_labels=None, augment_labels=None, z=None, **kwargs):
         """
