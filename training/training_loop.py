@@ -266,6 +266,9 @@ def training_loop(
     dist.print0('Loading dataset...')
     if task == 'RENEW':
         dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
+    elif task == 'RENEW_SC':
+        from training.semantic_comm_dataset import RenewSemanticCommunicationDataset
+        dataset_obj = RenewSemanticCommunicationDataset(**dataset_kwargs)
     elif task == 'WIDAR':
         dataset_obj = WiDARDataset(**dataset_kwargs)
     elif task == 'XRF55':
@@ -279,10 +282,16 @@ def training_loop(
         if task != 'XRF55':
             validation_dataset_kwargs = dataset_kwargs.copy()
             if validation_kwargs.validation_data is not None:
-                validation_dataset_kwargs['path'] = validation_kwargs.validation_data
+                if task == 'RENEW_SC':
+                    validation_dataset_kwargs['renew_path'] = validation_kwargs.validation_data
+                else:
+                    validation_dataset_kwargs['path'] = validation_kwargs.validation_data
                 validation_dataset_kwargs['dataset_keep_percentage'] = 1.0
             else:
-                validation_dataset_kwargs['flip_keep_dataset'] = True
+                if task == 'RENEW_SC':
+                    validation_dataset_kwargs['seed'] = (seed + 9999) if seed is not None else 9999
+                else:
+                    validation_dataset_kwargs['flip_keep_dataset'] = True
             
             validation_dataset_obj = dataset_obj.__class__(**validation_dataset_kwargs)
             validation_dataset_sampler = misc.FiniteSampler(dataset=validation_dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=False, seed=seed)
@@ -333,7 +342,7 @@ def training_loop(
     # Construct network.
     dist.print0('Constructing network...')
     # interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
-    if task == 'RENEW':  
+    if task in ['RENEW', 'RENEW_SC']:  
         interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_resolution=dataset_shape[-2:])
     elif task in ['WIDAR', 'XRF55']:
         interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_type='classes')

@@ -17,6 +17,7 @@ import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
 from training.dataset import renewRfProcessedDataset, pad_collate_fn, rf_augmentation_collate_fn, WiDARDataset, XRF55Dataset
+from training.semantic_comm_dataset import RenewSemanticCommunicationDataset
 import ambient_utils
 import warnings
 import wandb
@@ -121,6 +122,13 @@ def parse_int_list(s):
 @click.option('--noise_mean_alter_way', help='Whether to use alternative way to add noise, which is to directly add noise with the given sigma without multiplying with the clean image.', is_flag=True, default=False)
 @click.option('--only_additive_noise', help='Whether to only use additive noise for corruption without natural noise.', is_flag=True)
 @click.option('--snr_range', help='Target SNR range in dB (e.g. "5,20") for natural noise corruption. Overrides additive_noise_sigma and multiply_noise_sigma if set.', type=str, default=None, show_default=True)
+
+# Semantic Communication (RENEW_SC) related
+@click.option('--adjscc_config', help='Path to ADJSCC config JSON/YAML file for RENEW_SC.', type=str, default='misc/ADJSCC/config_example.json', show_default=True)
+@click.option('--image_data', help='Path to image dataset directory for RENEW_SC (None for CIFAR-10).', type=str, default=None, show_default=True)
+@click.option('--sc_t', help='Number of time steps T for RENEW_SC (None to auto-calculate from adjscc_config image size and compression level).', type=int, default=None, show_default=True)
+@click.option('--sc_dataset_len', help='Fixed dataset length for RENEW_SC (None for default).', type=int, default=None, show_default=True)
+@click.option('--matching_mode', help='Latent to RF channel matching mode for RENEW_SC.', type=click.Choice(['interpolate', 'pad_or_slice', 'repeat']), default='interpolate', show_default=True)
 
 # Consistency params
 @click.option("--consistency_batch_size", help="Batch size for the consistency loss.", type=int, default=32)
@@ -231,6 +239,24 @@ def main(**kwargs):
                                     noise_mean_alter_way=opts.noise_mean_alter_way,
                                     noise_mean_flag=not opts.dynamic_noise_sigma,
                                     snr_range=opts.snr_range)
+    elif opts.task == 'RENEW_SC':
+        c.dataset_kwargs = dnnlib.EasyDict(
+            path=opts.data,
+            renew_path=opts.data,
+            adjscc_config=opts.adjscc_config,
+            image_dataset=opts.image_data,
+            T=opts.sc_t,
+            dataset_len=opts.sc_dataset_len,
+            seed=opts.seed if opts.seed is not None else 42,
+            matching_mode=opts.matching_mode,
+            power_normalize_latent=True,
+            view_as_complex=opts.view_as_complex,
+            additive_noise_sigma=opts.additive_noise_sigma,
+            multiply_noise_sigma=opts.multiply_noise_sigma,
+            snr_range=opts.snr_range,
+            normalize_value=opts.data_norm,
+            use_labels=opts.cond,
+        )
     elif opts.task == 'WIDAR':
         # dataset_kwargs for WIDAR dataset
         # TMP: 512 to 256 time scale for now to reduce the computational cost.
@@ -263,11 +289,19 @@ def main(**kwargs):
     if opts.snr_range is not None:
         dist.print0(f'Using SNR range for natural noise corruption: {opts.snr_range} (additive_noise_sigma and multiply_noise_sigma are ignored)')
         
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=4, persistent_workers=True)
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=4 if opts.workers > 0 else None, persistent_workers=(opts.workers > 0))
+    if opts.task == 'RENEW_SC' and torch.cuda.is_available():
+        if opts.workers > 0:
+            dist.print0("[RENEW_SC] Note: Setting DataLoader num_workers=0 because SC encoder performs GPU inference in dataset.")
+        c.data_loader_kwargs.num_workers = 0
+        c.data_loader_kwargs.persistent_workers = False
+        c.data_loader_kwargs.prefetch_factor = None
 
     is_label_complex = False
     if opts.task == 'RENEW':
         is_label_complex = True
+    elif opts.task == 'RENEW_SC':
+        is_label_complex = opts.view_as_complex
 
     c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(flip_probability=opts.flip_aug_ratio, 
                                                                 phase_shift_probability=opts.phase_shift_aug_ratio, 
@@ -299,6 +333,9 @@ def main(**kwargs):
     try:
         if opts.task == 'RENEW':
             dataset_obj = renewRfProcessedDataset(**c.dataset_kwargs)
+        elif opts.task == 'RENEW_SC':
+            dataset_obj = RenewSemanticCommunicationDataset(**c.dataset_kwargs)
+            dist.print0(f"[RENEW_SC] Time steps T = {dataset_obj.T} (auto-calculated: {opts.sc_t is None})")
         elif opts.task == 'WIDAR':
             c.dataset_kwargs.must_contain = "regex:gesture(0|1|2|3|17|18)(?!\d)"
             dataset_obj = WiDARDataset(**c.dataset_kwargs)
