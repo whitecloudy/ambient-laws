@@ -51,20 +51,19 @@ def unpad_from_power_of_two(x, pad_h, pad_w, orig_H, orig_W):
 # Fully-connected layer.
 
 @persistence.persistent_class
-class Linear(torch.nn.Module):
+class Linear(torch.nn.Linear):
     def __init__(self, in_features, out_features, bias=True, init_mode='kaiming_normal', init_weight=1, init_bias=0):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
+        super().__init__(in_features=in_features, out_features=out_features, bias=bias)
         init_kwargs = dict(mode=init_mode, fan_in=in_features, fan_out=out_features)
-        self.weight = torch.nn.Parameter(weight_init([out_features, in_features], **init_kwargs) * init_weight)
-        self.bias = torch.nn.Parameter(weight_init([out_features], **init_kwargs) * init_bias) if bias else None
+        with torch.no_grad():
+            self.weight.copy_(weight_init([out_features, in_features], **init_kwargs) * init_weight)
+            if self.bias is not None:
+                self.bias.copy_(weight_init([out_features], **init_kwargs) * init_bias)
 
     def forward(self, x):
-        x = x @ self.weight.to(x.dtype).t()
-        if self.bias is not None:
-            x = x.add_(self.bias.to(x.dtype))
-        return x
+        w = self.weight.to(x.dtype)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        return torch.nn.functional.linear(x, w, b)
 
 #----------------------------------------------------------------------------
 # Convolutional layer with optional up/downsampling.

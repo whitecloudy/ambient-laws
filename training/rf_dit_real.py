@@ -72,44 +72,32 @@ def unpad_from_power_of_two(x: torch.Tensor, pad_h: int, pad_w: int, orig_H: int
     return x
 
 
-@persistence.persistent_class
-class RealLinear(Linear):
-    """
-    Linear layer that casts weight and bias to input dtype to support mixed precision (e.g. BF16),
-    inheriting from networks.py Linear and initialized via weight_init.
-    """
-    def __init__(self, in_features, out_features, bias=True, init_mode='xavier_uniform', init_weight=1, init_bias=0):
-        super().__init__(
-            in_features=in_features,
-            out_features=out_features,
-            bias=bias,
-            init_mode=init_mode,
-            init_weight=init_weight,
-            init_bias=init_bias,
-        )
+# Linear is imported directly from training.networks (inherits from nn.Linear)
+RealLinear = Linear
 
 
 @persistence.persistent_class
-class RealGroupNorm(GroupNorm):
+class RealGroupNorm(nn.GroupNorm):
     """
     Group Normalization for real-valued tensors with shape [B, C, T, W].
-    Inherits from networks.py GroupNorm.
+    Inherits from torch.nn.GroupNorm.
     When causal=True, normalizes independently per time-step (B*T, C, 1, W)
     to strictly prevent future information leakage across the T dimension.
     """
     def __init__(self, num_channels: int, num_groups: int = 32, min_channels_per_group: int = 4, eps: float = 1e-5, causal: bool = False):
-        super().__init__(num_channels=num_channels, num_groups=num_groups, min_channels_per_group=min_channels_per_group, eps=eps)
+        effective_groups = min(num_groups, num_channels // min_channels_per_group) if min_channels_per_group > 0 else num_groups
+        super().__init__(num_groups=effective_groups, num_channels=num_channels, eps=eps)
         self.causal = causal
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.weight.to(x.dtype) if self.weight is not None else None
+        b = self.bias.to(x.dtype) if self.bias is not None else None
         if self.causal:
             B, C, T, W = x.shape
             x_t = x.permute(0, 2, 1, 3).reshape(B * T, C, 1, W)
-            w = self.weight.to(x.dtype) if self.weight is not None else None
-            b = self.bias.to(x.dtype) if self.bias is not None else None
-            out = F.group_norm(x_t, self.num_groups, w, b, self.eps).reshape(B, T, C, W).permute(0, 2, 1, 3)
-            return out
-        return super().forward(x)
+            out = F.group_norm(x_t, self.num_groups, w, b, self.eps)
+            return out.reshape(B, T, C, W).permute(0, 2, 1, 3)
+        return F.group_norm(x, self.num_groups, w, b, self.eps)
 
 
 @persistence.persistent_class
@@ -215,12 +203,7 @@ class RealConv2d(Conv2d):
 
     @property
     def conv(self):
-        class _ConvProxy:
-            pass
-        proxy = _ConvProxy()
-        proxy.weight = self.weight
-        proxy.bias = self.bias
-        return proxy
+        return self
 
 
 @persistence.persistent_class
@@ -276,7 +259,7 @@ class RealUNetBlock(nn.Module):
         self.conv0 = RealConv2d(in_channels, out_channels, kernel_size=kernel, causal=causal_conv, **init)
 
         num_affine = 2 if adaptive_scale else 1
-        self.affine = RealLinear(emb_channels, out_channels * num_affine, **init)
+        self.affine = Linear(emb_channels, out_channels * num_affine, **init)
 
         self.norm1 = RealGroupNorm(out_channels, causal=causal_conv)
         self.act1 = nn.SiLU()
@@ -423,8 +406,8 @@ class RealMultiHeadAttention(nn.Module):
         self.dropout = dropout
 
         qkv_init = init_attn if init_attn is not None else init
-        self.qkv_proj = RealLinear(hidden_dim, 3 * hidden_dim, bias=bias, **qkv_init)
-        self.out_proj = RealLinear(hidden_dim, hidden_dim, bias=bias, **init_zero)
+        self.qkv_proj = Linear(hidden_dim, 3 * hidden_dim, bias=bias, **qkv_init)
+        self.out_proj = Linear(hidden_dim, hidden_dim, bias=bias, **init_zero)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, N, H]
@@ -462,13 +445,13 @@ class RealDiTBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
         self.mlp = nn.Sequential(
-            RealLinear(hidden_dim, mlp_hidden_dim, bias=True, **init),
+            Linear(hidden_dim, mlp_hidden_dim, bias=True, **init),
             nn.SiLU(),
-            RealLinear(mlp_hidden_dim, hidden_dim, bias=True, **init_zero),
+            Linear(mlp_hidden_dim, hidden_dim, bias=True, **init_zero),
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            RealLinear(hidden_dim, 6 * hidden_dim, bias=True, **init_zero)
+            Linear(hidden_dim, 6 * hidden_dim, bias=True, **init_zero)
         )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -492,10 +475,10 @@ class RealFinalLayer(nn.Module):
     def __init__(self, hidden_dim: int, out_dim: int, init_zero: dict = dict(init_weight=0)):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
-        self.linear = RealLinear(hidden_dim, out_dim, bias=True, **init_zero)
+        self.linear = Linear(hidden_dim, out_dim, bias=True, **init_zero)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            RealLinear(hidden_dim, 2 * hidden_dim, bias=True, **init_zero)
+            Linear(hidden_dim, 2 * hidden_dim, bias=True, **init_zero)
         )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -578,21 +561,21 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
 
         # Class / condition label embedding
         if label_dim != 0 and label_type == 'classes':
-            self.map_label = RealLinear(label_dim, noise_channels, **init)
+            self.map_label = Linear(label_dim, noise_channels, **init)
         elif label_dim != 0 and label_type == 'downlink':
             self.map_label = nn.Sequential(
-                RealLinear(label_dim, noise_channels * 2, **init),
+                Linear(label_dim, noise_channels * 2, **init),
                 nn.SiLU(),
-                RealLinear(noise_channels * 2, noise_channels * 2, **init),
+                Linear(noise_channels * 2, noise_channels * 2, **init),
             )
         else:
             self.map_label = None
 
-        self.map_augment = RealLinear(augment_dim, noise_channels, bias=False, **init) if augment_dim else None
+        self.map_augment = Linear(augment_dim, noise_channels, bias=False, **init) if augment_dim else None
 
         in_emb = noise_channels * (3 if (self.map_label is not None and label_type == 'downlink') else 1)
-        self.map_layer0 = RealLinear(in_emb, emb_channels * 2, **init)
-        self.map_layer1 = RealLinear(emb_channels * 2, emb_channels, **init)
+        self.map_layer0 = Linear(in_emb, emb_channels * 2, **init)
+        self.map_layer1 = Linear(emb_channels * 2, emb_channels, **init)
 
         # Stem convolution
         self.stem = RealConv2d(in_channels, model_channels, kernel_size=3, causal=causal_conv, **init)
@@ -625,7 +608,7 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
         c_bottleneck = c_curr
 
         # Tokenization & DiT projection
-        self.token_proj = RealLinear(c_bottleneck, dit_hidden_dim, **init)
+        self.token_proj = Linear(c_bottleneck, dit_hidden_dim, **init)
         H_res = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
         W_res = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
         max_t = 1 << int(np.ceil(np.log2(max(1, H_res))))
@@ -633,7 +616,7 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
         self.pos_embed = RealPositionalEmbedding2D(pos_embed_type, dit_hidden_dim, max_t=max_t, max_c=max_c)
 
         # Projection from real emb to conditioning for DiT adaLN-Zero
-        self.c_proj = RealLinear(emb_channels, dit_hidden_dim, **init)
+        self.c_proj = Linear(emb_channels, dit_hidden_dim, **init)
 
         # DiT Blocks
         dit_init_zero = dict(init_mode='xavier_uniform', init_weight=0, init_bias=0)

@@ -51,7 +51,7 @@ def parse_int_list(s):
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--arch',          help='Network architecture', metavar='ddpmpp|rf_dit|rf_dit_large|rf_dit_small|rf_dit_real|rf_dit_real_large|rf_dit_real_small|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
+@click.option('--arch',          help='Network architecture', metavar='ddpmpp|rf_dit|rf_dit_large|rf_dit_small|rf_dit_real|rf_dit_real_large|rf_dit_real_same_parameter|rf_dit_real_deep|rf_dit_real_small|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler|edm_with_latent_z',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler', 'edm_with_latent_z']), default='edm', show_default=True)
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
@@ -414,7 +414,7 @@ def main(**kwargs):
             model_channels=128,
             channel_mult=[1, 2],
             num_blocks_per_stage=4,
-            num_dit_blocks=5,
+            num_dit_blocks=9,
             dit_hidden_dim=512,
             dit_num_heads=8,
             dit_mlp_ratio=4.0,
