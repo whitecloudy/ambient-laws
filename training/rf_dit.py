@@ -10,7 +10,6 @@ from torch_utils import persistence
 from .complex import complex_module as cm
 
 
-@torch.jit.script
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """
     Modulate complex tensor x with complex shift and scale.
@@ -105,6 +104,7 @@ class ComplexConv2d(nn.Module):
         down: bool = False,
         up: bool = False,
         resample_filter = [1, 1],
+        resample_stride = 2,
     ):
         super().__init__()
         assert not (down and up), "Cannot specify both down=True and up=True"
@@ -129,10 +129,23 @@ class ComplexConv2d(nn.Module):
         else:
             self.dilation = tuple(dilation)
 
+        if isinstance(resample_stride, int):
+            self.resample_stride = (resample_stride, resample_stride)
+        else:
+            self.resample_stride = tuple(resample_stride)
+
         # Setup resample_filter matching RF_SongUNet
         if (down or up) and resample_filter is not None:
-            f_h = torch.as_tensor(resample_filter[0] if isinstance(resample_filter[0], (list, tuple)) else resample_filter, dtype=torch.float32)
-            f_w = torch.as_tensor(resample_filter[1] if len(resample_filter) > 1 and isinstance(resample_filter[1], (list, tuple)) else resample_filter, dtype=torch.float32)
+            if isinstance(resample_filter, (list, tuple)) and len(resample_filter) == 2 and isinstance(resample_filter[0], (list, tuple)):
+                f_h = torch.as_tensor(resample_filter[0], dtype=torch.float32)
+                f_w = torch.as_tensor(resample_filter[1], dtype=torch.float32)
+            else:
+                f_h = torch.as_tensor(resample_filter, dtype=torch.float32)
+                f_w = f_h
+            if self.resample_stride[0] == 1:
+                f_h = torch.ones(1, dtype=torch.float32)
+            if self.resample_stride[1] == 1:
+                f_w = torch.ones(1, dtype=torch.float32)
             f = f_h.ger(f_w)
             f = f.unsqueeze(0).unsqueeze(1) / (f_h.sum() * f_w.sum())
             self.register_buffer('resample_filter', f)
@@ -173,17 +186,19 @@ class ComplexConv2d(nn.Module):
                 pad_left_c = (kf_c - 1) // 2
                 pad_right_c = kf_c - 1 - pad_left_c
 
-            x_r = F.pad(x_r, (pad_left_c, pad_right_c, pad_top_t, pad_bottom_t))
-            x_i = F.pad(x_i, (pad_left_c, pad_right_c, pad_top_t, pad_bottom_t))
+            if pad_left_c > 0 or pad_right_c > 0 or pad_top_t > 0 or pad_bottom_t > 0:
+                x_r = F.pad(x_r, (pad_left_c, pad_right_c, pad_top_t, pad_bottom_t))
+                x_i = F.pad(x_i, (pad_left_c, pad_right_c, pad_top_t, pad_bottom_t))
             f_tile = f.tile([self.in_channels, 1, 1, 1])
-            x_r = F.conv2d(x_r, f_tile, groups=self.in_channels, stride=(2, 2))
-            x_i = F.conv2d(x_i, f_tile, groups=self.in_channels, stride=(2, 2))
+            x_r = F.conv2d(x_r, f_tile, groups=self.in_channels, stride=self.resample_stride)
+            x_i = F.conv2d(x_i, f_tile, groups=self.in_channels, stride=self.resample_stride)
 
         elif self.up and self.resample_filter is not None:
             f = self.resample_filter.to(x.dtype)
-            f_tile = f.mul(4.0).tile([self.in_channels, 1, 1, 1])
-            x_r = F.conv_transpose2d(x_r, f_tile, groups=self.in_channels, stride=(2, 2))
-            x_i = F.conv_transpose2d(x_i, f_tile, groups=self.in_channels, stride=(2, 2))
+            stride_mul = float(self.resample_stride[0] * self.resample_stride[1])
+            f_tile = f.mul(stride_mul).tile([self.in_channels, 1, 1, 1])
+            x_r = F.conv_transpose2d(x_r, f_tile, groups=self.in_channels, stride=self.resample_stride)
+            x_i = F.conv_transpose2d(x_i, f_tile, groups=self.in_channels, stride=self.resample_stride)
 
         # 2. Main convolution weights (w)
         k_t, k_c = self.kernel_size
@@ -224,19 +239,22 @@ class ComplexResample2d(nn.Module):
     Complex Resampling layer for 2x downsampling or 2x upsampling with RF_SongUNet FIR filter.
     Includes residual projection matching RF_SongUNet.
     """
-    def __init__(self, channels: int, down: bool = False, up: bool = False, causal: bool = False, resample_filter=[1, 1]):
+    def __init__(self, channels: int, down: bool = False, up: bool = False, causal: bool = False, resample_filter=[1, 1], resample_stride=(2, 2)):
         super().__init__()
         assert down ^ up, "Must specify exactly one of down=True or up=True"
         self.down = down
         self.up = up
         self.causal = causal
+        self.resample_stride = resample_stride
         self.conv = ComplexConv2d(
             channels, channels, kernel_size=3,
-            down=down, up=up, resample_filter=resample_filter, causal=causal
+            down=down, up=up, resample_filter=resample_filter, causal=causal,
+            resample_stride=resample_stride
         )
         self.skip = ComplexConv2d(
             channels, channels, kernel_size=1,
-            down=down, up=up, resample_filter=resample_filter, causal=causal
+            down=down, up=up, resample_filter=resample_filter, causal=causal,
+            resample_stride=resample_stride
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -542,6 +560,21 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
         self.map_layer0 = nn.Linear(in_emb, emb_channels * 2)
         self.map_layer1 = nn.Linear(emb_channels * 2, emb_channels)
 
+        # Spatial resolution tracking
+        H_res = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        W_res = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        max_t = 1 << int(np.ceil(np.log2(max(1, H_res))))
+        max_c = 1 << int(np.ceil(np.log2(max(1, W_res))))
+
+        cur_t, cur_c = max_t, max_c
+        down_strides = []
+        for level in range(len(encdec_channel_mult) - 1):
+            s_t = 2 if cur_t > 1 else 1
+            s_c = 2 if cur_c > 1 else 1
+            down_strides.append((s_t, s_c))
+            cur_t = max(1, cur_t // s_t)
+            cur_c = max(1, cur_c // s_c)
+
         # Stem convolution
         self.stem = ComplexConv2d(in_channels, model_channels, kernel_size=3, causal=causal_conv)
 
@@ -565,16 +598,13 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
             c_curr = c_target
 
             if level < len(encdec_channel_mult) - 1:
-                self.downsamplers.append(ComplexResample2d(c_curr, down=True, causal=causal_conv, resample_filter=resample_filter))
+                d_stride = down_strides[level]
+                self.downsamplers.append(ComplexResample2d(c_curr, down=True, causal=causal_conv, resample_filter=resample_filter, resample_stride=d_stride))
 
         c_bottleneck = c_curr
 
         # Tokenization & DiT projection
         self.token_proj = cm.ComplexLinear(c_bottleneck, dit_hidden_dim)
-        H_res = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
-        W_res = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
-        max_t = 1 << int(np.ceil(np.log2(max(1, H_res))))
-        max_c = 1 << int(np.ceil(np.log2(max(1, W_res))))
         self.pos_embed = ComplexPositionalEmbedding2D(pos_embed_type, dit_hidden_dim, max_t=max_t, max_c=max_c)
 
         # Projection from real emb to complex conditioning for DiT adaLN-Zero
@@ -592,12 +622,16 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
         self.upsamplers = nn.ModuleList()
 
         # Mirror levels in reverse
+        up_strides = list(reversed(down_strides))
+        up_idx = 0
         for level in reversed(range(len(encdec_channel_mult))):
             mult = encdec_channel_mult[level]
             c_stage = model_channels * mult
 
             if level < len(encdec_channel_mult) - 1:
-                self.upsamplers.append(ComplexResample2d(c_curr, up=True, causal=causal_conv, resample_filter=resample_filter))
+                u_stride = up_strides[up_idx]
+                self.upsamplers.append(ComplexResample2d(c_curr, up=True, causal=causal_conv, resample_filter=resample_filter, resample_stride=u_stride))
+                up_idx += 1
 
             # Concatenation of skip: input channels = c_curr + c_stage
             cin_first = c_curr + c_stage
@@ -626,8 +660,15 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
         orig_ndim = x.ndim
         is_complex_input = torch.is_complex(x)
         is_concat_real_imag = False
+        is_leading_complex = False
         if is_complex_input:
             x = torch.stack([x.real, x.imag], dim=-1)
+        elif x.ndim == 5:
+            if x.shape[-1] == 2 and x.shape[1] == self.in_channels:
+                pass
+            elif x.shape[1] == 2 and x.shape[2] == self.in_channels:
+                is_leading_complex = True
+                x = x.permute(0, 2, 3, 4, 1)
         elif x.ndim == 4:
             if x.shape[1] == 2 * self.in_channels:
                 # 4D tensor where real and imag are concatenated along antenna dimension [B, 2*A, T, C]
@@ -725,6 +766,8 @@ class RF_DiT(nn.Module, PyTorchModelHubMixin):
         if is_complex_input:
             out_r, out_i = out.unbind(-1)
             return torch.complex(out_r, out_i)
+        if is_leading_complex:
+            return out.permute(0, 4, 1, 2, 3)
         if is_concat_real_imag:
             return torch.cat(out.unbind(-1), dim=1)
         if orig_ndim == 4:
