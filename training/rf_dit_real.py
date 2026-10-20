@@ -27,7 +27,6 @@ except ImportError:
     )
 
 
-@torch.jit.script
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """
     Modulate real tensor x with shift and scale.
@@ -120,6 +119,7 @@ class RealConv2d(Conv2d):
         down: bool = False,
         up: bool = False,
         resample_filter = [1, 1],
+        resample_stride = 2,
         init_mode: str = 'xavier_uniform',
         init_weight: float = 1.0,
         init_bias: float = 0.0,
@@ -132,6 +132,7 @@ class RealConv2d(Conv2d):
             up=up,
             down=down,
             resample_filter=resample_filter,
+            resample_stride=resample_stride,
             init_mode=init_mode,
             init_weight=init_weight,
             init_bias=init_bias,
@@ -165,14 +166,16 @@ class RealConv2d(Conv2d):
                 pad_left_c = (kf_c - 1) // 2
                 pad_right_c = kf_c - 1 - pad_left_c
 
-            x = F.pad(x, (pad_left_c, pad_right_c, pad_top_t, pad_bottom_t))
+            if pad_left_c > 0 or pad_right_c > 0 or pad_top_t > 0 or pad_bottom_t > 0:
+                x = F.pad(x, (pad_left_c, pad_right_c, pad_top_t, pad_bottom_t))
             f_tile = f.tile([self.in_channels, 1, 1, 1])
-            x = F.conv2d(x, f_tile, groups=self.in_channels, stride=(2, 2))
+            x = F.conv2d(x, f_tile, groups=self.in_channels, stride=self.resample_stride)
 
         elif self.up and self.resample_filter is not None:
             f = self.resample_filter.to(x.dtype)
-            f_tile = f.mul(4.0).tile([self.in_channels, 1, 1, 1])
-            x = F.conv_transpose2d(x, f_tile, groups=self.in_channels, stride=(2, 2))
+            stride_mul = float(self.resample_stride[0] * self.resample_stride[1])
+            f_tile = f.mul(stride_mul).tile([self.in_channels, 1, 1, 1])
+            x = F.conv_transpose2d(x, f_tile, groups=self.in_channels, stride=self.resample_stride)
 
         # 2. Main convolution weights (w)
         if self.weight is None:
@@ -212,19 +215,22 @@ class RealResample2d(nn.Module):
     Real Resampling layer for 2x downsampling or 2x upsampling with RF_SongUNet FIR filter.
     Includes residual projection matching RF_SongUNet.
     """
-    def __init__(self, channels: int, down: bool = False, up: bool = False, causal: bool = False, resample_filter=[1, 1], init=dict()):
+    def __init__(self, channels: int, down: bool = False, up: bool = False, causal: bool = False, resample_filter=[1, 1], resample_stride=(2, 2), init=dict()):
         super().__init__()
         assert down ^ up, "Must specify exactly one of down=True or up=True"
         self.down = down
         self.up = up
         self.causal = causal
+        self.resample_stride = resample_stride
         self.conv = RealConv2d(
             channels, channels, kernel_size=3,
-            down=down, up=up, resample_filter=resample_filter, causal=causal, **init
+            down=down, up=up, resample_filter=resample_filter, causal=causal,
+            resample_stride=resample_stride, **init
         )
         self.skip = RealConv2d(
             channels, channels, kernel_size=1,
-            down=down, up=up, resample_filter=resample_filter, causal=causal, **init
+            down=down, up=up, resample_filter=resample_filter, causal=causal,
+            resample_stride=resample_stride, **init
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -577,6 +583,21 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
         self.map_layer0 = Linear(in_emb, emb_channels * 2, **init)
         self.map_layer1 = Linear(emb_channels * 2, emb_channels, **init)
 
+        # Spatial resolution tracking
+        H_res = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        W_res = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        max_t = 1 << int(np.ceil(np.log2(max(1, H_res))))
+        max_c = 1 << int(np.ceil(np.log2(max(1, W_res))))
+
+        cur_t, cur_c = max_t, max_c
+        down_strides = []
+        for level in range(len(encdec_channel_mult) - 1):
+            s_t = 2 if cur_t > 1 else 1
+            s_c = 2 if cur_c > 1 else 1
+            down_strides.append((s_t, s_c))
+            cur_t = max(1, cur_t // s_t)
+            cur_c = max(1, cur_c // s_c)
+
         # Stem convolution
         self.stem = RealConv2d(in_channels, model_channels, kernel_size=3, causal=causal_conv, **init)
 
@@ -601,18 +622,15 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
             c_curr = c_target
 
             if level < len(encdec_channel_mult) - 1:
+                d_stride = down_strides[level]
                 self.downsamplers.append(
-                    RealResample2d(c_curr, down=True, causal=causal_conv, resample_filter=resample_filter, init=init)
+                    RealResample2d(c_curr, down=True, causal=causal_conv, resample_filter=resample_filter, resample_stride=d_stride, init=init)
                 )
 
         c_bottleneck = c_curr
 
         # Tokenization & DiT projection
         self.token_proj = Linear(c_bottleneck, dit_hidden_dim, **init)
-        H_res = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
-        W_res = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
-        max_t = 1 << int(np.ceil(np.log2(max(1, H_res))))
-        max_c = 1 << int(np.ceil(np.log2(max(1, W_res))))
         self.pos_embed = RealPositionalEmbedding2D(pos_embed_type, dit_hidden_dim, max_t=max_t, max_c=max_c)
 
         # Projection from real emb to conditioning for DiT adaLN-Zero
@@ -634,14 +652,18 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
         self.upsamplers = nn.ModuleList()
 
         # Mirror levels in reverse
+        up_strides = list(reversed(down_strides))
+        up_idx = 0
         for level in reversed(range(len(encdec_channel_mult))):
             mult = encdec_channel_mult[level]
             c_stage = model_channels * mult
 
             if level < len(encdec_channel_mult) - 1:
+                u_stride = up_strides[up_idx]
                 self.upsamplers.append(
-                    RealResample2d(c_curr, up=True, causal=causal_conv, resample_filter=resample_filter, init=init)
+                    RealResample2d(c_curr, up=True, causal=causal_conv, resample_filter=resample_filter, resample_stride=u_stride, init=init)
                 )
+                up_idx += 1
 
             # Concatenation of skip: input channels = c_curr + c_stage
             cin_first = c_curr + c_stage
