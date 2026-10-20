@@ -19,6 +19,7 @@ import inspect
 import copy
 import uuid
 import types
+import linecache
 import dnnlib
 
 #----------------------------------------------------------------------------
@@ -229,7 +230,14 @@ def _src_to_module(src):
         sys.modules[module_name] = module
         _module_to_src_dict[module] = src
         _src_to_module_dict[src] = module
-        exec(src, module.__dict__) # pylint: disable=exec-used
+
+        # Register source in linecache so inspect.getsource and torch.jit.script can find it
+        filename = f"<{module_name}>"
+        linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
+        linecache.cache['<string>'] = (len(src), None, src.splitlines(True), '<string>')
+        module.__file__ = filename
+        compiled_code = compile(src, filename, 'exec')
+        exec(compiled_code, module.__dict__) # pylint: disable=exec-used
     return module
 
 #----------------------------------------------------------------------------

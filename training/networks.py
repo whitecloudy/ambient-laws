@@ -51,20 +51,19 @@ def unpad_from_power_of_two(x, pad_h, pad_w, orig_H, orig_W):
 # Fully-connected layer.
 
 @persistence.persistent_class
-class Linear(torch.nn.Module):
+class Linear(torch.nn.Linear):
     def __init__(self, in_features, out_features, bias=True, init_mode='kaiming_normal', init_weight=1, init_bias=0):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
+        super().__init__(in_features=in_features, out_features=out_features, bias=bias)
         init_kwargs = dict(mode=init_mode, fan_in=in_features, fan_out=out_features)
-        self.weight = torch.nn.Parameter(weight_init([out_features, in_features], **init_kwargs) * init_weight)
-        self.bias = torch.nn.Parameter(weight_init([out_features], **init_kwargs) * init_bias) if bias else None
+        with torch.no_grad():
+            self.weight.copy_(weight_init([out_features, in_features], **init_kwargs) * init_weight)
+            if self.bias is not None:
+                self.bias.copy_(weight_init([out_features], **init_kwargs) * init_bias)
 
     def forward(self, x):
-        x = x @ self.weight.to(x.dtype).t()
-        if self.bias is not None:
-            x = x.add_(self.bias.to(x.dtype))
-        return x
+        w = self.weight.to(x.dtype)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        return torch.nn.functional.linear(x, w, b)
 
 #----------------------------------------------------------------------------
 # Convolutional layer with optional up/downsampling.
@@ -114,6 +113,10 @@ class Conv2d(torch.nn.Module):
                 f_h = torch.as_tensor(resample_filter, dtype=torch.float32)
                 f_w = f_h
             if resample_filter is not None:
+                if self.resample_stride[0] == 1:
+                    f_h = torch.ones(1, dtype=torch.float32)
+                if self.resample_stride[1] == 1:
+                    f_w = torch.ones(1, dtype=torch.float32)
                 f = f_h.ger(f_w)
                 f = f.unsqueeze(0).unsqueeze(1) / (f_h.sum() * f_w.sum())
                 self.register_buffer('resample_filter', f)
@@ -513,46 +516,62 @@ class SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         self.enc = torch.nn.ModuleDict()
         cout = in_channels
         caux = in_channels
+        cur_H = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        cur_W = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        level_resolutions = []
+        down_strides = {}
         for level, mult in enumerate(channel_mult):
-            res = img_resolution >> level
+            if level > 0:
+                s_h = 2 if cur_H > 1 else 1
+                s_w = 2 if cur_W > 1 else 1
+                down_strides[level] = (s_h, s_w)
+                cur_H = max(1, cur_H // s_h)
+                cur_W = max(1, cur_W // s_w)
+            level_resolutions.append((cur_H, cur_W))
+            H_res, W_res = cur_H, cur_W
+            res_str = f'{H_res}x{W_res}' if isinstance(img_resolution, (list, tuple)) else f'{cur_H}x{cur_H}'
             if level == 0:
                 cin = cout
                 cout = model_channels
-                self.enc[f'{res}x{res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
+                self.enc[f'{res_str}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
             else:
-                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                d_stride = down_strides[level]
+                self.enc[f'{res_str}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, resample_stride=d_stride, **block_kwargs)
                 if encoder_type == 'skip':
-                    self.enc[f'{res}x{res}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter)
-                    self.enc[f'{res}x{res}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
+                    self.enc[f'{res_str}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter, resample_stride=d_stride)
+                    self.enc[f'{res_str}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
                 if encoder_type == 'residual':
-                    self.enc[f'{res}x{res}_aux_residual'] = Conv2d(in_channels=caux, out_channels=cout, kernel=3, down=True, resample_filter=resample_filter, fused_resample=True, **init)
+                    self.enc[f'{res_str}_aux_residual'] = Conv2d(in_channels=caux, out_channels=cout, kernel=3, down=True, resample_filter=resample_filter, resample_stride=d_stride, fused_resample=True, **init)
                     caux = cout
             for idx in range(num_blocks):
                 cin = cout
                 cout = model_channels * mult
-                attn = (res in attn_resolutions)
-                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                attn = (W_res in attn_resolutions if isinstance(img_resolution, (list, tuple)) else cur_H in attn_resolutions)
+                self.enc[f'{res_str}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
         skips = [block.out_channels for name, block in self.enc.items() if 'aux' not in name]
 
         # Decoder.
         self.dec = torch.nn.ModuleDict()
         for level, mult in reversed(list(enumerate(channel_mult))):
-            res = img_resolution >> level
+            H_res, W_res = level_resolutions[level]
+            res_str = f'{H_res}x{W_res}' if isinstance(img_resolution, (list, tuple)) else f'{H_res}x{H_res}'
             if level == len(channel_mult) - 1:
-                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
-                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+                self.dec[f'{res_str}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
+                self.dec[f'{res_str}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
             else:
-                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                u_stride = down_strides[level + 1]
+                self.dec[f'{res_str}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, resample_stride=u_stride, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
-                attn = (idx == num_blocks and res in attn_resolutions)
-                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                attn = (idx == num_blocks and (W_res in attn_resolutions if isinstance(img_resolution, (list, tuple)) else H_res in attn_resolutions))
+                self.dec[f'{res_str}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
-                    self.dec[f'{res}x{res}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter)
-                self.dec[f'{res}x{res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
-                self.dec[f'{res}x{res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
+                    u_stride = down_strides[level + 1]
+                    self.dec[f'{res_str}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter, resample_stride=u_stride)
+                self.dec[f'{res_str}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
+                self.dec[f'{res_str}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
     def forward(self, x, noise_labels, class_labels, augment_labels=None):
         # Mapping.
@@ -671,19 +690,30 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 if label_resolution == None:
                     label_resolution = img_resolution
                 # Apply padding size
-                padded_label_H = 1 << (label_resolution[0] - 1).bit_length() if label_resolution[0] > 0 else 0
-                padded_label_W = 1 << (label_resolution[1] - 1).bit_length() if label_resolution[1] > 0 else 0
+                label_H = label_resolution[0] if isinstance(label_resolution, (list, tuple)) else label_resolution
+                label_W = label_resolution[1] if isinstance(label_resolution, (list, tuple)) else label_resolution
+                padded_label_H = 1 << (label_H - 1).bit_length() if label_H > 0 else 0
+                padded_label_W = 1 << (label_W - 1).bit_length() if label_W > 0 else 0
                 
-                flatten_feature_size = padded_label_H//4 * padded_label_W//4 * model_channels
+                cur_l_H, cur_l_W = padded_label_H, padded_label_W
+                l_down1_stride = (2 if cur_l_H > 1 else 1, 2 if cur_l_W > 1 else 1)
+                cur_l_H = max(1, cur_l_H // l_down1_stride[0])
+                cur_l_W = max(1, cur_l_W // l_down1_stride[1])
+
+                l_down2_stride = (2 if cur_l_H > 1 else 1, 2 if cur_l_W > 1 else 1)
+                cur_l_H = max(1, cur_l_H // l_down2_stride[0])
+                cur_l_W = max(1, cur_l_W // l_down2_stride[1])
+
+                flatten_feature_size = cur_l_H * cur_l_W * model_channels
                 self.map_label = torch.nn.Sequential(
                     (OrderedDict([
                                 ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=3, **init)),    # RT : (model_channels, padded_label_H, padded_label_W)
                                 ("SiLU 1", torch.nn.SiLU()),
                                 ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, resample_stride=l_down1_stride, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
                                 ("SiLU 2", torch.nn.SiLU()),
                                 ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, resample_stride=l_down2_stride, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
                                 ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * padded_label_H//4 * padded_label_W//4)
                                 ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
                                 ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
@@ -721,21 +751,37 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         caux = in_channels
         unet_block_class = UNetBlock_AS if self.dynamic_noise else UNetBlock
 
+        img_H = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        img_W = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        cur_H = 1 << (img_H - 1).bit_length() if img_H > 0 else 1
+        cur_W = 1 << (img_W - 1).bit_length() if img_W > 0 else 1
+
+        level_resolutions = []
+        down_strides = {}
+
         for level, mult in enumerate(channel_mult):
-            H_res = img_resolution[0] >> level
-            W_res = img_resolution[1] >> level
-            emb_stride = (img_resolution[0] // max(H_res, 1), img_resolution[1] // max(W_res, 1))
+            if level > 0:
+                stride_H = 2 if cur_H > 1 else 1
+                stride_W = 2 if cur_W > 1 else 1
+                down_strides[level] = (stride_H, stride_W)
+                cur_H = max(1, cur_H // stride_H)
+                cur_W = max(1, cur_W // stride_W)
+            level_resolutions.append((cur_H, cur_W))
+
+            H_res, W_res = cur_H, cur_W
+            emb_stride = (img_H // max(H_res, 1), img_W // max(W_res, 1))
             if level == 0:
                 cin = cout
                 cout = model_channels
                 self.enc[f'{H_res}x{W_res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
             else:
-                self.enc[f'{H_res}x{W_res}_down'] = unet_block_class(in_channels=cout, out_channels=cout, down=True, emb_stride=emb_stride, **block_kwargs)
+                d_stride = down_strides[level]
+                self.enc[f'{H_res}x{W_res}_down'] = unet_block_class(in_channels=cout, out_channels=cout, down=True, emb_stride=emb_stride, resample_stride=d_stride, **block_kwargs)
                 if encoder_type == 'skip':
-                    self.enc[f'{H_res}x{W_res}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter)
+                    self.enc[f'{H_res}x{W_res}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter, resample_stride=d_stride)
                     self.enc[f'{H_res}x{W_res}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
                 if encoder_type == 'residual':
-                    self.enc[f'{H_res}x{W_res}_aux_residual'] = Conv2d(in_channels=caux, out_channels=cout, kernel=3, down=True, resample_filter=resample_filter, fused_resample=True, **init)
+                    self.enc[f'{H_res}x{W_res}_aux_residual'] = Conv2d(in_channels=caux, out_channels=cout, kernel=3, down=True, resample_filter=resample_filter, resample_stride=d_stride, fused_resample=True, **init)
                     caux = cout
             for idx in range(num_blocks):
                 cin = cout
@@ -747,14 +793,14 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         # Decoder.
         self.dec = torch.nn.ModuleDict()
         for level, mult in reversed(list(enumerate(channel_mult))):
-            H_res = img_resolution[0] >> level
-            W_res = img_resolution[1] >> level            
-            emb_stride = (img_resolution[0] // max(H_res, 1), img_resolution[1] // max(W_res, 1))
+            H_res, W_res = level_resolutions[level]
+            emb_stride = (img_H // max(H_res, 1), img_W // max(W_res, 1))
             if level == len(channel_mult) - 1:
                 self.dec[f'{H_res}x{W_res}_in0'] = unet_block_class(in_channels=cout, out_channels=cout, attention=True, emb_stride=emb_stride, **block_kwargs)
                 self.dec[f'{H_res}x{W_res}_in1'] = unet_block_class(in_channels=cout, out_channels=cout, emb_stride=emb_stride, **block_kwargs)
             else:
-                self.dec[f'{H_res}x{W_res}_up'] = unet_block_class(in_channels=cout, out_channels=cout, up=True, emb_stride=emb_stride, **block_kwargs)
+                u_stride = down_strides[level + 1]
+                self.dec[f'{H_res}x{W_res}_up'] = unet_block_class(in_channels=cout, out_channels=cout, up=True, emb_stride=emb_stride, resample_stride=u_stride, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
@@ -762,7 +808,8 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 self.dec[f'{H_res}x{W_res}_block{idx}'] = unet_block_class(in_channels=cin, out_channels=cout, attention=attn, emb_stride=emb_stride, **block_kwargs)
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
-                    self.dec[f'{H_res}x{W_res}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter)
+                    u_stride = down_strides[level + 1]
+                    self.dec[f'{H_res}x{W_res}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter, resample_stride=u_stride)
                 self.dec[f'{H_res}x{W_res}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
                 self.dec[f'{H_res}x{W_res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
@@ -772,7 +819,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             class_labels = z
         
         x, pad_h, pad_w, orig_H, orig_W = pad_to_power_of_two(x)
-        if self.label_type == 'downlink':
+        if self.label_type == 'downlink' and class_labels is not None:
             class_labels, c_pad_h, c_pad_w, c_orig_H, c_orig_W = pad_to_power_of_two(class_labels)
 
             if pad_h != c_pad_h or pad_w != c_pad_w:
@@ -886,8 +933,16 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 #----------------------------------------------------------------------------
 # RF_DiT: Complex-valued Diffusion Transformer with Convolutional Encoder-Decoder
 # and U-ViT style skip connections.
-from training.rf_dit import RF_DiT
-from training.rf_dit_real import RF_DiT_Real
+try:
+    from training.rf_dit import RF_DiT
+except ImportError:
+    pass
+
+try:
+    from training.rf_dit_real import RF_DiT_Real
+except ImportError:
+    pass
+
 
 
 
@@ -895,6 +950,7 @@ from training.rf_dit_real import RF_DiT_Real
 @persistence.persistent_class
 class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
     def __init__(
+        self,
         img_resolution,                     # Image resolution at input/output.
         in_channels,                        # Number of color channels at input.
         out_channels,                       # Number of color channels at output.
@@ -938,8 +994,8 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
-            resample_filter=resample_filter, resample_stride=resample_stride, resample_proj=True, adaptive_scale=False,
-            kernel=kernel_size, stride=stride,
+            resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
+            kernel=kernel_size,
             init=init, init_zero=init_zero, init_attn=init_attn, attention_scale=attention_scale,
         )
         
@@ -958,18 +1014,39 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 padded_label_H = 1 << (label_resolution[0] - 1).bit_length() if label_resolution[0] > 0 else 0
                 padded_label_W = 1 << (label_resolution[1] - 1).bit_length() if label_resolution[1] > 0 else 0
 
-                total_stride_0 = resample_stride[0] * stride[0]
-                total_stride_1 = resample_stride[1] * stride[1]
-                flatten_feature_size = (padded_label_H // (total_stride_0**2)) * (padded_label_W // (total_stride_1**2)) * model_channels
+                cur_l_H, cur_l_W = padded_label_H, padded_label_W
+                eff_l_resample_stride_1 = (
+                    resample_stride[0] if cur_l_H > 1 else 1,
+                    resample_stride[1] if cur_l_W > 1 else 1,
+                )
+                eff_l_stride_1 = (
+                    stride[0] if cur_l_H > 1 else 1,
+                    stride[1] if cur_l_W > 1 else 1,
+                )
+                cur_l_H = max(1, cur_l_H // (eff_l_resample_stride_1[0] * eff_l_stride_1[0]))
+                cur_l_W = max(1, cur_l_W // (eff_l_resample_stride_1[1] * eff_l_stride_1[1]))
+
+                eff_l_resample_stride_2 = (
+                    resample_stride[0] if cur_l_H > 1 else 1,
+                    resample_stride[1] if cur_l_W > 1 else 1,
+                )
+                eff_l_stride_2 = (
+                    stride[0] if cur_l_H > 1 else 1,
+                    stride[1] if cur_l_W > 1 else 1,
+                )
+                cur_l_H = max(1, cur_l_H // (eff_l_resample_stride_2[0] * eff_l_stride_2[0]))
+                cur_l_W = max(1, cur_l_W // (eff_l_resample_stride_2[1] * eff_l_stride_2[1]))
+
+                flatten_feature_size = cur_l_H * cur_l_W * model_channels
                 self.map_label = torch.nn.Sequential(
                     (OrderedDict([
                                 ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=kernel_size, **init)),    # RT : (model_channels, padded_label_H, padded_label_W)
                                 ("SiLU 1", torch.nn.SiLU()),
                                 ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=eff_l_resample_stride_1, stride=eff_l_stride_1, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
                                 ("SiLU 2", torch.nn.SiLU()),
                                 ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=eff_l_resample_stride_2, stride=eff_l_stride_2, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
                                 ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * padded_label_H//4 * padded_label_W//4)
                                 ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
                                 ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
@@ -984,18 +1061,39 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 padded_label_H = 1 << (label_resolution[0] - 1).bit_length() if label_resolution[0] > 0 else 0
                 padded_label_W = 1 << (label_resolution[1] - 1).bit_length() if label_resolution[1] > 0 else 0
 
-                total_stride_0 = resample_stride[0] * stride[0]
-                total_stride_1 = resample_stride[1] * stride[1]
-                flatten_feature_size = (padded_label_H // (total_stride_0**2)) * (padded_label_W // (total_stride_1**2)) * model_channels
+                cur_l_H, cur_l_W = padded_label_H, padded_label_W
+                eff_l_resample_stride_1 = (
+                    resample_stride[0] if cur_l_H > 1 else 1,
+                    resample_stride[1] if cur_l_W > 1 else 1,
+                )
+                eff_l_stride_1 = (
+                    stride[0] if cur_l_H > 1 else 1,
+                    stride[1] if cur_l_W > 1 else 1,
+                )
+                cur_l_H = max(1, cur_l_H // (eff_l_resample_stride_1[0] * eff_l_stride_1[0]))
+                cur_l_W = max(1, cur_l_W // (eff_l_resample_stride_1[1] * eff_l_stride_1[1]))
+
+                eff_l_resample_stride_2 = (
+                    resample_stride[0] if cur_l_H > 1 else 1,
+                    resample_stride[1] if cur_l_W > 1 else 1,
+                )
+                eff_l_stride_2 = (
+                    stride[0] if cur_l_H > 1 else 1,
+                    stride[1] if cur_l_W > 1 else 1,
+                )
+                cur_l_H = max(1, cur_l_H // (eff_l_resample_stride_2[0] * eff_l_stride_2[0]))
+                cur_l_W = max(1, cur_l_W // (eff_l_resample_stride_2[1] * eff_l_stride_2[1]))
+
+                flatten_feature_size = cur_l_H * cur_l_W * model_channels
                 self.map_label = torch.nn.ModuleList([torch.nn.Sequential(
                     (OrderedDict([
                                 ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=kernel_size, **init)),    # RT : (model_channels, padded_label_H, padded_label_W)
                                 ("SiLU 1", torch.nn.SiLU()),
                                 ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
+                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=eff_l_resample_stride_1, stride=eff_l_stride_1, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
                                 ("SiLU 2", torch.nn.SiLU()),
                                 ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=resample_stride, stride=stride, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
+                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=kernel_size, down=True, resample_stride=eff_l_resample_stride_2, stride=eff_l_stride_2, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
                                 ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * padded_label_H//4 * padded_label_W//4)
                                 ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
                                 ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
@@ -1022,28 +1120,43 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         cur_H = img_resolution[0]
         cur_W = img_resolution[1]
         level_resolutions = []
+        down_strides = {}
 
         for level, mult in enumerate(channel_mult):
-            level_resolutions.append((cur_H, cur_W))
             if level == 0:
                 cin = cout
                 cout = model_channels
-                if self.stem_stride[0] > 1 or self.stem_stride[1] > 1:
-                    self.enc[f'{cur_H}x{cur_W}_conv_stem'] = Conv2d(in_channels=cin, out_channels=cout, kernel=stem_kernel, stride=self.stem_stride, **init)
+                eff_stem_stride = (
+                    self.stem_stride[0] if cur_H > 1 else 1,
+                    self.stem_stride[1] if cur_W > 1 else 1,
+                )
+                if eff_stem_stride[0] > 1 or eff_stem_stride[1] > 1:
+                    self.enc[f'{cur_H}x{cur_W}_conv_stem'] = Conv2d(in_channels=cin, out_channels=cout, kernel=stem_kernel, stride=eff_stem_stride, **init)
                 else:
                     self.enc[f'{cur_H}x{cur_W}_conv_stem'] = Conv2d(in_channels=cin, out_channels=cout, kernel=stem_kernel, **init)
-                cur_H = cur_H // self.stem_stride[0]
-                cur_W = cur_W // self.stem_stride[1]
+                cur_H = max(1, cur_H // eff_stem_stride[0])
+                cur_W = max(1, cur_W // eff_stem_stride[1])
             else:
-                self.enc[f'{cur_H}x{cur_W}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                eff_resample_stride = (
+                    resample_stride[0] if cur_H > 1 else 1,
+                    resample_stride[1] if cur_W > 1 else 1,
+                )
+                eff_stride = (
+                    stride[0] if cur_H > 1 else 1,
+                    stride[1] if cur_W > 1 else 1,
+                )
+                down_strides[level] = (eff_resample_stride, eff_stride)
+                self.enc[f'{cur_H}x{cur_W}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, resample_stride=eff_resample_stride, stride=eff_stride, **block_kwargs)
                 if encoder_type == 'skip':
-                    self.enc[f'{cur_H}x{cur_W}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter, resample_stride=resample_stride, stride=stride)
+                    self.enc[f'{cur_H}x{cur_W}_aux_down'] = Conv2d(in_channels=caux, out_channels=caux, kernel=0, down=True, resample_filter=resample_filter, resample_stride=eff_resample_stride, stride=eff_stride)
                     self.enc[f'{cur_H}x{cur_W}_aux_skip'] = Conv2d(in_channels=caux, out_channels=cout, kernel=1, **init)
                 if encoder_type == 'residual':
-                    self.enc[f'{cur_H}x{cur_W}_aux_residual'] = Conv2d(in_channels=caux, out_channels=cout, kernel=kernel_size, down=True, resample_filter=resample_filter, resample_stride=resample_stride, fused_resample=True, stride=stride, **init)
+                    self.enc[f'{cur_H}x{cur_W}_aux_residual'] = Conv2d(in_channels=caux, out_channels=cout, kernel=kernel_size, down=True, resample_filter=resample_filter, resample_stride=eff_resample_stride, fused_resample=True, stride=eff_stride, **init)
                     caux = cout
-                cur_H = cur_H // (resample_stride[0] * stride[0])
-                cur_W = cur_W // (resample_stride[1] * stride[1])
+                cur_H = max(1, cur_H // (eff_resample_stride[0] * eff_stride[0]))
+                cur_W = max(1, cur_W // (eff_resample_stride[1] * eff_stride[1]))
+
+            level_resolutions.append((cur_H, cur_W))
 
             for idx in range(num_blocks):
                 cin = cout
@@ -1060,7 +1173,8 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 self.dec[f'{cur_H}x{cur_W}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
                 self.dec[f'{cur_H}x{cur_W}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
             else:
-                self.dec[f'{cur_H}x{cur_W}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                eff_resample_stride, eff_stride = down_strides[level + 1]
+                self.dec[f'{cur_H}x{cur_W}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, resample_stride=eff_resample_stride, stride=eff_stride, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
@@ -1068,10 +1182,15 @@ class WiDAR_RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 self.dec[f'{cur_H}x{cur_W}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
-                    self.dec[f'{cur_H}x{cur_W}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter, resample_stride=resample_stride, stride=stride)
+                    eff_resample_stride, eff_stride = down_strides[level + 1]
+                    self.dec[f'{cur_H}x{cur_W}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter, resample_stride=eff_resample_stride, stride=eff_stride)
                 self.dec[f'{cur_H}x{cur_W}_aux_norm'] = GroupNorm(num_channels=cout, eps=1e-6)
                 if self.stem_stride[0] > 1 or self.stem_stride[1] > 1:
-                    self.dec[f'{cur_H}x{cur_W}_aux_conv_stem'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=stem_kernel, up=True, resample_filter=None, stride=self.stem_stride, **init_zero)
+                    eff_stem_stride = (
+                        self.stem_stride[0] if img_resolution[0] > 1 else 1,
+                        self.stem_stride[1] if img_resolution[1] > 1 else 1,
+                    )
+                    self.dec[f'{cur_H}x{cur_W}_aux_conv_stem'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=stem_kernel, up=True, resample_filter=None, stride=eff_stem_stride, **init_zero)
                 else:
                     self.dec[f'{cur_H}x{cur_W}_aux_conv_stem'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=stem_kernel, **init_zero)
 
@@ -1210,33 +1329,48 @@ class DhariwalUNet(torch.nn.Module, PyTorchModelHubMixin):
         # Encoder.
         self.enc = torch.nn.ModuleDict()
         cout = in_channels
+        cur_H = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        cur_W = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
+        level_resolutions = []
+        down_strides = {}
         for level, mult in enumerate(channel_mult):
-            res = img_resolution >> level
+            if level > 0:
+                s_h = 2 if cur_H > 1 else 1
+                s_w = 2 if cur_W > 1 else 1
+                down_strides[level] = (s_h, s_w)
+                cur_H = max(1, cur_H // s_h)
+                cur_W = max(1, cur_W // s_w)
+            level_resolutions.append((cur_H, cur_W))
+            H_res, W_res = cur_H, cur_W
+            res_str = f'{H_res}x{W_res}' if isinstance(img_resolution, (list, tuple)) else f'{cur_H}x{cur_H}'
             if level == 0:
                 cin = cout
                 cout = model_channels * mult
-                self.enc[f'{res}x{res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
+                self.enc[f'{res_str}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
             else:
-                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                d_stride = down_strides[level]
+                self.enc[f'{res_str}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, resample_stride=d_stride, **block_kwargs)
             for idx in range(num_blocks):
                 cin = cout
                 cout = model_channels * mult
-                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
+                self.enc[f'{res_str}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(W_res in attn_resolutions if isinstance(img_resolution, (list, tuple)) else cur_H in attn_resolutions), **block_kwargs)
         skips = [block.out_channels for block in self.enc.values()]
 
         # Decoder.
         self.dec = torch.nn.ModuleDict()
         for level, mult in reversed(list(enumerate(channel_mult))):
-            res = img_resolution >> level
+            H_res, W_res = level_resolutions[level]
+            res_str = f'{H_res}x{W_res}' if isinstance(img_resolution, (list, tuple)) else f'{H_res}x{H_res}'
             if level == len(channel_mult) - 1:
-                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
-                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+                self.dec[f'{res_str}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
+                self.dec[f'{res_str}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
             else:
-                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                u_stride = down_strides[level + 1]
+                self.dec[f'{res_str}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, resample_stride=u_stride, **block_kwargs)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
-                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
+                self.dec[f'{res_str}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(W_res in attn_resolutions if isinstance(img_resolution, (list, tuple)) else H_res in attn_resolutions), **block_kwargs)
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
@@ -1470,6 +1604,14 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
                 model_out_channels = img_channels // 2
             else:
                 model_out_channels = img_channels
+
+        if model_type not in globals():
+            if model_type == 'RF_DiT_Real':
+                from training.rf_dit_real import RF_DiT_Real
+                globals()['RF_DiT_Real'] = RF_DiT_Real
+            elif model_type == 'RF_DiT':
+                from training.rf_dit import RF_DiT
+                globals()['RF_DiT'] = RF_DiT
 
         self.model = globals()[model_type](img_resolution=img_resolution, in_channels=model_in_channels, out_channels=model_out_channels, label_dim=label_dim, **model_kwargs)
 
