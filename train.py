@@ -125,10 +125,13 @@ def parse_int_list(s):
 
 # Semantic Communication (RENEW_SC) related
 @click.option('--adjscc_config', help='Path to ADJSCC config JSON/YAML file for RENEW_SC.', type=str, default='misc/ADJSCC/config_example.json', show_default=True)
+@click.option('--adjscc_model_path', help='Explicit path to ADJSCC checkpoint .pt file for RENEW_SC (overrides config).', type=str, default=None, show_default=True)
 @click.option('--image_data', help='Path to image dataset directory for RENEW_SC (None for CIFAR-10).', type=str, default=None, show_default=True)
 @click.option('--sc_t', help='Number of time steps T for RENEW_SC (None to auto-calculate from adjscc_config image size and compression level).', type=int, default=None, show_default=True)
 @click.option('--sc_dataset_len', help='Fixed dataset length for RENEW_SC (None for default).', type=int, default=None, show_default=True)
 @click.option('--matching_mode', help='Latent to RF channel matching mode for RENEW_SC.', type=click.Choice(['interpolate', 'pad_or_slice', 'repeat']), default='interpolate', show_default=True)
+@click.option('--sc_channel_type', help='Channel type for RENEW_SC: "slow_fading" (standard Y = H*Z + N) or "slow_fading_eq" (Zero-Forcing equalization Y/H = Z + N/H with dimensional noise).', type=click.Choice(['slow_fading', 'slow_fading_eq']), default='slow_fading', show_default=True)
+@click.option('--slow_fading_eq', help='Shortcut flag to enable slow_fading_eq channel equalization for RENEW_SC.', is_flag=True, default=False)
 
 # Consistency params
 @click.option("--consistency_batch_size", help="Batch size for the consistency loss.", type=int, default=32)
@@ -240,10 +243,12 @@ def main(**kwargs):
                                     noise_mean_flag=not opts.dynamic_noise_sigma,
                                     snr_range=opts.snr_range)
     elif opts.task == 'RENEW_SC':
+        sc_channel = 'slow_fading_eq' if opts.slow_fading_eq else opts.sc_channel_type
         c.dataset_kwargs = dnnlib.EasyDict(
             path=opts.data,
             renew_path=opts.data,
             adjscc_config=opts.adjscc_config,
+            adjscc_model_path=opts.adjscc_model_path,
             image_dataset=opts.image_data,
             T=opts.sc_t,
             dataset_len=opts.sc_dataset_len,
@@ -251,6 +256,8 @@ def main(**kwargs):
             matching_mode=opts.matching_mode,
             power_normalize_latent=True,
             view_as_complex=opts.view_as_complex,
+            channel_type=sc_channel,
+            slow_fading_eq=opts.slow_fading_eq,
             additive_noise_sigma=opts.additive_noise_sigma,
             multiply_noise_sigma=opts.multiply_noise_sigma,
             snr_range=opts.snr_range,
@@ -336,6 +343,7 @@ def main(**kwargs):
         elif opts.task == 'RENEW_SC':
             dataset_obj = RenewSemanticCommunicationDataset(**c.dataset_kwargs)
             dist.print0(f"[RENEW_SC] Time steps T = {dataset_obj.T} (auto-calculated: {opts.sc_t is None})")
+            dist.print0(f"[RENEW_SC] Channel type: {dataset_obj.channel_type} (equalization: {dataset_obj.channel_type == 'slow_fading_eq'})")
         elif opts.task == 'WIDAR':
             c.dataset_kwargs.must_contain = "regex:gesture(0|1|2|3|17|18)(?!\d)"
             dataset_obj = WiDARDataset(**c.dataset_kwargs)
@@ -372,6 +380,9 @@ def main(**kwargs):
     elif opts.arch == 'ddpmpp_192':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
+    elif opts.arch == 'ddpmpp_64':
+        c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
@@ -495,7 +506,7 @@ def main(**kwargs):
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
 
     if not opts.not_dynamic_noise_sigma_model:
-        if (opts.arch in ['ddpmpp', 'ddpmpp_256', 'ddpmpp_192']):
+        if (opts.arch in ['ddpmpp', 'ddpmpp_256', 'ddpmpp_192', 'ddpmpp_64']):
             c.network_kwargs.update(dynamic_noise=True)
         elif opts.arch.startswith('rf_dit'):
             c.network_kwargs.update(dynamic_noise=False)

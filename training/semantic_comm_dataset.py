@@ -130,6 +130,95 @@ def calculate_sc_t_from_config(
     return max(1, t)
 
 
+def find_adjscc_checkpoint(
+    adjscc_config: Dict[str, Any],
+    explicit_path: Optional[Union[str, Path]] = None,
+    config_file_path: Optional[Union[str, Path]] = None,
+) -> Optional[Path]:
+    """
+    ADJSCC 인코더 체크포인트(.pt) 경로를 찾습니다.
+    우선순위:
+    1) explicit_path (CLI 옵션 --adjscc_model_path 또는 생성자 인자)
+    2) adjscc_config 내 'load_model_path' 또는 'model_path' (null/None이 아닌 경우)
+    3) 자동 탐색 (ADJSCC 학습용 yaml 등에서 load_model_path: null 인 경우):
+       config의 model_dir(예: misc/ADJSCC/model/)에서
+       channel_type, tcn, snr, bs, lr 등의 하이퍼파라미터 패턴과 일치하는 .pt 모델 파일을 자동 탐색하여 반환.
+    """
+    # 1. explicit_path
+    if explicit_path is not None and str(explicit_path).strip() not in ('', 'None', 'null'):
+        cand = Path(explicit_path)
+        if cand.exists():
+            return cand.resolve()
+        cand_cwd = (Path.cwd() / explicit_path).resolve()
+        if cand_cwd.exists():
+            return cand_cwd
+
+    # 2. config['load_model_path'] / config['model_path']
+    cfg_model_path = adjscc_config.get('load_model_path', adjscc_config.get('model_path', None))
+    if cfg_model_path is not None and str(cfg_model_path).strip() not in ('', 'None', 'null'):
+        cand = Path(cfg_model_path)
+        if cand.exists():
+            return cand.resolve()
+        cand_cwd = (Path.cwd() / cfg_model_path).resolve()
+        if cand_cwd.exists():
+            return cand_cwd
+        if config_file_path is not None:
+            cand_cfg = (Path(config_file_path).resolve().parent / cfg_model_path).resolve()
+            if cand_cfg.exists():
+                return cand_cfg
+
+    # 3. 자동 탐색 (ADJSCC 파일명 네이밍 규칙에 따른 검색)
+    model_dir_str = adjscc_config.get('model_dir', 'misc/ADJSCC/model/')
+    dir_candidates = [
+        Path(model_dir_str),
+        Path.cwd() / model_dir_str,
+    ]
+    if config_file_path is not None:
+        cfg_dir = Path(config_file_path).resolve().parent
+        dir_candidates.append(cfg_dir / model_dir_str)
+        dir_candidates.append(cfg_dir / "model")
+
+    valid_dir = None
+    for d in dir_candidates:
+        if d.is_dir():
+            valid_dir = d.resolve()
+            break
+
+    if valid_dir is None:
+        return None
+
+    channel_type = str(adjscc_config.get('channel_type', '*')).lower().strip()
+    tcn = adjscc_config.get('transmit_channel_num', adjscc_config.get('tcn', '*'))
+    snr_low_train = adjscc_config.get('snr_low_train', None)
+    snr_up_train = adjscc_config.get('snr_up_train', None)
+    snr_low_eval = adjscc_config.get('snr_low_eval', None)
+    snr_up_eval = adjscc_config.get('snr_up_eval', None)
+    bs = adjscc_config.get('batch_size', None)
+    lr = adjscc_config.get('learning_rate', None)
+
+    glob_patterns = []
+    # 1) exact match with train snr, bs, lr
+    if snr_low_train is not None and snr_up_train is not None and bs is not None and lr is not None:
+        glob_patterns.append(f"*_{channel_type}_tcn{tcn}_snrdb{snr_low_train}to{snr_up_train}_bs{bs}_lr{lr}.pt")
+        glob_patterns.append(f"*_tcn{tcn}_snrdb{snr_low_train}to{snr_up_train}_bs{bs}_lr{lr}.pt")
+    # 2) match with eval snr
+    if snr_low_eval is not None and snr_up_eval is not None and bs is not None and lr is not None:
+        glob_patterns.append(f"*_{channel_type}_tcn{tcn}_snrdb{snr_low_eval}to{snr_up_eval}_bs{bs}_lr{lr}.pt")
+    # 3) match channel_type and tcn
+    glob_patterns.append(f"*_{channel_type}_tcn{tcn}*.pt")
+    # 4) match tcn
+    glob_patterns.append(f"*tcn{tcn}*.pt")
+    # 5) any pt file in model_dir
+    glob_patterns.append("*.pt")
+
+    for pat in glob_patterns:
+        matched = sorted(list(valid_dir.glob(pat)))
+        if matched:
+            return matched[0].resolve()
+
+    return None
+
+
 class RenewSemanticCommunicationDataset(Dataset):
     """
     RENEW RF 채널 데이터와 ADJSCC를 결합하여 Semantic Communication (SC) 무선 전송을 모사하는 데이터셋 클래스.
@@ -142,6 +231,7 @@ class RenewSemanticCommunicationDataset(Dataset):
     5) SNR 산출: 선택된 RF 채널 슬라이스와 natural noise sigma를 이용하여 계산 후 ADJSCC Encoder에 입력.
     6) SC Encoder는 사전에 학습된 상태로 가정되며, GPU에서 inference mode로만 동작하고 절대 학습(가중치 업데이트)되지 않음.
     7) 시간 스텝 T는 adjscc_config에 설정된 이미지 크기와 압축 수준(tcn 또는 bandwidth ratio)에 의해 자동 계산 지원.
+    8) slow_fading_eq 옵션: ADJSCC의 slow_fading_eq처럼 수신 신호 Y에 알려진 채널 H를 나누어 신호 자체(Z)에는 채널 영향을 제거하고, 노이즈가 H로 나누어져 차원(시간, 서브캐리어)에 따라 노이즈 세기(sigma)가 달라지는 신호를 생성하여 diffusion이 학습할 수 있도록 지원.
     """
 
     def __init__(
@@ -152,12 +242,16 @@ class RenewSemanticCommunicationDataset(Dataset):
         renew_dataset: Optional[renewRfProcessedDataset] = None,
         renew_kwargs: Optional[Dict[str, Any]] = None,
         image_dataset: Optional[Any] = None,
+        adjscc_model_path: Optional[str] = None,
         T: Optional[int] = None,
         dataset_len: Optional[int] = None,
         seed: int = 42,
         matching_mode: str = 'interpolate',  # 'interpolate', 'pad_or_slice', 'repeat'
         power_normalize_latent: bool = True,
         view_as_complex: bool = False,       # 기본값 False: [2, T, 48] 실수/허수 채널 반환
+        channel_type: Optional[str] = None,  # 'slow_fading' 또는 'slow_fading_eq'
+        slow_fading_eq: bool = False,        # slow_fading_eq 활성화 플래그
+        eq_epsilon: float = 1e-6,            # 채널 나눗셈 분모 안정화 상수
         additive_noise_sigma: float = 0.0,
         multiply_noise_sigma: float = 1.0,
         snr_range: Optional[Union[str, Tuple[float, float], List[float]]] = None,
@@ -210,22 +304,38 @@ class RenewSemanticCommunicationDataset(Dataset):
         sample_csi, sample_noise = self._load_raw_file(self._renew_files[0])
         self.n_frames, self.n_antennas, self.raw_subcarriers = sample_csi.shape
 
-        # 2. ADJSCC 설정 로드 및 디바이스 결정 (GPU 우선 지원)
+        # 2. ADJSCC 설정 로드 및 채널 모드 결정
+        self._config_file_path = Path(adjscc_config) if isinstance(adjscc_config, (str, Path)) else None
         self.adjscc_config = _load_adjscc_config(adjscc_config)
         self.tcn = int(self.adjscc_config.get('transmit_channel_num', 16))
         self.in_channels = int(self.adjscc_config.get('in_channels', 3))
-        self.load_model_path = self.adjscc_config.get('load_model_path', None)
+        self.load_model_path = adjscc_model_path or self.adjscc_config.get('load_model_path', None)
+
+        # 채널 유형 결정 ('slow_fading' vs 'slow_fading_eq')
+        if slow_fading_eq:
+            self.channel_type = 'slow_fading_eq'
+        elif channel_type is not None:
+            self.channel_type = str(channel_type).lower().strip()
+        elif 'channel_type' in self.adjscc_config:
+            self.channel_type = str(self.adjscc_config['channel_type']).lower().strip()
+        else:
+            self.channel_type = 'slow_fading'
+
+        self.eq_epsilon = float(eq_epsilon)
 
         if device is not None:
             self.device = torch.device(device)
         elif 'device' in self.adjscc_config and self.adjscc_config['device'] is not None:
             cfg_dev = str(self.adjscc_config['device']).strip().lower()
-            if cfg_dev == 'auto':
+            if cfg_dev in ['cuda', 'gpu', 'auto']:
                 self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             else:
                 self.device = torch.device(self.adjscc_config['device'])
         else:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        if self.device.type == 'cuda' and not torch.cuda.is_available():
+            self.device = torch.device('cpu')
 
         if Attention_Encoder is None:
             raise ImportError("Failed to import Attention_Encoder from misc/ADJSCC/util_module.py.")
@@ -234,24 +344,28 @@ class RenewSemanticCommunicationDataset(Dataset):
         torch.manual_seed(self.seed)
         self.encoder = Attention_Encoder(tcn=self.tcn, in_channels=self.in_channels)
 
-        if self.load_model_path is not None and str(self.load_model_path).strip() != '':
-            model_path = Path(self.load_model_path)
-            if model_path.exists():
-                logger.info(f"Loading ADJSCC encoder weights from {model_path}")
-                checkpoint = torch.load(model_path, map_location=self.device)
-                if isinstance(checkpoint, dict) and 'encoder' in checkpoint:
-                    self.encoder.load_state_dict(checkpoint['encoder'])
-                elif isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                    self.encoder.load_state_dict(checkpoint['model_state_dict'])
-                elif isinstance(checkpoint, dict):
-                    enc_dict = {k.replace('encoder.', ''): v for k, v in checkpoint.items() if k.startswith('encoder.')}
-                    self.encoder.load_state_dict(enc_dict if enc_dict else checkpoint, strict=False)
-                else:
-                    self.encoder.load_state_dict(checkpoint)
+        # ADJSCC 인코더 체크포인트 탐색 및 로드
+        resolved_model_path = find_adjscc_checkpoint(
+            adjscc_config=self.adjscc_config,
+            explicit_path=self.load_model_path,
+            config_file_path=self._config_file_path
+        )
+
+        if resolved_model_path is not None and resolved_model_path.exists():
+            logger.info(f"Loading ADJSCC encoder weights from {resolved_model_path}")
+            checkpoint = torch.load(resolved_model_path, map_location=self.device)
+            if isinstance(checkpoint, dict) and 'encoder' in checkpoint:
+                self.encoder.load_state_dict(checkpoint['encoder'])
+            elif isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                self.encoder.load_state_dict(checkpoint['model_state_dict'])
+            elif isinstance(checkpoint, dict):
+                enc_dict = {k.replace('encoder.', ''): v for k, v in checkpoint.items() if k.startswith('encoder.')}
+                self.encoder.load_state_dict(enc_dict if enc_dict else checkpoint, strict=False)
             else:
-                logger.warning(f"ADJSCC model path {model_path} does not exist. Using randomly initialized encoder in eval mode.")
+                self.encoder.load_state_dict(checkpoint)
+            logger.info(f"Successfully loaded ADJSCC encoder weights from {resolved_model_path.name}")
         else:
-            logger.info("No ADJSCC model checkpoint specified. Initialized Attention_Encoder with fixed seed in eval mode.")
+            logger.info("No ADJSCC model checkpoint specified or found. Initialized Attention_Encoder with fixed seed in eval mode.")
 
         # SC Encoder는 GPU에 배치되고 eval() 및 requires_grad=False로 완전히 동결됨 (학습되지 않음)
         self.encoder.to(self.device)
@@ -376,6 +490,20 @@ class RenewSemanticCommunicationDataset(Dataset):
         """이미지 데이터셋을 로드하거나 초기화합니다 (기본 CIFAR-10)."""
         if image_dataset is None:
             transform = T.Compose([T.ToTensor()])
+            # 1. ADJSCC 표준 경로(data/cifar10/train)에 이미 존재하는 CIFAR-10 확인
+            cifar_candidates = [
+                os.path.join(_WORKSPACE_DIR, 'data', 'cifar10', 'train'),
+                './data/cifar10/train',
+                '/data/alex9395/cifar10/train',
+                os.path.join(str(_ADJSCC_DIR), 'data', 'cifar10', 'train'),
+            ]
+            for cand in cifar_candidates:
+                if os.path.exists(cand) and os.path.isdir(cand):
+                    from torchvision.datasets import ImageFolder
+                    logger.info(f"Using existing CIFAR-10 dataset from {cand} (50,000 images found, no download needed)")
+                    return ImageFolder(cand, transform=transform)
+
+            # 2. torchvision CIFAR10 로컬 캐시(cifar-10-batches-py) 확인
             try:
                 from torchvision.datasets import CIFAR10
                 return CIFAR10(root=os.path.join(_WORKSPACE_DIR, 'data'), train=True, download=False, transform=transform)
@@ -569,10 +697,8 @@ class RenewSemanticCommunicationDataset(Dataset):
         z_matched = self._match_latent_shape(z_complex_1d, (self.T, 48))
 
         # -------------------------------------------------------------
-        # 5) 무선 채널 전송 및 natural noise 추가: Y = H * Z + N
+        # 5) 무선 채널 전송 및 노이즈 추가 (slow_fading vs slow_fading_eq)
         # -------------------------------------------------------------
-        rx_noiseless = h_clean_48 * z_matched  # (T, 48) complex
-
         # noise_seed로 일관된 복소 가우시안 노이즈 생성
         noise_real = np_gen.standard_normal((self.T, 48))
         noise_imag = np_gen.standard_normal((self.T, 48))
@@ -585,7 +711,31 @@ class RenewSemanticCommunicationDataset(Dataset):
             eff_sigma_mat = float(eff_noise_sigma)
 
         rx_noise = complex_norm_noise * eff_sigma_mat
-        rx_signal = rx_noiseless + rx_noise
+
+        if self.channel_type == 'slow_fading_eq':
+            # Zero-Forcing 채널 등화 (ADJSCC slow_fading_eq 모사):
+            # 수신된 신호에 미리 알고 있는 정확한 H를 나누어 신호 자체(Z)에서 채널 영향을 제거:
+            # Y_eq = (H * Z + N) / H = Z + N / H
+            h_mag = np.abs(h_clean_48)
+            eps = self.eq_epsilon
+            # 분모가 0에 근접할 때의 수치적 폭주를 방지하기 위해 위상을 보존하며 안전 클램핑
+            h_safe = np.where(h_mag < eps, eps * np.exp(1j * np.angle(h_clean_48)), h_clean_48)
+
+            eq_noise = rx_noise / h_safe
+            rx_signal = z_matched + eq_noise
+
+            # H의 크기가 시간/서브캐리어 차원마다 다르므로, H로 나누어진 노이즈의 표준편차도 차원에 따라 다양해짐
+            if isinstance(eff_sigma_mat, np.ndarray):
+                base_sigma = np.broadcast_to(eff_sigma_mat, (self.T, 48)).astype(np.float32)
+            else:
+                base_sigma = np.full((self.T, 48), eff_sigma_mat, dtype=np.float32)
+
+            sigma_map = (base_sigma / np.maximum(h_mag, eps)).astype(np.float32)
+        else:
+            # 기본 slow_fading: Y = H * Z + N
+            rx_noiseless = h_clean_48 * z_matched  # (T, 48) complex
+            rx_signal = rx_noiseless + rx_noise
+            sigma_map = None
 
         # -------------------------------------------------------------
         # 6) 출력 형태: [img/real, T, C] = [2, T, 48]
@@ -593,28 +743,35 @@ class RenewSemanticCommunicationDataset(Dataset):
         # -------------------------------------------------------------
         if self.view_as_complex:
             out_image = rx_signal.astype(np.complex64)
-            out_clean = h_clean_48.astype(np.complex64)
+            out_clean_channel = h_clean_48.astype(np.complex64)
             out_latent = z_matched.astype(np.complex64)
+            out_sigma = sigma_map if sigma_map is not None else np.float32(np.mean(eff_noise_sigma))
         else:
             # [2, T, 48]
             out_image = np.stack([rx_signal.real, rx_signal.imag], axis=0).astype(np.float32)
-            out_clean = np.stack([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
+            out_clean_channel = np.stack([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
             out_latent = np.stack([z_matched.real, z_matched.imag], axis=0).astype(np.float32)
+            if sigma_map is not None:
+                out_sigma = np.stack([sigma_map, sigma_map], axis=0).astype(np.float32)
+            else:
+                out_sigma = np.float32(np.mean(eff_noise_sigma))
 
         if self.use_labels:
-            out_label = out_clean
+            if self.channel_type == 'slow_fading_eq':
+                out_label = out_latent
+            else:
+                out_label = out_clean_channel
         else:
             out_label = np.zeros([0,], dtype=np.float32)
 
-        out_sigma = np.float32(np.mean(eff_noise_sigma))
-
         return {
             'image': out_image,
-            'clean_channel': out_clean,
+            'clean_channel': out_clean_channel,
+            'latent': out_latent,
+            'clean_latent': out_latent,
             'label': out_label,
             'sigma': out_sigma,
             'snr_db': np.float32(snr_db),
-            'latent': out_latent,
             'source_image': img_tensor,
             'source_label': label,
             'antenna_idx': antenna_idx,
@@ -623,6 +780,7 @@ class RenewSemanticCommunicationDataset(Dataset):
             'idx': idx,
             'axis_name': ['complex', 'time', 'channel'] if not self.view_as_complex else ['time', 'channel'],
             'additive_noise_sigma': np.float32(self.additive_noise_sigma),
+            'channel_type': self.channel_type,
         }
 
 
