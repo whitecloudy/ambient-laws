@@ -258,11 +258,20 @@ def main(**kwargs):
             view_as_complex=opts.view_as_complex,
             channel_type=sc_channel,
             slow_fading_eq=opts.slow_fading_eq,
+            sigma=opts.sigma,
             additive_noise_sigma=opts.additive_noise_sigma,
             multiply_noise_sigma=opts.multiply_noise_sigma,
+            only_additive_noise=opts.only_additive_noise,
+            noise_mean_alter_way=opts.noise_mean_alter_way,
+            noise_mean_flag=not opts.dynamic_noise_sigma,
+            dynamic_noise_sigma=opts.dynamic_noise_sigma,
+            corruption_probability_per_image=opts.corruption_probability,
+            must_contain=opts.must_contain,
+            must_not_contain=opts.must_not_contain,
             snr_range=opts.snr_range,
             normalize_value=opts.data_norm,
             use_labels=opts.cond,
+            dataset_keep_percentage=opts.dataset_keep_percentage,
         )
     elif opts.task == 'WIDAR':
         # dataset_kwargs for WIDAR dataset

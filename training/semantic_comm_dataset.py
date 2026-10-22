@@ -26,7 +26,15 @@ except ImportError:
     except ImportError:
         Attention_Encoder = None
 
-from training.dataset import renewRfProcessedDataset, parse_snr_range, find_npz_files
+from training.dataset import (
+    renewRfProcessedDataset,
+    parse_snr_range,
+    find_npz_files,
+    CorruptionCollateFn,
+    AlternativeCorruptionCollateFn,
+    NoiseMeanCollateFn,
+    sigma_mean,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -252,12 +260,25 @@ class RenewSemanticCommunicationDataset(Dataset):
         channel_type: Optional[str] = None,  # 'slow_fading' 또는 'slow_fading_eq'
         slow_fading_eq: bool = False,        # slow_fading_eq 활성화 플래그
         eq_epsilon: float = 1e-6,            # 채널 나눗셈 분모 안정화 상수
+        # RENEW 관련 옵션
+        must_contain: Optional[str] = None,
+        must_not_contain: Optional[str] = None,
+        sigma: float = 0.1,
         additive_noise_sigma: float = 0.0,
         multiply_noise_sigma: float = 1.0,
-        snr_range: Optional[Union[str, Tuple[float, float], List[float]]] = None,
+        only_additive_noise: bool = False,
+        noise_mean_flag: Optional[bool] = None,
+        dynamic_noise_sigma: Optional[bool] = None,
+        noise_mean_alter_way: bool = False,
+        corruption_probability_per_image: float = 1.0,
+        corruption_probability_per_pixel: float = 1.0,
+        image_corruption_seed: int = 112154,
+        image_noise_seed: int = 445481,
+        dataset_keep_percentage: float = 1.0,
+        flip_keep_dataset: bool = False,
         normalize_value: float = 1.0,
         use_labels: bool = False,
-        dataset_keep_percentage: float = 1.0,
+        snr_range: Optional[Union[str, Tuple[float, float], List[float]]] = None,
         device: Optional[Union[str, torch.device]] = None,
         **super_kwargs
     ):
@@ -275,36 +296,21 @@ class RenewSemanticCommunicationDataset(Dataset):
         self.power_normalize_latent = power_normalize_latent
         self.view_as_complex = view_as_complex
         self.normalize_value = float(normalize_value)
+        self.minimum_sigma = float(sigma)
+        self.must_contain = must_contain
+        self.must_not_contain = must_not_contain
         self.additive_noise_sigma = float(additive_noise_sigma)
         self.multiply_noise_sigma = float(multiply_noise_sigma)
+        self.only_additive_noise = bool(only_additive_noise)
+        self.noise_mean_alter_way = bool(noise_mean_alter_way)
+        self.corruption_probability_per_image = float(corruption_probability_per_image)
+        self.corruption_probability_per_pixel = float(corruption_probability_per_pixel)
+        self.image_corruption_seed = int(image_corruption_seed)
+        self.image_noise_seed = int(image_noise_seed)
+        self.flip_keep_dataset = bool(flip_keep_dataset)
         self.snr_range = parse_snr_range(snr_range)
 
-        # 1. RENEW 파일 목록 초기화
-        if renew_dataset is not None:
-            self._renew_files = list(renew_dataset._fname)
-            self._base_renew = renew_dataset
-        elif renew_path is not None:
-            if isinstance(renew_path, list):
-                self._renew_files = []
-                for p in renew_path:
-                    self._renew_files += find_npz_files(p)
-            elif os.path.isdir(renew_path):
-                self._renew_files = find_npz_files(renew_path)
-            else:
-                raise IOError(f"Path must point to a directory or list: {renew_path}")
-            self._base_renew = None
-        else:
-            raise ValueError("Either 'renew_dataset' or 'renew_path' must be provided.")
-
-        self._renew_files = sorted(list(self._renew_files))
-        if len(self._renew_files) == 0:
-            raise ValueError("No RENEW .npz files found!")
-
-        # 첫 번째 파일 검사하여 기본 차원(Frame, Antenna, Subcarrier) 확인
-        sample_csi, sample_noise = self._load_raw_file(self._renew_files[0])
-        self.n_frames, self.n_antennas, self.raw_subcarriers = sample_csi.shape
-
-        # 2. ADJSCC 설정 로드 및 채널 모드 결정
+        # 1. ADJSCC 설정 로드 및 채널 모드 결정
         self._config_file_path = Path(adjscc_config) if isinstance(adjscc_config, (str, Path)) else None
         self.adjscc_config = _load_adjscc_config(adjscc_config)
         self.tcn = int(self.adjscc_config.get('transmit_channel_num', 16))
@@ -322,6 +328,62 @@ class RenewSemanticCommunicationDataset(Dataset):
             self.channel_type = 'slow_fading'
 
         self.eq_epsilon = float(eq_epsilon)
+
+        # dynamic_noise_sigma 및 noise_mean_flag 처리
+        # slow_fading_eq는 차원별 다양한 노이즈(varying dimensional noise)를 사용하므로
+        # 명시적으로 지정되지 않은 경우 기본적으로 dynamic_noise_sigma=True (noise_mean_flag=False)로 설정
+        if dynamic_noise_sigma is not None:
+            self.noise_mean_flag = not dynamic_noise_sigma
+        elif noise_mean_flag is not None:
+            self.noise_mean_flag = bool(noise_mean_flag)
+        elif self.channel_type == 'slow_fading_eq':
+            self.noise_mean_flag = False
+        else:
+            self.noise_mean_flag = True
+        self.dynamic_noise_sigma = not self.noise_mean_flag
+
+        # 2. RENEW 기본 데이터셋 및 파일 초기화 (기존 RENEW 클래스/함수 직접 활용)
+        if renew_dataset is not None:
+            self.base_renew = renew_dataset
+            self._renew_files = list(renew_dataset._fname)
+        elif self.path is not None:
+            self.base_renew = renewRfProcessedDataset(
+                path=self.path,
+                must_contain=self.must_contain,
+                must_not_contain=self.must_not_contain,
+                sigma=self.minimum_sigma,
+                additive_noise_sigma=self.additive_noise_sigma,
+                multiply_noise_sigma=self.multiply_noise_sigma,
+                only_additive_noise=self.only_additive_noise,
+                noise_mean_flag=self.noise_mean_flag,
+                noise_mean_alter_way=self.noise_mean_alter_way,
+                corruption_probability_per_image=self.corruption_probability_per_image,
+                corruption_probability_per_pixel=self.corruption_probability_per_pixel,
+                image_corruption_seed=self.image_corruption_seed,
+                image_noise_seed=self.image_noise_seed,
+                dataset_keep_percentage=self.dataset_keep_percentage,
+                flip_keep_dataset=self.flip_keep_dataset,
+                normalize_value=self.normalize_value,
+                use_labels=self.use_labels,
+                snr_range=self.snr_range,
+                view_as_complex=True,
+                **(renew_kwargs or {})
+            )
+            self._renew_files = list(self.base_renew._fname)
+        else:
+            raise ValueError("Either 'renew_dataset' or 'renew_path' (or 'path') must be provided.")
+
+        self._renew_files = sorted(list(self._renew_files))
+        if len(self._renew_files) == 0:
+            raise ValueError("No RENEW .npz files found matching the criteria!")
+
+        # 기존 RENEW collate functions 직접 재사용
+        self.corruption_collate_fn = self.base_renew.corruption_collate_fn
+        self.noise_mean_collate_fn = self.base_renew.noise_mean_collate_fn
+
+        # 첫 번째 파일 검사하여 기본 차원(Frame, Antenna, Subcarrier) 확인
+        sample_csi, sample_noise = self.base_renew._load_and_normalize(self._renew_files[0])
+        self.n_frames, self.n_antennas, self.raw_subcarriers = sample_csi.shape[:3]
 
         if device is not None:
             self.device = torch.device(device)
@@ -456,16 +518,8 @@ class RenewSemanticCommunicationDataset(Dataset):
 
 
     def _load_raw_file(self, f_path: str) -> Tuple[np.ndarray, np.ndarray]:
-        """npz 파일에서 csi와 noise 배열을 로드하고 정규화합니다."""
-        npz_data = np.load(f_path)
-        csi_data = np.array(npz_data['csi'])
-        noise_data = np.array(npz_data['noise'])
-
-        if self.normalize_value != 1.0:
-            csi_data = csi_data / self.normalize_value
-            noise_data = noise_data / self.normalize_value
-
-        return csi_data, noise_data
+        """npz 파일에서 csi와 noise 배열을 로드하고 정규화합니다 (기존 RENEW 함수 위임)."""
+        return self.base_renew._load_and_normalize(f_path)
 
     def _extract_48_subcarriers(self, csi_data: np.ndarray) -> np.ndarray:
         """
@@ -595,6 +649,54 @@ class RenewSemanticCommunicationDataset(Dataset):
 
         return z_matched
 
+    def _extract_rx_noise(
+        self,
+        corr_res: Dict[str, Any],
+        h_clean: np.ndarray,
+        noise_slice: np.ndarray,
+        noise_seed: int,
+    ) -> np.ndarray:
+        """
+        RENEW corruption_collate_fn의 결과로부터 무선 채널 전송에 적용할 rx_noise를 직접 추출 및 재사용합니다.
+        불필요한 2중 가우시안 난수 생성을 제거하고, RENEW 노이즈 모듈의 결과를 채널 전송 노이즈로 1회만 단일 적용합니다.
+        """
+        eff_noise_sigma = corr_res['sigma']
+        corr_image = corr_res['image']
+        corr_noise = corr_image - h_clean
+
+        # only_additive_noise인 경우 corr_noise의 표준편차가 이미 eff_noise_sigma와 정확히 일치
+        if self.only_additive_noise:
+            return corr_noise.astype(np.complex64)
+
+        # only_additive_noise가 아닌 경우 corruption_collate_fn은 sqrt(eff_sigma^2 - natural_sigma^2) 만큼만 가산하므로
+        # 단위 복소 가우시안 노이즈를 복원한 뒤 eff_noise_sigma를 곱하여 전체 채널 노이즈를 산출
+        sigma_added_sq = np.maximum(0.0, eff_noise_sigma ** 2 - noise_slice ** 2)
+        sigma_added = np.sqrt(sigma_added_sq)
+
+        valid_mask = (sigma_added > 1e-12)
+        if np.all(valid_mask):
+            unit_noise = corr_noise / sigma_added
+            return (unit_noise * eff_noise_sigma).astype(np.complex64)
+        elif np.any(valid_mask):
+            unit_noise = np.zeros_like(corr_noise)
+            unit_noise[valid_mask] = corr_noise[valid_mask] / sigma_added[valid_mask]
+            # 미가산 영역(자연 노이즈만 존재하는 영역)은 동일 시드 generator로 보충
+            torch_gen = torch.Generator().manual_seed(int(noise_seed + self.image_noise_seed + 4454))
+            nr = torch.randn(h_clean.shape, generator=torch_gen).numpy()
+            ni = torch.randn(h_clean.shape, generator=torch_gen).numpy()
+            backup_unit = (nr + 1j * ni) / np.sqrt(2.0)
+            unit_noise[~valid_mask] = backup_unit[~valid_mask]
+            return (unit_noise * eff_noise_sigma).astype(np.complex64)
+        else:
+            # corruption이 가산되지 않은 경우 (corruption_label=0 또는 additive_noise=0)
+            if np.max(eff_noise_sigma) < 1e-12:
+                return np.zeros_like(h_clean, dtype=np.complex64)
+            torch_gen = torch.Generator().manual_seed(int(noise_seed + self.image_noise_seed + 4454))
+            nr = torch.randn(h_clean.shape, generator=torch_gen).numpy()
+            ni = torch.randn(h_clean.shape, generator=torch_gen).numpy()
+            unit_noise = (nr + 1j * ni) / np.sqrt(2.0)
+            return (unit_noise * eff_noise_sigma).astype(np.complex64)
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         pair = self.pairing_table[idx]
         file_idx = pair['file_idx']
@@ -608,9 +710,9 @@ class RenewSemanticCommunicationDataset(Dataset):
         # -------------------------------------------------------------
         # 1) RF 채널 로드, 1개 안테나 및 T step 선택, 48개 서브캐리어 추출
         # -------------------------------------------------------------
-        raw_csi, raw_noise = self._load_raw_file(item_fname)
+        raw_csi, raw_noise = self.base_renew._load_and_normalize(item_fname)
         # raw_csi shape: (n_frames, n_antennas, n_subcarriers)
-        # raw_noise shape: (n_frames, n_antennas)
+        # raw_noise shape: (n_frames, n_antennas, 1)
 
         # 시간 청크 범위 슬라이싱 (T 스텝)
         f_start = time_chunk_idx * self.T
@@ -619,40 +721,36 @@ class RenewSemanticCommunicationDataset(Dataset):
         # 파일 내 프레임 수가 T보다 적거나 슬라이싱 범위가 부족한 경우 처리
         if f_end <= raw_csi.shape[0]:
             h_slice = raw_csi[f_start:f_end, antenna_idx, :]
-            n_slice = raw_noise[f_start:f_end, antenna_idx]
+            n_slice = raw_noise[f_start:f_end, antenna_idx, :]
         else:
             # 부족한 경우 끝부분 슬라이스 후 시간 패딩
             h_sub = raw_csi[:, antenna_idx, :]
-            n_sub = raw_noise[:, antenna_idx]
+            n_sub = raw_noise[:, antenna_idx, :]
             pad_len = self.T - h_sub.shape[0]
             h_slice = np.pad(h_sub, ((0, pad_len), (0, 0)), mode='edge')
-            n_slice = np.pad(n_sub, ((0, pad_len),), mode='edge')
+            n_slice = np.pad(n_sub, ((0, pad_len), (0, 0)), mode='edge')
 
         # 52개 중 파일럿 제외하여 48개 서브캐리어 추출 -> shape: (T, 48) complex
         h_clean_48 = self._extract_48_subcarriers(h_slice)
-        # n_slice shape: (T,)
+        # n_slice: (T, 1) -> (T, 48)
+        noise_slice_48 = np.broadcast_to(n_slice, (self.T, 48)).copy()
 
         # -------------------------------------------------------------
-        # 2) 선택된 RF 채널과 natural noise를 이용해 SNR 계산
+        # 2) RENEW corruption_collate_fn을 통한 노이즈 계산 및 SNR 산출
         # -------------------------------------------------------------
-        signal_power = float(np.mean(np.abs(h_clean_48) ** 2))
-        natural_noise_power = float(np.mean(n_slice ** 2))
+        corr_item = {
+            'image': h_clean_48.copy(),
+            'sigma': noise_slice_48.copy(),
+            'idx': noise_seed,
+        }
+        corr_res = self.corruption_collate_fn([corr_item])[0]
+        eff_noise_sigma = corr_res['sigma']  # (T, 48)
+        corruption_label = corr_res.get('corruption_label', 0)
 
-        # RENEW corruption 매개변수 적용 (snr_range 또는 additive/multiply noise)
-        np_gen = np.random.default_rng(noise_seed)
-        if self.snr_range is not None:
-            target_snr_db = float(np_gen.uniform(self.snr_range[0], self.snr_range[1]))
-            ratio_snr = 10.0 ** (target_snr_db / 10.0)
-            target_sigma_rms = np.sqrt(signal_power / max(ratio_snr, 1e-12))
-            eff_noise_sigma = target_sigma_rms
-            snr_db = target_snr_db
-        else:
-            eff_noise_sigma = n_slice * self.multiply_noise_sigma + self.additive_noise_sigma
-            eff_noise_power = float(np.mean(eff_noise_sigma ** 2))
-            if eff_noise_power > 1e-12 and signal_power > 1e-12:
-                snr_db = float(10.0 * np.log10(signal_power / eff_noise_power))
-            else:
-                snr_db = 20.0
+        # ADJSCC 인코더 입력용 SNR 계산
+        sig_pow = float(np.mean(np.abs(h_clean_48) ** 2))
+        noise_pow = float(np.mean(eff_noise_sigma ** 2))
+        snr_db = float(10.0 * np.log10(sig_pow / max(noise_pow, 1e-12)))
 
         # -------------------------------------------------------------
         # 3) 고정 매핑된 이미지 선택 및 ADJSCC Encoder를 통한 latent 생성
@@ -697,20 +795,10 @@ class RenewSemanticCommunicationDataset(Dataset):
         z_matched = self._match_latent_shape(z_complex_1d, (self.T, 48))
 
         # -------------------------------------------------------------
-        # 5) 무선 채널 전송 및 노이즈 추가 (slow_fading vs slow_fading_eq)
+        # 5) 무선 채널 전송 및 RENEW NoiseMeanCollateFn 적용
         # -------------------------------------------------------------
-        # noise_seed로 일관된 복소 가우시안 노이즈 생성
-        noise_real = np_gen.standard_normal((self.T, 48))
-        noise_imag = np_gen.standard_normal((self.T, 48))
-        complex_norm_noise = (noise_real + 1j * noise_imag) / np.sqrt(2.0)
-
-        # eff_noise_sigma 브로드캐스팅 (T, 1) -> (T, 48)
-        if isinstance(eff_noise_sigma, np.ndarray):
-            eff_sigma_mat = eff_noise_sigma.reshape(-1, 1)
-        else:
-            eff_sigma_mat = float(eff_noise_sigma)
-
-        rx_noise = complex_norm_noise * eff_sigma_mat
+        # corruption_collate_fn에서 기생성된 노이즈를 재사용하여 중복 난수 생성 방지
+        rx_noise = self._extract_rx_noise(corr_res, h_clean_48, noise_slice_48, noise_seed)
 
         if self.channel_type == 'slow_fading_eq':
             # Zero-Forcing 채널 등화 (ADJSCC slow_fading_eq 모사):
@@ -718,24 +806,29 @@ class RenewSemanticCommunicationDataset(Dataset):
             # Y_eq = (H * Z + N) / H = Z + N / H
             h_mag = np.abs(h_clean_48)
             eps = self.eq_epsilon
-            # 분모가 0에 근접할 때의 수치적 폭주를 방지하기 위해 위상을 보존하며 안전 클램핑
             h_safe = np.where(h_mag < eps, eps * np.exp(1j * np.angle(h_clean_48)), h_clean_48)
 
             eq_noise = rx_noise / h_safe
             rx_signal = z_matched + eq_noise
-
-            # H의 크기가 시간/서브캐리어 차원마다 다르므로, H로 나누어진 노이즈의 표준편차도 차원에 따라 다양해짐
-            if isinstance(eff_sigma_mat, np.ndarray):
-                base_sigma = np.broadcast_to(eff_sigma_mat, (self.T, 48)).astype(np.float32)
-            else:
-                base_sigma = np.full((self.T, 48), eff_sigma_mat, dtype=np.float32)
-
-            sigma_map = (base_sigma / np.maximum(h_mag, eps)).astype(np.float32)
+            raw_sigma = (eff_noise_sigma / np.maximum(h_mag, eps)).astype(np.float32)
         else:
             # 기본 slow_fading: Y = H * Z + N
             rx_noiseless = h_clean_48 * z_matched  # (T, 48) complex
             rx_signal = rx_noiseless + rx_noise
-            sigma_map = None
+            raw_sigma = eff_noise_sigma.astype(np.float32)
+
+        # RENEW의 NoiseMeanCollateFn 적용 (noise_mean_flag 및 noise_mean_alter_way 반영)
+        mean_res = self.noise_mean_collate_fn([{'sigma': raw_sigma}])[0]['sigma']
+
+        if self.noise_mean_flag:
+            # scalar sigma (dynamic_noise_sigma=False)
+            out_sigma = np.float32(mean_res)
+        else:
+            # dynamic_noise_sigma=True: 차원별 노이즈 세기 유지 [2, T, 48] 또는 [T, 48]
+            if self.view_as_complex:
+                out_sigma = mean_res.astype(np.float32)
+            else:
+                out_sigma = np.stack([mean_res, mean_res], axis=0).astype(np.float32)
 
         # -------------------------------------------------------------
         # 6) 출력 형태: [img/real, T, C] = [2, T, 48]
@@ -745,16 +838,10 @@ class RenewSemanticCommunicationDataset(Dataset):
             out_image = rx_signal.astype(np.complex64)
             out_clean_channel = h_clean_48.astype(np.complex64)
             out_latent = z_matched.astype(np.complex64)
-            out_sigma = sigma_map if sigma_map is not None else np.float32(np.mean(eff_noise_sigma))
         else:
-            # [2, T, 48]
             out_image = np.stack([rx_signal.real, rx_signal.imag], axis=0).astype(np.float32)
             out_clean_channel = np.stack([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
             out_latent = np.stack([z_matched.real, z_matched.imag], axis=0).astype(np.float32)
-            if sigma_map is not None:
-                out_sigma = np.stack([sigma_map, sigma_map], axis=0).astype(np.float32)
-            else:
-                out_sigma = np.float32(np.mean(eff_noise_sigma))
 
         if self.use_labels:
             if self.channel_type == 'slow_fading_eq':
@@ -778,9 +865,11 @@ class RenewSemanticCommunicationDataset(Dataset):
             'time_chunk_idx': time_chunk_idx,
             'filename': item_fname,
             'idx': idx,
+            'corruption_label': corruption_label,
             'axis_name': ['complex', 'time', 'channel'] if not self.view_as_complex else ['time', 'channel'],
             'additive_noise_sigma': np.float32(self.additive_noise_sigma),
             'channel_type': self.channel_type,
+            'dynamic_noise_sigma': self.dynamic_noise_sigma,
         }
 
 
