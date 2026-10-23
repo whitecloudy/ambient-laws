@@ -25,10 +25,9 @@ from torch_utils import save_utils
 import ambient_utils
 import wandb
 import tempfile
-from training.dataset import renewRfProcessedDataset, WiDARDataset, XRF55Dataset
+from training.semantic_comm_dataset import RenewChannelDataset, SCBatchSynthesizer
 import torch.multiprocessing as mp
 import io
-from validation.XRF55_validation import XRF55Validator
 
 
 def infiniteloop(dataloader):
@@ -264,71 +263,61 @@ def training_loop(
 
     # Load dataset.
     dist.print0('Loading dataset...')
-    if task == 'RENEW':
-        dataset_obj = renewRfProcessedDataset(**dataset_kwargs)
-    elif task == 'RENEW_SC':
-        from training.semantic_comm_dataset import RenewSemanticCommunicationDataset
-        dataset_obj = RenewSemanticCommunicationDataset(**dataset_kwargs)
-    elif task == 'WIDAR':
-        dataset_obj = WiDARDataset(**dataset_kwargs)
-    elif task == 'XRF55':
-        dataset_obj = XRF55Dataset(**dataset_kwargs)
-    else:
-        raise ValueError(f'Unsupported task: {task}')
+    dataset_obj = RenewChannelDataset(**dataset_kwargs)
+
+    dist.print0('Initializing Semantic Communication Batch Synthesizer on GPU...')
+    sc_synthesizer = SCBatchSynthesizer(
+        adjscc_config=dataset_kwargs.adjscc_config,
+        adjscc_model_path=dataset_kwargs.get('adjscc_model_path', None),
+        image_dataset=dataset_kwargs.get('image_dataset', None),
+        device=device,
+        T=dataset_obj.T,
+        channel_type=dataset_kwargs.get('channel_type', 'slow_fading'),
+        slow_fading_eq=dataset_kwargs.get('slow_fading_eq', False),
+        matching_mode=dataset_kwargs.get('matching_mode', 'interpolate'),
+        power_normalize_latent=dataset_kwargs.get('power_normalize_latent', True),
+        view_as_complex=dataset_kwargs.get('view_as_complex', False),
+        use_labels=dataset_kwargs.get('use_labels', False),
+        eq_epsilon=dataset_kwargs.get('eq_epsilon', 1e-6),
+        snr_range=dataset_kwargs.get('snr_range', None),
+        additive_noise_sigma=dataset_kwargs.get('additive_noise_sigma', 0.0),
+        multiply_noise_sigma=dataset_kwargs.get('multiply_noise_sigma', 1.0),
+        only_additive_noise=dataset_kwargs.get('only_additive_noise', False),
+        corruption_probability_per_image=dataset_kwargs.get('corruption_probability_per_image', 1.0),
+        noise_mean_flag=dataset_kwargs.get('noise_mean_flag', True),
+        noise_mean_alter_way=dataset_kwargs.get('noise_mean_alter_way', False),
+        dynamic_noise_sigma=dataset_kwargs.get('dynamic_noise_sigma', False),
+        image_corruption_seed=dataset_kwargs.get('image_corruption_seed', 112154),
+        image_noise_seed=dataset_kwargs.get('image_noise_seed', 445481),
+        seed=seed if seed is not None else 42,
+    )
+
     validation_on_off = validation_kwargs.validation_on_off
     if validation_on_off:
         validation_interval_tick = validation_kwargs.validation_interval
-        
-        if task != 'XRF55':
-            validation_dataset_kwargs = dataset_kwargs.copy()
-            if validation_kwargs.validation_data is not None:
-                if task == 'RENEW_SC':
-                    validation_dataset_kwargs['renew_path'] = validation_kwargs.validation_data
-                else:
-                    validation_dataset_kwargs['path'] = validation_kwargs.validation_data
-                validation_dataset_kwargs['dataset_keep_percentage'] = 1.0
-            else:
-                if task == 'RENEW_SC':
-                    validation_dataset_kwargs['seed'] = (seed + 9999) if seed is not None else 9999
-                else:
-                    validation_dataset_kwargs['flip_keep_dataset'] = True
-            
-            validation_dataset_obj = dataset_obj.__class__(**validation_dataset_kwargs)
-            validation_dataset_sampler = misc.FiniteSampler(dataset=validation_dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=False, seed=seed)
-            validation_dataset_iterator = torch.utils.data.DataLoader(dataset=validation_dataset_obj, sampler=validation_dataset_sampler, batch_size=validation_kwargs.validation_batch_size, **data_loader_kwargs)
+        validation_dataset_kwargs = dataset_kwargs.copy()
+        if validation_kwargs.validation_data is not None:
+            validation_dataset_kwargs['renew_path'] = validation_kwargs.validation_data
+            validation_dataset_kwargs['dataset_keep_percentage'] = 1.0
         else:
-            validation_dataset_iterator = None
-            
-            sampler_json_path = './misc/validation/sampler_kwargs.json'
-            if os.path.exists(sampler_json_path):
-                with open(sampler_json_path, 'r') as f:
-                    sampler_kwargs = json.load(f)
-            else:
-                sampler_kwargs = {
-                    "num_steps": 18,
-                    "sigma_min": 0.002,
-                    "sigma_max": 80.0,
-                    "rho": 7.0,
-                    "S_churn": 0.0,
-                    "S_min": 0.0,
-                    "S_noise": 1.0
-                }
-            
-            xrf55_validator = XRF55Validator(device=device, **sampler_kwargs)
+            validation_dataset_kwargs['seed'] = (seed + 9999) if seed is not None else 9999
         
+        validation_dataset_obj = RenewChannelDataset(**validation_dataset_kwargs)
+        validation_dataset_sampler = misc.FiniteSampler(dataset=validation_dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=False, seed=seed)
+        validation_dataset_iterator = torch.utils.data.DataLoader(dataset=validation_dataset_obj, sampler=validation_dataset_sampler, batch_size=validation_kwargs.validation_batch_size, **data_loader_kwargs)
     else:
         validation_dataset_iterator = None
         validation_interval_tick = -1
 
-    ## using This sampler is way way way~~~ too slow for every epoch renewal
-    # dataset_sampler = torch.utils.data.distributed.DistributedSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), shuffle=True, seed=seed)
     dist.print0('Dataset Loading completed...')
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dist.print0('Sampler Loading completed...')
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
-    dataset_item = next(dataset_iterator)
+    raw_dataset_item = next(dataset_iterator)
+    dataset_item = sc_synthesizer(raw_dataset_item)
     dataset_shape = dataset_item["image"].shape
     dist.print0(f'Dataset image shape: {dataset_shape}')
+
     # Initialize temporary directory for training state dumps
     if dist.get_rank() == 0 and not debug_test and temp_save:
         run_dir_name = os.path.basename(os.path.normpath(run_dir))
@@ -341,13 +330,7 @@ def training_loop(
     
     # Construct network.
     dist.print0('Constructing network...')
-    # interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
-    if task in ['RENEW', 'RENEW_SC']:  
-        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_resolution=dataset_shape[-2:])
-    elif task in ['WIDAR', 'XRF55']:
-        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_type='classes')
-    else:
-        interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim)
+    interface_kwargs = dict(img_resolution=dataset_shape[-2:], img_channels=dataset_shape[-3], label_dim=dataset_obj.label_dim, label_resolution=dataset_shape[-2:])
 
     # network_kwargs에 이미 label_dim이나 label_type이 명시되어 있으면(예: EDM scheduler 사용 시) interface_kwargs의 덮어쓰기 방지
     if 'label_dim' in network_kwargs:
@@ -447,10 +430,11 @@ def training_loop(
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                dataset_item = next(dataset_iterator)
-                images = dataset_item["image"].to(device)                
-                labels = dataset_item["label"].to(device)
-                current_sigma = dataset_item["sigma"].to(device)
+                raw_dataset_item = next(dataset_iterator)
+                dataset_item = sc_synthesizer(raw_dataset_item)
+                images = dataset_item["image"]                
+                labels = dataset_item["label"]
+                current_sigma = dataset_item["sigma"]
                 # additive_noise_sigma = dataset_item['additive_noise_sigma'].to(device)
 
                 if "original_shape" in dataset_item:
@@ -552,47 +536,14 @@ def training_loop(
         if validation_on_off and (validation_interval_tick > 0) and ((cur_tick) % validation_interval_tick == 0) and cur_tick!=0:
             ddp.eval()
             with torch.no_grad():
-                if task == 'XRF55':
-                    dist.print0("Running XRF55 validation (IS/FID)...")
-                    # we make 50,000 samples to evalutate IS and FID
-                    # divide the work across the distributed processes
-                    num_samples = 50000
-                    if debug_test:
-                        num_samples = dist.get_world_size()*16
-                    num_samples = int((num_samples // dist.get_world_size())) * dist.get_world_size()
-                    
-                    (is_mean, is_std), fid_val = xrf55_validator.validate(
-                        net=ema, 
-                        num_samples=num_samples, 
-                        batch_size=validation_kwargs.validation_batch_size, 
-                        real_loader=None,
-                        image_shape=dataset_shape[1:],
-                        data_norm=dataset_kwargs.normalize_value
-                    )
-                    
-                    training_stats.report('Validation/IS_mean', is_mean)
-                    training_stats.report('Validation/IS_std', is_std)
-                    if fid_val is not None:
-                        training_stats.report('Validation/FID', fid_val)
-                        dist.print0(f"Validation IS: {is_mean:.4f} ± {is_std:.4f}, FID: {fid_val:.4f}")
-                    else:
-                        dist.print0(f"Validation IS: {is_mean:.4f} ± {is_std:.4f}")
-                        
-                    if wandb_onoff and wandb.run is not None:
-                        wandb_data = {
-                            'Validation/IS_mean': is_mean,
-                            'Validation/IS_std': is_std
-                        }
-                        if fid_val is not None:
-                            wandb_data['Validation/FID'] = fid_val
-                        wandb.log(wandb_data, step=int(cur_nimg/1e3))
-                elif validation_dataset_iterator is not None:
+                if validation_dataset_iterator is not None:
                     with tqdm.tqdm(total=validation_kwargs.validation_iterations * len(validation_dataset_iterator), desc="Validation", disable=not dist.get_rank() == 0) as pbar:
                         for val_iter in range(validation_kwargs.validation_iterations):
-                            for val_dataset_item in validation_dataset_iterator:
-                                val_images = val_dataset_item["image"].to(device)
-                                val_labels = val_dataset_item["label"].to(device)
-                                val_current_sigma = val_dataset_item["sigma"].to(device)
+                            for raw_val_item in validation_dataset_iterator:
+                                val_dataset_item = sc_synthesizer(raw_val_item)
+                                val_images = val_dataset_item["image"]
+                                val_labels = val_dataset_item["label"]
+                                val_current_sigma = val_dataset_item["sigma"]
 
                                 if "original_shape" in val_dataset_item:
                                     val_original_shape = val_dataset_item["original_shape"].to(device)

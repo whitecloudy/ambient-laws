@@ -5,8 +5,7 @@
 # You should have received a copy of the license along with this
 # work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-"""Train diffusion-based generative model using the techniques described in the
-paper "Elucidating the Design Space of Diffusion-Based Generative Models"."""
+"""Train diffusion-based generative model for Semantic Communication (SC)."""
 
 import os
 import re
@@ -15,9 +14,9 @@ import click
 import torch
 import dnnlib
 from torch_utils import distributed as dist
-from training import training_loop
-from training.dataset import renewRfProcessedDataset, pad_collate_fn, rf_augmentation_collate_fn, WiDARDataset, XRF55Dataset
-from training.semantic_comm_dataset import RenewSemanticCommunicationDataset
+from training import training_loop_SC as training_loop
+from training.dataset import rf_augmentation_collate_fn
+from training.semantic_comm_dataset import RenewChannelDataset, RenewSemanticCommunicationDataset
 import ambient_utils
 import warnings
 import wandb
@@ -48,11 +47,11 @@ def parse_int_list(s):
 @click.command()
 
 # Main options.
-@click.option('--task',          help='Current task',         metavar='STR',                        type=str, required=True, show_default=True, default='RENEW')
+@click.option('--task',          help='Current task',         metavar='STR',                        type=str, default='RENEW_SC', show_default=True)
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--arch',          help='Network architecture', metavar='ddpmpp|rf_dit|rf_dit_large|rf_dit_small|rf_dit_real|rf_dit_real_large|rf_dit_real_same_parameter|rf_dit_real_deep|rf_dit_real_small|ncsnpp|adm',          type=str, default='ddpmpp', show_default=True)
+@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ddpmpp_256|ddpmpp_192|ddpmpp_64|rf_dit|rf_dit_large|rf_dit_small|rf_dit_real|rf_dit_real_large|rf_dit_real_deep|rf_dit_real_small',          type=str, default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler|edm_with_latent_z',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler', 'edm_with_latent_z']), default='edm', show_default=True)
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
@@ -102,12 +101,7 @@ def parse_int_list(s):
 
 # RF dataset related
 @click.option('--view_as_complex', help='Whether to view the data as complex numbers.', type=bool, default=False, show_default=True)
-@click.option('--complex_merge_axis', help='Axis to merge real and imaginary parts when view_as_complex is False. Set to "None" to not merge.', type=str, default='0', show_default=True)
-@click.option('--transpose', help='Transpose the data axes according to the given order. Provide a list of two integers representing the new order of the first two axes (frame_resolution and ant_resolution). Set to None to not transpose.', type=str, default="0,1", show_default=True)
-@click.option('--frame_res', help='Frame resolution of the RF data.', type=int, default=14, show_default=True)
-@click.option('--ant_res', help='Antenna resolution of the RF data.', type=int, default=8, show_default=True)
 @click.option('--data_norm', help='Data normalization value for the RF data.', type=float, default=1.0, show_default=True)
-@click.option('--sigma_norm', help='Normalize data with sigma',                            is_flag=True)
 @click.option('--flip_aug_ratio', help='Ratio of flip augmentation.', type=float, default=0.0, show_default=True)
 @click.option('--phase_shift_aug_ratio', help='Ratio of phase shift augmentation.', type=float, default=0.0, show_default=True)
 
@@ -174,24 +168,19 @@ def parse_int_list(s):
 @click.option('--pos_embed_type', help='Positional embedding mode for RF_DiT (learnable_2d, sincos_2d, hybrid_1d_t_sincos_c_learnable)', type=click.Choice(['learnable_2d', 'sincos_2d', 'hybrid_1d_t_sincos_c_learnable']), default=None)
 
 def main(**kwargs):
-    """Train diffusion-based generative model using the techniques described in the
-    paper "Elucidating the Design Space of Diffusion-Based Generative Models".
+    """Train diffusion-based generative model for Semantic Communication (SC).
 
     Examples:
 
     \b
-    # Train DDPM++ model for class-conditional CIFAR-10 using 8 GPUs
-    torchrun --standalone --nproc_per_node=8 train.py --outdir=training-runs \\
-        --data=datasets/cifar10-32x32.zip --cond=1 --arch=ddpmpp
+    # Train DDPM++ model for Semantic Communication (RENEW_SC)
+    torchrun --standalone --nproc_per_node=1 train_SC.py --outdir=training-runs \\
+        --data=data/RENEW/splited/ArgosCSI-96x8-2016-11-04-05-37-37_2.4GHz_track_left_to_right_NLOS \\
+        --adjscc_config=misc/ADJSCC/config_example.json --arch=ddpmpp
     """
     opts = dnnlib.EasyDict(kwargs)
     torch.multiprocessing.set_start_method('spawn')
 
-    complex_merge_axis = opts.complex_merge_axis
-    if complex_merge_axis is None or str(complex_merge_axis).lower() == 'none':
-        complex_merge_axis = None
-    else:
-        complex_merge_axis = int(complex_merge_axis)
     dist.init()
     
     # Initialize config dict.
@@ -214,7 +203,6 @@ def main(**kwargs):
 
     wandb_id = None
     if dist.get_rank() == 0 and opts.wandb:
-        # If there is resume_options is exist, and we are resuming from a certain checkpoint, then we will load and search for wandb ID. And if it exists, we will resume the wandb run only.
         if resume_options is not None:
             if 'wandb_id' in resume_options:
                 wandb_id = resume_options['wandb_id']
@@ -229,115 +217,66 @@ def main(**kwargs):
                                 id=wandb_id, resume="allow" if wandb_id is not None else 'never')
         wandb_id = wandb_run.id
         dist.print0(f"Wandb ID: {wandb_id}")
-        
 
-    if opts.task == 'RENEW':
-        # dataset_kwargs for RENEW dataset
-        c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
-                                        corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                        only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=complex_merge_axis,
-                                        resolution=(opts.frame_res, opts.ant_res), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
-                                        normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                        multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, 
-                                    noise_mean_alter_way=opts.noise_mean_alter_way,
-                                    noise_mean_flag=not opts.dynamic_noise_sigma,
-                                    snr_range=opts.snr_range)
-    elif opts.task == 'RENEW_SC':
-        sc_channel = 'slow_fading_eq' if opts.slow_fading_eq else opts.sc_channel_type
-        c.dataset_kwargs = dnnlib.EasyDict(
-            path=opts.data,
-            renew_path=opts.data,
-            adjscc_config=opts.adjscc_config,
-            adjscc_model_path=opts.adjscc_model_path,
-            image_dataset=opts.image_data,
-            T=opts.sc_t,
-            dataset_len=opts.sc_dataset_len,
-            seed=opts.seed if opts.seed is not None else 42,
-            matching_mode=opts.matching_mode,
-            power_normalize_latent=True,
-            view_as_complex=opts.view_as_complex,
-            channel_type=sc_channel,
-            slow_fading_eq=opts.slow_fading_eq,
-            sigma=opts.sigma,
-            additive_noise_sigma=opts.additive_noise_sigma,
-            multiply_noise_sigma=opts.multiply_noise_sigma,
-            only_additive_noise=opts.only_additive_noise,
-            noise_mean_alter_way=opts.noise_mean_alter_way,
-            noise_mean_flag=not opts.dynamic_noise_sigma,
-            dynamic_noise_sigma=opts.dynamic_noise_sigma,
-            corruption_probability_per_image=opts.corruption_probability,
-            must_contain=opts.must_contain,
-            must_not_contain=opts.must_not_contain,
-            snr_range=opts.snr_range,
-            normalize_value=opts.data_norm,
-            use_labels=opts.cond,
-            dataset_keep_percentage=opts.dataset_keep_percentage,
-        )
-    elif opts.task == 'WIDAR':
-        # dataset_kwargs for WIDAR dataset
-        # TMP: 512 to 256 time scale for now to reduce the computational cost.
-        c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
-                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=complex_merge_axis,
-                                    transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
-                                    normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm,
-                                    snr_range=opts.snr_range)
-        # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
-        #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-        #                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
-        #                                    resolution=(3, 512, 30), transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
-        #                                    normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-        #                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise)
-    elif opts.task == 'XRF55':
-                c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
-                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
-                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=complex_merge_axis,
-                                    transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
-                                    normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
-                                    multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm,
-                                    snr_range=opts.snr_range)
-
-
-    else:
-        raise ValueError(f'Unknown task: {opts.task}')
+    # Dataset kwargs for Semantic Communication (RENEW_SC)
+    sc_channel = 'slow_fading_eq' if opts.slow_fading_eq else opts.sc_channel_type
+    c.dataset_kwargs = dnnlib.EasyDict(
+        path=opts.data,
+        renew_path=opts.data,
+        adjscc_config=opts.adjscc_config,
+        adjscc_model_path=opts.adjscc_model_path,
+        image_dataset=opts.image_data,
+        T=opts.sc_t,
+        dataset_len=opts.sc_dataset_len,
+        seed=opts.seed if opts.seed is not None else 42,
+        matching_mode=opts.matching_mode,
+        power_normalize_latent=True,
+        view_as_complex=opts.view_as_complex,
+        channel_type=sc_channel,
+        slow_fading_eq=opts.slow_fading_eq,
+        sigma=opts.sigma,
+        additive_noise_sigma=opts.additive_noise_sigma,
+        multiply_noise_sigma=opts.multiply_noise_sigma,
+        only_additive_noise=opts.only_additive_noise,
+        noise_mean_alter_way=opts.noise_mean_alter_way,
+        noise_mean_flag=not opts.dynamic_noise_sigma,
+        dynamic_noise_sigma=opts.dynamic_noise_sigma,
+        corruption_probability_per_image=opts.corruption_probability,
+        must_contain=opts.must_contain,
+        must_not_contain=opts.must_not_contain,
+        snr_range=opts.snr_range,
+        normalize_value=opts.data_norm,
+        use_labels=opts.cond,
+        dataset_keep_percentage=opts.dataset_keep_percentage,
+    )
 
     if opts.snr_range is not None:
         dist.print0(f'Using SNR range for natural noise corruption: {opts.snr_range} (additive_noise_sigma and multiply_noise_sigma are ignored)')
-        
+
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=4 if opts.workers > 0 else None, persistent_workers=(opts.workers > 0))
-    if opts.task == 'RENEW_SC' and torch.cuda.is_available():
-        if opts.workers > 0:
-            dist.print0("[RENEW_SC] Note: Setting DataLoader num_workers=0 because SC encoder performs GPU inference in dataset.")
-        c.data_loader_kwargs.num_workers = 0
-        c.data_loader_kwargs.persistent_workers = False
-        c.data_loader_kwargs.prefetch_factor = None
 
-    is_label_complex = False
-    if opts.task == 'RENEW':
-        is_label_complex = True
-    elif opts.task == 'RENEW_SC':
-        is_label_complex = opts.view_as_complex
+    c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(
+        flip_probability=opts.flip_aug_ratio, 
+        phase_shift_probability=opts.phase_shift_aug_ratio, 
+        other_collate_fn=[torch.utils.data.default_collate, ],
+        is_label_complex=opts.view_as_complex
+    )
 
-    c.data_loader_kwargs.collate_fn = rf_augmentation_collate_fn(flip_probability=opts.flip_aug_ratio, 
-                                                                phase_shift_probability=opts.phase_shift_aug_ratio, 
-                                                                other_collate_fn=[torch.utils.data.default_collate, ],
-                                                                is_label_complex=is_label_complex)
-                                                                # other_collate_fn=[pad_collate_fn(dynamic_noise=opts.dynamic_noise_sigma), torch.utils.data.default_collate])
-    validation_on_off = False
     # Determine whether to turn on validation
-    if opts.validation_interval == -1:  # If validation_interval is -1, we will turn off validation regardless of other options.
+    if opts.validation_interval == -1:
         validation_on_off = False
-    elif opts.task != 'XRF55' and opts.validation_data is None and opts.dataset_keep_percentage >= 1.0: # If validation_data is not specified and we are using the whole dataset for training, we will turn off validation.
+    elif opts.validation_data is None and opts.dataset_keep_percentage >= 1.0:
         validation_on_off = False
     else:
         validation_on_off = True
 
-    c.validation_kwargs = dnnlib.EasyDict(validation_on_off=validation_on_off, 
-                                          validation_interval=opts.validation_interval, 
-                                          validation_iterations=opts.validation_iterations, 
-                                          validation_batch_size=opts.validation_batch_size, 
-                                          validation_data=opts.validation_data)
+    c.validation_kwargs = dnnlib.EasyDict(
+        validation_on_off=validation_on_off, 
+        validation_interval=opts.validation_interval, 
+        validation_iterations=opts.validation_iterations, 
+        validation_batch_size=opts.validation_batch_size, 
+        validation_data=opts.validation_data
+    )
 
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
@@ -347,19 +286,9 @@ def main(**kwargs):
     dist.synchronize()
     # Validate dataset options.
     try:
-        if opts.task == 'RENEW':
-            dataset_obj = renewRfProcessedDataset(**c.dataset_kwargs)
-        elif opts.task == 'RENEW_SC':
-            dataset_obj = RenewSemanticCommunicationDataset(**c.dataset_kwargs)
-            dist.print0(f"[RENEW_SC] Time steps T = {dataset_obj.T} (auto-calculated: {opts.sc_t is None})")
-            dist.print0(f"[RENEW_SC] Channel type: {dataset_obj.channel_type} (equalization: {dataset_obj.channel_type == 'slow_fading_eq'})")
-        elif opts.task == 'WIDAR':
-            c.dataset_kwargs.must_contain = "regex:gesture(0|1|2|3|17|18)(?!\d)"
-            dataset_obj = WiDARDataset(**c.dataset_kwargs)
-        elif opts.task == 'XRF55':
-            dataset_obj = XRF55Dataset(**c.dataset_kwargs)
-        else:
-            raise ValueError(f'Unknown task: {opts.task}')
+        dataset_obj = RenewChannelDataset(**c.dataset_kwargs)
+        dist.print0(f"[RENEW_SC] Time steps T = {dataset_obj.T} (auto-calculated: {opts.sc_t is None})")
+        dist.print0(f"[RENEW_SC] Channel type: {dataset_obj.channel_type} (equalization: {dataset_obj.channel_type == 'slow_fading_eq'})")
         dataset_name = copy.copy(dataset_obj.name)
         c.dataset_kwargs.dataset_keep_percentage = opts.dataset_keep_percentage
         c.dataset_kwargs.max_size = int(len(dataset_obj) * opts.dataset_keep_percentage)
@@ -370,19 +299,11 @@ def main(**kwargs):
         gc.collect()
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
+
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
-    elif opts.arch == 'widar_ddpmpp':
-        c.network_kwargs.update(model_type='WiDAR_RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[[1,1,1,1],[1,1]], resample_stride=[4,2], model_channels=16, channel_mult=[1,2,2,2], kernel_size = [9,3])
-    elif opts.arch == 'widar_ddpmpp_stem256':
-        c.network_kwargs.update(model_type='WiDAR_RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,1,2,2], kernel_size=[3,3], stem_stride=[8,1], stem_kernel=[24,3], attn_resolutions=[16, 8])
-    elif opts.arch == 'widar_ddpmpp_stem512':
-        c.network_kwargs.update(model_type='WiDAR_RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], kernel_size=[3,3], stem_stride=[16,1], stem_kernel=[48,3], attn_resolutions=[16, 8])
     elif opts.arch == 'ddpmpp_256':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
@@ -392,19 +313,6 @@ def main(**kwargs):
     elif opts.arch == 'ddpmpp_64':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
-    elif opts.arch == 'ncsnpp':
-        c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
-    elif opts.arch == 'rf_transformer_default':
-        c.network_kwargs.update(model_type='RF_transformer', cond_dim=(6 if opts.cond else 0))
-    elif opts.arch == 'rf_transformer_default_256':
-        c.network_kwargs.update(model_type='RF_transformer', sample_rate=256, cond_dim=(6 if opts.cond else 0))
-    elif opts.arch == 'rf_transformer_default_xrf_500':
-        c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55)
-    elif opts.arch == 'rf_transformer_default_xrf_500_large':
-        c.network_kwargs.update(model_type='RF_transformer', sample_rate=500, input_dim=270, cond_dim=55, hidden_dim=512, num_block=16)
-    elif opts.arch == 'rf_transformer_MIMO_default':
-        c.network_kwargs.update(model_type='RF_transformer_MIMO', sample_rate=1, input_dim=[8, 26])
     elif opts.arch == 'rf_dit':
         c.network_kwargs.update(
             model_type='RF_DiT',
@@ -511,8 +419,7 @@ def main(**kwargs):
             label_type='downlink' if opts.cond else 'no_label',
         )
     else:
-        assert opts.arch == 'adm'
-        c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
+        raise ValueError(f'Unsupported architecture for Semantic Communication: {opts.arch}')
 
     if not opts.not_dynamic_noise_sigma_model:
         if (opts.arch in ['ddpmpp', 'ddpmpp_256', 'ddpmpp_192', 'ddpmpp_64']):
@@ -611,7 +518,6 @@ def main(**kwargs):
         c.network_kwargs.augment_dim = 9
     c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16, label_dropout=opts.label_dropout, attention_scale=opts.attn_scale, sigma_data=opts.sigma_data)
 
-
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)
     c.ema_halflife_kimg = int(opts.ema * 1000)
@@ -690,7 +596,6 @@ def main(**kwargs):
         # Convert function object to its name for serialization
         if 'collate_fn' in c_json.data_loader_kwargs and callable(c_json.data_loader_kwargs.collate_fn):
             c_json.data_loader_kwargs.collate_fn = c_json.data_loader_kwargs.collate_fn.__name__
-        print(c_json.data_loader_kwargs.collate_fn)
         dist.print0(json.dumps(c_json, indent=2))
         dist.print0()
         dist.print0(f'Output directory:        {c.run_dir}')
@@ -715,6 +620,7 @@ def main(**kwargs):
     # Dry run?
     if opts.dry_run:
         dist.print0('Dry run; exiting.')
+        dist.destroy_process_group()
         return
 
     # Create output directory.
@@ -724,7 +630,6 @@ def main(**kwargs):
         with open(os.path.join(c.run_dir, 'training_options.json'), 'wt') as f:
             json.dump(c_json, f, indent=2)
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
-
 
     # Train.
     training_loop.training_loop(**c)
