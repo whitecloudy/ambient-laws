@@ -37,12 +37,13 @@ def _get_net_attr(n, name):
 class EDMLoss:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
 
         self.no_asm = no_asm
+        self.no_asm2 = no_asm2
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -66,6 +67,8 @@ class EDMLoss:
 
         current_sigma = current_sigma * padding_mask
 
+        # no_asm do not use ASM Loss during training.
+        # And it do not use sigma_t_n at all. In that case, it is equivalent to original EDM.
         if self.no_asm:
             current_sigma = torch.zeros_like(current_sigma)
         
@@ -91,6 +94,11 @@ class EDMLoss:
             nonzero_sigma = 1e-8
         else:
             nonzero_sigma = sigma
+        
+        # no_asm2 do not use ASM Loss during training.
+        # Instead, we use sigma_t_n for noise level.
+        if self.no_asm2:
+            current_sigma = torch.zeros_like(current_sigma)
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
@@ -155,13 +163,14 @@ class EDMLoss:
 class EDMLoss_with_scheduler:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False,
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False,
                  sigma_max=80, kl_coeff=1.0, **kwargs):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
 
         self.no_asm = no_asm
+        self.no_asm2 = no_asm2
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -186,6 +195,8 @@ class EDMLoss_with_scheduler:
             padding_mask = torch.ones_like(images)
 
         orig_current_sigma_f64 = current_sigma_f64
+        # no_asm do not use ASM Loss during training.
+        # And it do not use sigma_t_n at all. In that case, it is equivalent to original EDM.
         if self.no_asm:
             current_sigma_f64 = torch.zeros_like(current_sigma_f64)
 
@@ -248,6 +259,11 @@ class EDMLoss_with_scheduler:
             nonzero_sigma_f64 = 1e-8
         else:
             nonzero_sigma_f64 = sigma_f64
+        
+        # no_asm2 do not use ASM Loss during training.
+        # Instead, we use sigma_t_n for noise level.
+        if self.no_asm2:
+            current_sigma_f64 = torch.zeros_like(current_sigma_f64)
 
         D_yn_f64 = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input_f64, nonzero_sigma_f64, current_sigma_f64)
 
@@ -351,13 +367,14 @@ class EDMLoss_with_scheduler:
 class EDMLoss_with_latent_z:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False,
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False,
                  kl_coeff=1.0, **kwargs):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
 
         self.no_asm = no_asm
+        self.no_asm2 = no_asm2
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -381,6 +398,8 @@ class EDMLoss_with_latent_z:
         orig_current_sigma = current_sigma
         current_sigma = current_sigma * padding_mask
 
+        # no_asm do not use ASM Loss during training.
+        # And it do not use sigma_t_n at all. In that case, it is equivalent to original EDM.
         if self.no_asm:
             current_sigma = torch.zeros_like(current_sigma)
         
@@ -425,6 +444,11 @@ class EDMLoss_with_latent_z:
             nonzero_sigma = 1e-8
         else:
             nonzero_sigma = sigma
+        
+        # no_asm2 do not use ASM Loss during training.
+        # Instead, we use sigma_t_n for noise level.
+        if self.no_asm2:
+            current_sigma = torch.zeros_like(current_sigma)
 
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
 
@@ -496,13 +520,14 @@ class EDMLoss_with_latent_z:
 class EDMLoss_loss_scaling_test:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, sigma_loss_scaling=0.5):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, sigma_loss_scaling=0.5):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
         self.sigma_loss_scaling = sigma_loss_scaling
 
         self.no_asm = no_asm
+        self.no_asm2 = no_asm2
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -526,6 +551,8 @@ class EDMLoss_loss_scaling_test:
 
         current_sigma = current_sigma * padding_mask
 
+        # no_asm do not use ASM Loss during training.
+        # And it do not use sigma_t_n at all. In that case, it is equivalent to original EDM.
         if self.no_asm:
             current_sigma = torch.zeros_like(current_sigma)
         
@@ -552,6 +579,11 @@ class EDMLoss_loss_scaling_test:
             nonzero_sigma = 1e-8
         else:
             nonzero_sigma = sigma
+        
+        # no_asm2 do not use ASM Loss during training.
+        # Instead, we use sigma_t_n for noise level.
+        if self.no_asm2:
+            current_sigma = torch.zeros_like(current_sigma)
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
@@ -624,7 +656,7 @@ class EDMLoss_loss_scaling_test:
 class EDMLoss_dynamic_sigma:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False,
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False,
                  lognorm_dist_mean = 0.11322956881040724,
                  lognorm_dist_loc = -0.3077225803161989,
                  lognorm_dist_sigma = 0.3644639849662781):
@@ -639,6 +671,7 @@ class EDMLoss_dynamic_sigma:
         self.with_weight = with_weight
         self.with_grad = with_grad
         self.no_asm = no_asm
+        self.no_asm2 = no_asm2
 
         self.lognorm_dist_mean = lognorm_dist_mean
         self.lognorm_dist_loc = lognorm_dist_loc
@@ -662,6 +695,8 @@ class EDMLoss_dynamic_sigma:
         
         current_sigma = current_sigma * padding_mask
 
+        # no_asm do not use ASM Loss during training.
+        # And it do not use sigma_t_n at all. In that case, it is equivalent to original EDM.
         if self.no_asm:
             current_sigma = torch.zeros_like(current_sigma)
         
@@ -687,6 +722,11 @@ class EDMLoss_dynamic_sigma:
             nonzero_sigma = 1e-8
         else:
             nonzero_sigma = sigma
+        
+        # no_asm2 do not use ASM Loss during training.
+        # Instead, we use sigma_t_n for noise level.
+        if self.no_asm2:
+            current_sigma = torch.zeros_like(current_sigma)
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
@@ -757,7 +797,7 @@ class EDMLoss_dynamic_sigma:
 class EDMLoss_boosted_sigma:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False):
                  
         self.P_mean = P_mean
         self.P_std = P_std
@@ -770,6 +810,7 @@ class EDMLoss_boosted_sigma:
         self.with_weight = with_weight
         self.with_grad = with_grad
         self.no_asm = no_asm
+        self.no_asm2 = no_asm2
 
     def __call__(self, net, images, labels=None, current_sigma=0.0, augment_pipe=None, original_shape=None):
         current_sigma = torch.tensor(current_sigma)
@@ -788,6 +829,8 @@ class EDMLoss_boosted_sigma:
 
         normalized_current_sigma = (current_sigma / (torch.mean(current_sigma**2, dim=tuple(range(1, current_sigma.ndim)), keepdim=True)**0.5)).to(torch.float64).to(images.device)
 
+        # no_asm do not use ASM Loss during training.
+        # And it do not use sigma_t_n at all. In that case, it is equivalent to original EDM.
         if self.no_asm:
             current_sigma = torch.zeros_like(current_sigma)
         
@@ -813,6 +856,11 @@ class EDMLoss_boosted_sigma:
             nonzero_sigma = 1e-8
         else:
             nonzero_sigma = sigma
+        
+        # no_asm2 do not use ASM Loss during training.
+        # Instead, we use sigma_t_n for noise level.
+        if self.no_asm2:
+            current_sigma = torch.zeros_like(current_sigma)
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)

@@ -55,6 +55,7 @@ def parse_int_list(s):
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler|edm_with_latent_z',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler', 'edm_with_latent_z']), default='edm', show_default=True)
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
+@click.option('--no_asm2',       help='Force not to use ASM Loss (use sigma_t_n for noise level)',  is_flag=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',            type=str, default=None, show_default=True)
 
@@ -491,6 +492,7 @@ def main(**kwargs):
     c.loss_kwargs.update(num_primes=opts.num_primes)
     c.loss_kwargs.update(consistency_coeff=opts.consistency_coeff)
     c.loss_kwargs.update(no_asm=opts.no_asm)
+    c.loss_kwargs.update(no_asm2=opts.no_asm2)
     c.loss_kwargs.update(P_mean=opts.p_mean, P_std=opts.p_std, sigma_data=opts.sigma_data)
 
     # Network options.
@@ -580,7 +582,6 @@ def main(**kwargs):
         c.run_dir = os.path.join(opts.outdir, f'{cur_run_id:05d}-{desc}-{random_string}')
         assert not os.path.exists(c.run_dir)
     
-    c.no_asm = opts.no_asm
     c.debug_test = opts.debug_test
     c.temp_save = opts.temp_save
     c.compile_network = opts.compile_network
