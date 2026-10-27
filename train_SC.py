@@ -127,6 +127,7 @@ def parse_int_list(s):
 @click.option('--matching_mode', help='Latent to RF channel matching mode for RENEW_SC.', type=click.Choice(['interpolate', 'pad_or_slice', 'repeat']), default='interpolate', show_default=True)
 @click.option('--sc_channel_type', help='Channel type for RENEW_SC: "slow_fading" (standard Y = H*Z + N) or "slow_fading_eq" (Zero-Forcing equalization Y/H = Z + N/H with dimensional noise).', type=click.Choice(['slow_fading', 'slow_fading_eq']), default='slow_fading', show_default=True)
 @click.option('--slow_fading_eq', help='Shortcut flag to enable slow_fading_eq channel equalization for RENEW_SC.', is_flag=True, default=False)
+@click.option('--encoder_snr_range', help='Feed uniform random SNR to SC encoder in range (min,max) in dB (e.g. "-5,20"). If None, uses RENEW channel SNR.', type=str, default=None, show_default=True)
 
 # Consistency params
 @click.option("--consistency_batch_size", help="Batch size for the consistency loss.", type=int, default=32)
@@ -249,7 +250,11 @@ def main(**kwargs):
         normalize_value=opts.data_norm,
         use_labels=opts.cond,
         dataset_keep_percentage=opts.dataset_keep_percentage,
+        encoder_snr_range=opts.encoder_snr_range,
     )
+
+    if opts.encoder_snr_range is not None:
+        dist.print0(f'Using uniform random SNR for SC encoder: {opts.encoder_snr_range} dB')
 
     if opts.snr_range is not None:
         dist.print0(f'Using SNR range for natural noise corruption: {opts.snr_range} (additive_noise_sigma and multiply_noise_sigma are ignored)')

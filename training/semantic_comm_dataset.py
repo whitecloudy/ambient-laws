@@ -336,6 +336,7 @@ class RenewSemanticCommunicationDataset(Dataset):
         normalize_value: float = 1.0,
         use_labels: bool = False,
         snr_range: Optional[Union[str, Tuple[float, float], List[float]]] = None,
+        encoder_snr_range: Optional[Union[str, Tuple[float, float], List[float]]] = None,
         device: Optional[Union[str, torch.device]] = None,
         **super_kwargs
     ):
@@ -366,6 +367,14 @@ class RenewSemanticCommunicationDataset(Dataset):
         self.image_noise_seed = int(image_noise_seed)
         self.flip_keep_dataset = bool(flip_keep_dataset)
         self.snr_range = parse_snr_range(snr_range)
+        parsed_enc_snr = parse_snr_range(encoder_snr_range)
+        self.encoder_uniform_snr = (parsed_enc_snr is not None)
+        if self.encoder_uniform_snr:
+            self.encoder_snr_low = float(parsed_enc_snr[0])
+            self.encoder_snr_high = float(parsed_enc_snr[1])
+        else:
+            self.encoder_snr_low = -5.0
+            self.encoder_snr_high = 20.0
 
         # 1. ADJSCC 설정 로드 및 채널 모드 결정
         self._config_file_path = Path(adjscc_config) if isinstance(adjscc_config, (str, Path)) else None
@@ -790,10 +799,14 @@ class RenewSemanticCommunicationDataset(Dataset):
         img_tensor = img.float()
 
         img_batch = img_tensor.unsqueeze(0).to(self.device)
-        snr_batch = torch.tensor([[snr_db]], dtype=torch.float32, device=self.device)
+        if self.encoder_uniform_snr:
+            enc_snr_val = float(np.random.uniform(self.encoder_snr_low, self.encoder_snr_high))
+            encoder_snr_batch = torch.tensor([[enc_snr_val]], dtype=torch.float32, device=self.device)
+        else:
+            encoder_snr_batch = torch.tensor([[snr_db]], dtype=torch.float32, device=self.device)
 
         with torch.inference_mode():
-            features = self.encoder(img_batch, snr_batch)
+            features = self.encoder(img_batch, encoder_snr_batch)
 
         # -------------------------------------------------------------
         # 4) Latent 복소수 변환, 단위 전력 정규화, (T, 48) reshape
@@ -1129,6 +1142,7 @@ class SCBatchSynthesizer(torch.nn.Module):
         image_corruption_seed: int = 112154,
         image_noise_seed: int = 445481,
         seed: int = 42,
+        encoder_snr_range: Optional[Union[str, Tuple[float, float], List[float]]] = None,
         **kwargs
     ):
         super().__init__()
@@ -1152,6 +1166,14 @@ class SCBatchSynthesizer(torch.nn.Module):
         self.image_corruption_seed = int(image_corruption_seed)
         self.image_noise_seed = int(image_noise_seed)
         self.seed = int(seed)
+        parsed_enc_snr = parse_snr_range(encoder_snr_range)
+        self.encoder_uniform_snr = (parsed_enc_snr is not None)
+        if self.encoder_uniform_snr:
+            self.encoder_snr_low = float(parsed_enc_snr[0])
+            self.encoder_snr_high = float(parsed_enc_snr[1])
+        else:
+            self.encoder_snr_low = -5.0
+            self.encoder_snr_high = 20.0
 
         # 1. ADJSCC Config & Model
         self._config_file_path = Path(adjscc_config) if isinstance(adjscc_config, (str, Path)) else None
@@ -1332,12 +1354,20 @@ class SCBatchSynthesizer(torch.nn.Module):
         eff_noise_sigma, snr_batch = self._compute_deterministic_noise_sigma(h_complex, raw_noise, idx_list)
         snr_batch = snr_batch.float()
 
+        # Determine SNR fed into SC Encoder
+        if self.encoder_uniform_snr:
+            encoder_snr_batch = torch.empty((B, 1), device=self.device, dtype=torch.float32).uniform_(
+                self.encoder_snr_low, self.encoder_snr_high
+            )
+        else:
+            encoder_snr_batch = snr_batch
+
         # 2) Image Batch Extraction
         img_batch = self.cached_images[image_idx].float()
 
         # 3) SC Encoder Batch Forward
         with torch.inference_mode():
-            features = self.encoder(img_batch, snr_batch)
+            features = self.encoder(img_batch, encoder_snr_batch)
 
         # 4) Latent Complex Conversion & Power Normalization & Shape Matching
         f = features.reshape(B, -1)

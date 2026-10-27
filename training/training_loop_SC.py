@@ -289,7 +289,10 @@ def training_loop(
         image_corruption_seed=dataset_kwargs.get('image_corruption_seed', 112154),
         image_noise_seed=dataset_kwargs.get('image_noise_seed', 445481),
         seed=seed if seed is not None else 42,
+        encoder_snr_range=dataset_kwargs.get('encoder_snr_range', None),
     )
+    if sc_synthesizer.encoder_uniform_snr:
+        dist.print0(f"[RENEW_SC] Uniform SNR mode enabled for SC Encoder (range: {sc_synthesizer.encoder_snr_low} to {sc_synthesizer.encoder_snr_high} dB)")
 
     validation_on_off = validation_kwargs.validation_on_off
     if validation_on_off:
