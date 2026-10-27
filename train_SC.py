@@ -305,6 +305,9 @@ def main(**kwargs):
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
+    elif opts.arch == 'ddpmpp_64_deep':
+        c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,4,4], label_type='downlink' if opts.cond else 'no_label')
     elif opts.arch == 'ddpmpp_256':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
