@@ -138,6 +138,35 @@ def calculate_sc_t_from_config(
     return max(1, t)
 
 
+def calculate_sc_latent_hw_from_config(
+    adjscc_config: Union[str, Path, Dict[str, Any]],
+    image_shape: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int]:
+    """
+    adjscc_config에 정의된 이미지 크기(image_size)를 바탕으로
+    SC Encoder 출력 특징맵의 공간 해상도 (H_out, W_out)를 계산합니다 (기본 CIFAR-10 32x32 기준 (8, 8)).
+    """
+    if isinstance(adjscc_config, (str, Path)):
+        adjscc_config = _load_adjscc_config(adjscc_config)
+
+    img_size = adjscc_config.get('image_size', adjscc_config.get('img_size', None)) if isinstance(adjscc_config, dict) else None
+    if img_size is not None:
+        if isinstance(img_size, (int, float)):
+            h, w = int(img_size), int(img_size)
+        elif len(img_size) == 2:
+            h, w = int(img_size[0]), int(img_size[1])
+        elif len(img_size) >= 3:
+            h, w = int(img_size[-2]), int(img_size[-1])
+        else:
+            h, w = 32, 32
+    elif image_shape is not None:
+        h, w = int(image_shape[-2]), int(image_shape[-1])
+    else:
+        h, w = 32, 32
+
+    return max(1, h // 4), max(1, w // 4)
+
+
 def find_adjscc_checkpoint(
     adjscc_config: Dict[str, Any],
     explicit_path: Optional[Union[str, Path]] = None,
@@ -383,7 +412,7 @@ class RenewSemanticCommunicationDataset(Dataset):
         self.in_channels = int(self.adjscc_config.get('in_channels', 3))
         self.load_model_path = adjscc_model_path or self.adjscc_config.get('load_model_path', None)
 
-        # 채널 유형 결정 ('slow_fading' vs 'slow_fading_eq')
+        # 채널 유형 결정 ('slow_fading' vs 'slow_fading_eq' vs 'awgn')
         if slow_fading_eq:
             self.channel_type = 'slow_fading_eq'
         elif channel_type is not None:
@@ -408,48 +437,79 @@ class RenewSemanticCommunicationDataset(Dataset):
             self.noise_mean_flag = True
         self.dynamic_noise_sigma = not self.noise_mean_flag
 
-        # 2. RENEW 기본 데이터셋 및 파일 초기화 (기존 RENEW 클래스/함수 직접 활용)
-        if renew_dataset is not None:
-            self.base_renew = renew_dataset
-            self._renew_files = list(renew_dataset._fname)
-        elif self.path is not None:
-            self.base_renew = renewRfProcessedDataset(
-                path=self.path,
-                must_contain=self.must_contain,
-                must_not_contain=self.must_not_contain,
-                sigma=self.minimum_sigma,
-                additive_noise_sigma=self.additive_noise_sigma,
-                multiply_noise_sigma=self.multiply_noise_sigma,
-                only_additive_noise=self.only_additive_noise,
+        # 2. RENEW 기본 데이터셋 및 파일 초기화 (AWGN 모드가 아닐 때 기존 RENEW 클래스/함수 직접 활용)
+        if self.channel_type == 'awgn':
+            self.base_renew = None
+            self._renew_files = []
+            if self.noise_mean_alter_way:
+                self.corruption_collate_fn = AlternativeCorruptionCollateFn(
+                    corruption_probability_per_image=self.corruption_probability_per_image,
+                    additive_noise_sigma=self.additive_noise_sigma,
+                    multiply_noise_sigma=self.multiply_noise_sigma,
+                    only_additive_noise=True,
+                    image_corruption_seed=self.image_corruption_seed,
+                    image_noise_seed=self.image_noise_seed,
+                    snr_range=self.snr_range,
+                )
+            else:
+                self.corruption_collate_fn = CorruptionCollateFn(
+                    corruption_probability_per_image=self.corruption_probability_per_image,
+                    additive_noise_sigma=self.additive_noise_sigma,
+                    multiply_noise_sigma=self.multiply_noise_sigma,
+                    only_additive_noise=True,
+                    image_corruption_seed=self.image_corruption_seed,
+                    image_noise_seed=self.image_noise_seed,
+                    snr_range=self.snr_range,
+                )
+            self.noise_mean_collate_fn = NoiseMeanCollateFn(
                 noise_mean_flag=self.noise_mean_flag,
                 noise_mean_alter_way=self.noise_mean_alter_way,
-                corruption_probability_per_image=self.corruption_probability_per_image,
-                corruption_probability_per_pixel=self.corruption_probability_per_pixel,
-                image_corruption_seed=self.image_corruption_seed,
-                image_noise_seed=self.image_noise_seed,
-                dataset_keep_percentage=self.dataset_keep_percentage,
-                flip_keep_dataset=self.flip_keep_dataset,
-                normalize_value=self.normalize_value,
-                use_labels=self.use_labels,
-                snr_range=self.snr_range,
-                view_as_complex=True,
-                **(renew_kwargs or {})
             )
-            self._renew_files = list(self.base_renew._fname)
+            self.n_frames = 0
+            self.n_antennas = 1
+            self.raw_subcarriers = 48
         else:
-            raise ValueError("Either 'renew_dataset' or 'renew_path' (or 'path') must be provided.")
+            if renew_dataset is not None:
+                self.base_renew = renew_dataset
+                self._renew_files = list(renew_dataset._fname)
+            elif self.path is not None:
+                self.base_renew = renewRfProcessedDataset(
+                    path=self.path,
+                    must_contain=self.must_contain,
+                    must_not_contain=self.must_not_contain,
+                    sigma=self.minimum_sigma,
+                    additive_noise_sigma=self.additive_noise_sigma,
+                    multiply_noise_sigma=self.multiply_noise_sigma,
+                    only_additive_noise=self.only_additive_noise,
+                    noise_mean_flag=self.noise_mean_flag,
+                    noise_mean_alter_way=self.noise_mean_alter_way,
+                    corruption_probability_per_image=self.corruption_probability_per_image,
+                    corruption_probability_per_pixel=self.corruption_probability_per_pixel,
+                    image_corruption_seed=self.image_corruption_seed,
+                    image_noise_seed=self.image_noise_seed,
+                    dataset_keep_percentage=self.dataset_keep_percentage,
+                    flip_keep_dataset=self.flip_keep_dataset,
+                    normalize_value=self.normalize_value,
+                    use_labels=self.use_labels,
+                    snr_range=self.snr_range,
+                    view_as_complex=True,
+                    **(renew_kwargs or {})
+                )
+                self._renew_files = list(self.base_renew._fname)
+            else:
+                raise ValueError("Either 'renew_dataset' or 'renew_path' (or 'path') must be provided when channel_type is not 'awgn'.")
 
-        self._renew_files = sorted(list(self._renew_files))
-        if len(self._renew_files) == 0:
-            raise ValueError("No RENEW .npz files found matching the criteria!")
+            self._renew_files = sorted(list(self._renew_files))
+            if len(self._renew_files) == 0:
+                raise ValueError("No RENEW .npz files found matching the criteria!")
 
-        # 기존 RENEW collate functions 직접 재사용
-        self.corruption_collate_fn = self.base_renew.corruption_collate_fn
-        self.noise_mean_collate_fn = self.base_renew.noise_mean_collate_fn
+            # 기존 RENEW collate functions 직접 재사용
+            self.corruption_collate_fn = self.base_renew.corruption_collate_fn
+            self.noise_mean_collate_fn = self.base_renew.noise_mean_collate_fn
 
-        # 첫 번째 파일 검사하여 기본 차원(Frame, Antenna, Subcarrier) 확인
-        sample_csi, sample_noise = self.base_renew._load_and_normalize(self._renew_files[0])
-        self.n_frames, self.n_antennas, self.raw_subcarriers = sample_csi.shape[:3]
+            # 첫 번째 파일 검사하여 기본 차원(Frame, Antenna, Subcarrier) 확인
+            sample_csi, sample_noise = self.base_renew._load_and_normalize(self._renew_files[0])
+            self.n_frames, self.n_antennas, self.raw_subcarriers = sample_csi.shape[:3]
 
         if device is not None:
             self.device = torch.device(device)
@@ -504,28 +564,29 @@ class RenewSemanticCommunicationDataset(Dataset):
         # 3. 이미지 데이터셋 초기화
         self.image_dataset = self._init_image_dataset(image_dataset)
 
-        # 4. 시간 스텝 T 결정: T가 지정되지 않은 경우 adjscc_config의 이미지 크기와 압축 수준(tcn 또는 bandwidth ratio)으로 자동 계산
+        # 4. 시간 스텝 T 및 (H_out, W_out) 결정
+        sample_img_shape = None
+        if len(self.image_dataset) > 0:
+            try:
+                sample_item = self.image_dataset[0]
+                if isinstance(sample_item, (tuple, list)):
+                    s_img = sample_item[0]
+                elif isinstance(sample_item, dict):
+                    s_img = sample_item.get('image', sample_item.get('img'))
+                else:
+                    s_img = sample_item
+                if isinstance(s_img, torch.Tensor):
+                    sample_img_shape = (s_img.shape[-2], s_img.shape[-1])
+                elif hasattr(s_img, 'shape'):
+                    sample_img_shape = (s_img.shape[0], s_img.shape[1])
+                elif hasattr(s_img, 'size'):
+                    sample_img_shape = (s_img.size[1], s_img.size[0])
+            except Exception:
+                pass
+        self.h_out, self.w_out = calculate_sc_latent_hw_from_config(self.adjscc_config, image_shape=sample_img_shape)
         if T is not None:
             self.T = int(T)
         else:
-            sample_img_shape = None
-            if len(self.image_dataset) > 0:
-                try:
-                    sample_item = self.image_dataset[0]
-                    if isinstance(sample_item, (tuple, list)):
-                        s_img = sample_item[0]
-                    elif isinstance(sample_item, dict):
-                        s_img = sample_item.get('image', sample_item.get('img'))
-                    else:
-                        s_img = sample_item
-                    if isinstance(s_img, torch.Tensor):
-                        sample_img_shape = (s_img.shape[-2], s_img.shape[-1])
-                    elif hasattr(s_img, 'shape'):
-                        sample_img_shape = (s_img.shape[0], s_img.shape[1])
-                    elif hasattr(s_img, 'size'):
-                        sample_img_shape = (s_img.size[1], s_img.size[0])
-                except Exception:
-                    pass
             self.T = calculate_sc_t_from_config(self.adjscc_config, image_shape=sample_img_shape, num_subcarriers=48)
 
         # 프레임 내 non-overlapping 청크 수 계산
@@ -534,6 +595,8 @@ class RenewSemanticCommunicationDataset(Dataset):
         # 5. [image, RF channel, antenna, natural noise] 고유 조합 (Pairing Table) 생성
         if dataset_len is not None:
             self._dataset_len = int(dataset_len)
+        elif self.channel_type == 'awgn':
+            self._dataset_len = 160800
         else:
             # 기본적으로 (파일 수 * 시간 청크 수)를 데이터셋 길이로 설정
             self._dataset_len = len(self._renew_files) * self.n_time_chunks
@@ -544,22 +607,30 @@ class RenewSemanticCommunicationDataset(Dataset):
 
     @property
     def name(self) -> str:
-        return 'RENEW_SC'
+        return 'AWGN_SC' if self.channel_type == 'awgn' else 'RENEW_SC'
 
     @property
     def image_shape(self) -> List[int]:
+        if self.channel_type == 'awgn':
+            if self.view_as_complex:
+                return [self.tcn // 2, self.h_out, self.w_out]
+            return [self.tcn, self.h_out, self.w_out]
         if self.view_as_complex:
             return [self.T, 48]
         return [2, self.T, 48]
 
     @property
     def num_channels(self) -> int:
+        if self.channel_type == 'awgn':
+            return (self.tcn // 2) if self.view_as_complex else self.tcn
         if self.view_as_complex:
             return 1
         return 2
 
     @property
     def resolution(self) -> Tuple[int, int]:
+        if self.channel_type == 'awgn':
+            return (self.h_out, self.w_out)
         return (self.T, 48)
 
     @property
@@ -621,10 +692,10 @@ class RenewSemanticCommunicationDataset(Dataset):
         table = []
         for i in range(length):
             # 파일, 안테나, 시간 청크, 이미지, 노이즈 시드를 결정론적으로 할당
-            file_idx = int(rng.randint(0, num_files))
-            antenna_idx = int(rng.randint(0, self.n_antennas))
-            time_chunk_idx = int(rng.randint(0, self.n_time_chunks))
-            image_idx = int(rng.randint(0, num_images))
+            file_idx = int(rng.randint(0, num_files)) if num_files > 0 else 0
+            antenna_idx = int(rng.randint(0, self.n_antennas)) if self.n_antennas > 0 else 0
+            time_chunk_idx = int(rng.randint(0, self.n_time_chunks)) if self.n_time_chunks > 0 else 0
+            image_idx = int(rng.randint(0, max(1, num_images)))
             noise_seed = int(rng.randint(0, 2**31 - 1))
 
             table.append({
@@ -731,35 +802,40 @@ class RenewSemanticCommunicationDataset(Dataset):
         image_idx = pair['image_idx']
         noise_seed = pair['noise_seed']
 
-        item_fname = self._renew_files[file_idx]
-
-        # -------------------------------------------------------------
-        # 1) RF 채널 로드, 1개 안테나 및 T step 선택, 48개 서브캐리어 추출
-        # -------------------------------------------------------------
-        raw_csi, raw_noise = self.base_renew._load_and_normalize(item_fname)
-        # raw_csi shape: (n_frames, n_antennas, n_subcarriers)
-        # raw_noise shape: (n_frames, n_antennas, 1)
-
-        # 시간 청크 범위 슬라이싱 (T 스텝)
-        f_start = time_chunk_idx * self.T
-        f_end = f_start + self.T
-
-        # 파일 내 프레임 수가 T보다 적거나 슬라이싱 범위가 부족한 경우 처리
-        if f_end <= raw_csi.shape[0]:
-            h_slice = raw_csi[f_start:f_end, antenna_idx, :]
-            n_slice = raw_noise[f_start:f_end, antenna_idx, :]
+        if self.channel_type == 'awgn':
+            item_fname = 'awgn'
+            h_clean_48 = np.ones((self.tcn // 2, self.h_out, self.w_out), dtype=np.complex64)
+            noise_slice_48 = np.zeros((self.tcn // 2, self.h_out, self.w_out), dtype=np.float32)
         else:
-            # 부족한 경우 끝부분 슬라이스 후 시간 패딩
-            h_sub = raw_csi[:, antenna_idx, :]
-            n_sub = raw_noise[:, antenna_idx, :]
-            pad_len = self.T - h_sub.shape[0]
-            h_slice = np.pad(h_sub, ((0, pad_len), (0, 0)), mode='edge')
-            n_slice = np.pad(n_sub, ((0, pad_len), (0, 0)), mode='edge')
+            item_fname = self._renew_files[file_idx]
 
-        # 52개 중 파일럿 제외하여 48개 서브캐리어 추출 -> shape: (T, 48) complex
-        h_clean_48 = self._extract_48_subcarriers(h_slice)
-        # n_slice: (T, 1) -> (T, 48)
-        noise_slice_48 = np.broadcast_to(n_slice, (self.T, 48)).copy()
+            # -------------------------------------------------------------
+            # 1) RF 채널 로드, 1개 안테나 및 T step 선택, 48개 서브캐리어 추출
+            # -------------------------------------------------------------
+            raw_csi, raw_noise = self.base_renew._load_and_normalize(item_fname)
+            # raw_csi shape: (n_frames, n_antennas, n_subcarriers)
+            # raw_noise shape: (n_frames, n_antennas, 1)
+
+            # 시간 청크 범위 슬라이싱 (T 스텝)
+            f_start = time_chunk_idx * self.T
+            f_end = f_start + self.T
+
+            # 파일 내 프레임 수가 T보다 적거나 슬라이싱 범위가 부족한 경우 처리
+            if f_end <= raw_csi.shape[0]:
+                h_slice = raw_csi[f_start:f_end, antenna_idx, :]
+                n_slice = raw_noise[f_start:f_end, antenna_idx, :]
+            else:
+                # 부족한 경우 끝부분 슬라이스 후 시간 패딩
+                h_sub = raw_csi[:, antenna_idx, :]
+                n_sub = raw_noise[:, antenna_idx, :]
+                pad_len = self.T - h_sub.shape[0]
+                h_slice = np.pad(h_sub, ((0, pad_len), (0, 0)), mode='edge')
+                n_slice = np.pad(n_sub, ((0, pad_len), (0, 0)), mode='edge')
+
+            # 52개 중 파일럿 제외하여 48개 서브캐리어 추출 -> shape: (T, 48) complex
+            h_clean_48 = self._extract_48_subcarriers(h_slice)
+            # n_slice: (T, 1) -> (T, 48)
+            noise_slice_48 = np.broadcast_to(n_slice, (self.T, 48)).copy()
 
         # -------------------------------------------------------------
         # 2) RENEW corruption_collate_fn을 통한 노이즈 계산 및 SNR 산출
@@ -770,7 +846,7 @@ class RenewSemanticCommunicationDataset(Dataset):
             'idx': noise_seed,
         }
         corr_res = self.corruption_collate_fn([corr_item])[0]
-        eff_noise_sigma = corr_res['sigma']  # (T, 48)
+        eff_noise_sigma = corr_res['sigma']
         corruption_label = corr_res.get('corruption_label', 0)
 
         # ADJSCC 인코더 입력용 SNR 계산
@@ -809,8 +885,9 @@ class RenewSemanticCommunicationDataset(Dataset):
             features = self.encoder(img_batch, encoder_snr_batch)
 
         # -------------------------------------------------------------
-        # 4) Latent 복소수 변환, 단위 전력 정규화, (T, 48) reshape
+        # 4) Latent 복소수 변환, 단위 전력 정규화, reshape (AWGN은 그리드 매칭 생략)
         # -------------------------------------------------------------
+        _, tcn_feat, h_feat, w_feat = features.shape
         f = features.reshape(1, -1)
         dim_z = f.shape[1] // 2
         z_in = torch.complex(f[:, :dim_z], f[:, dim_z:])
@@ -821,8 +898,15 @@ class RenewSemanticCommunicationDataset(Dataset):
             z_in = z_in * torch.complex(scale, torch.zeros_like(scale))
 
         z_complex_1d = z_in.squeeze(0)
-        # (T, 48) 복소수 심볼로 매칭
-        z_matched = self._match_latent_shape(z_complex_1d, (self.T, 48))
+        if self.channel_type == 'awgn':
+            # AWGN 모드: (T, 48) 그리드 매칭 없이 인코더 출력 형태 (tcn//2, H_out, W_out) 유지
+            z_matched = z_complex_1d.reshape(tcn_feat // 2, h_feat, w_feat).cpu().numpy()
+            power_z = np.mean(np.abs(z_matched) ** 2)
+            if power_z > 1e-12:
+                z_matched = z_matched / np.sqrt(power_z)
+        else:
+            # (T, 48) 복소수 심볼로 매칭
+            z_matched = self._match_latent_shape(z_complex_1d, (self.T, 48))
 
         # -------------------------------------------------------------
         # 5) 무선 채널 전송 및 RENEW NoiseMeanCollateFn 적용
@@ -841,6 +925,10 @@ class RenewSemanticCommunicationDataset(Dataset):
             eq_noise = rx_noise / h_safe
             rx_signal = z_matched + eq_noise
             raw_sigma = (eff_noise_sigma / np.maximum(h_mag, eps)).astype(np.float32)
+        elif self.channel_type == 'awgn':
+            # AWGN 채널: Y = Z + N (H = 1)
+            rx_signal = z_matched + rx_noise
+            raw_sigma = eff_noise_sigma.astype(np.float32)
         else:
             # 기본 slow_fading: Y = H * Z + N
             rx_noiseless = h_clean_48 * z_matched  # (T, 48) complex
@@ -854,27 +942,34 @@ class RenewSemanticCommunicationDataset(Dataset):
             # scalar sigma (dynamic_noise_sigma=False)
             out_sigma = np.float32(mean_res)
         else:
-            # dynamic_noise_sigma=True: 차원별 노이즈 세기 유지 [2, T, 48] 또는 [T, 48]
+            # dynamic_noise_sigma=True: 차원별 노이즈 세기 유지
             if self.view_as_complex:
                 out_sigma = mean_res.astype(np.float32)
+            elif self.channel_type == 'awgn':
+                out_sigma = np.concatenate([mean_res, mean_res], axis=0).astype(np.float32)
             else:
                 out_sigma = np.stack([mean_res, mean_res], axis=0).astype(np.float32)
 
         # -------------------------------------------------------------
-        # 6) 출력 형태: [img/real, T, C] = [2, T, 48]
-        #    (0: 실수부 Real, 1: 허수부 Imag)
+        # 6) 출력 형태:
+        #    - AWGN 모드: [tcn, H_out, W_out] (예: [16, 8, 8], 그리드 매칭 없음)
+        #    - RENEW 모드: [img/real, T, C] = [2, T, 48] (0: 실수부 Real, 1: 허수부 Imag)
         # -------------------------------------------------------------
         if self.view_as_complex:
             out_image = rx_signal.astype(np.complex64)
             out_clean_channel = h_clean_48.astype(np.complex64)
             out_latent = z_matched.astype(np.complex64)
+        elif self.channel_type == 'awgn':
+            out_image = np.concatenate([rx_signal.real, rx_signal.imag], axis=0).astype(np.float32)
+            out_clean_channel = np.concatenate([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
+            out_latent = np.concatenate([z_matched.real, z_matched.imag], axis=0).astype(np.float32)
         else:
             out_image = np.stack([rx_signal.real, rx_signal.imag], axis=0).astype(np.float32)
             out_clean_channel = np.stack([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
             out_latent = np.stack([z_matched.real, z_matched.imag], axis=0).astype(np.float32)
 
         if self.use_labels:
-            if self.channel_type == 'slow_fading_eq':
+            if self.channel_type in ('slow_fading_eq', 'awgn'):
                 out_label = out_latent
             else:
                 out_label = out_clean_channel
@@ -945,32 +1040,43 @@ class RenewChannelDataset(Dataset):
         self.must_contain = must_contain
         self.must_not_contain = must_not_contain
         self.flip_keep_dataset = bool(flip_keep_dataset)
-        self.channel_type = 'slow_fading_eq' if slow_fading_eq else (channel_type or 'slow_fading')
+        self.channel_type = 'slow_fading_eq' if slow_fading_eq else str(channel_type or 'slow_fading').lower().strip()
 
-        # 1. Base RENEW dataset helper for file discovery & reading
-        self.base_renew = renewRfProcessedDataset(
-            path=self.path,
-            normalize_value=self.normalize_value,
-            must_contain=self.must_contain,
-            must_not_contain=self.must_not_contain,
-            dataset_keep_percentage=self.dataset_keep_percentage,
-            flip_keep_dataset=self.flip_keep_dataset,
-        )
-        self._renew_files = self.base_renew._fname
-        if len(self._renew_files) == 0:
-            raise FileNotFoundError(f"No RENEW npz files found at path: {self.path}")
+        # 1. Base RENEW dataset helper for file discovery & reading (skipped in AWGN mode)
+        if self.channel_type == 'awgn':
+            self.base_renew = None
+            self._renew_files = []
+            self.n_frames = 0
+            self.n_antennas = 1
+            self.raw_subcarriers = 48
+        else:
+            if self.path is None:
+                raise ValueError("RENEW dataset path ('renew_path' or 'path') is required when channel_type is not 'awgn'.")
+            self.base_renew = renewRfProcessedDataset(
+                path=self.path,
+                normalize_value=self.normalize_value,
+                must_contain=self.must_contain,
+                must_not_contain=self.must_not_contain,
+                dataset_keep_percentage=self.dataset_keep_percentage,
+                flip_keep_dataset=self.flip_keep_dataset,
+            )
+            self._renew_files = self.base_renew._fname
+            if len(self._renew_files) == 0:
+                raise FileNotFoundError(f"No RENEW npz files found at path: {self.path}")
 
-        sample_csi, sample_noise = self.base_renew._load_and_normalize(self._renew_files[0])
-        self.n_frames, self.n_antennas, self.raw_subcarriers = sample_csi.shape[:3]
+            sample_csi, sample_noise = self.base_renew._load_and_normalize(self._renew_files[0])
+            self.n_frames, self.n_antennas, self.raw_subcarriers = sample_csi.shape[:3]
 
-        # 2. Determine T
+        # 2. Determine T and (h_out, w_out)
+        cfg = _load_adjscc_config(adjscc_config) if adjscc_config is not None else {}
+        self.tcn = int(cfg.get('transmit_channel_num', cfg.get('tcn', 16))) if isinstance(cfg, dict) else 16
+        self.h_out, self.w_out = calculate_sc_latent_hw_from_config(cfg)
         if T is not None:
             self.T = int(T)
         else:
-            cfg = _load_adjscc_config(adjscc_config) if adjscc_config is not None else {}
             self.T = calculate_sc_t_from_config(cfg, num_subcarriers=48)
 
-        self.n_time_chunks = max(1, self.n_frames // self.T)
+        self.n_time_chunks = max(1, self.n_frames // self.T) if self.n_frames > 0 else 1
 
         # 3. Determine number of images for pairing table
         self._num_images = 50000
@@ -984,6 +1090,8 @@ class RenewChannelDataset(Dataset):
         # 4. Build Pairing Table
         if dataset_len is not None:
             self._dataset_len = int(dataset_len)
+        elif self.channel_type == 'awgn':
+            self._dataset_len = 160800
         else:
             self._dataset_len = len(self._renew_files) * self.n_time_chunks
 
@@ -997,9 +1105,9 @@ class RenewChannelDataset(Dataset):
         num_files = len(self._renew_files)
         table = []
         for i in range(length):
-            file_idx = int(rng.randint(0, num_files))
-            antenna_idx = int(rng.randint(0, self.n_antennas))
-            time_chunk_idx = int(rng.randint(0, self.n_time_chunks))
+            file_idx = int(rng.randint(0, num_files)) if num_files > 0 else 0
+            antenna_idx = int(rng.randint(0, self.n_antennas)) if self.n_antennas > 0 else 0
+            time_chunk_idx = int(rng.randint(0, self.n_time_chunks)) if self.n_time_chunks > 0 else 0
             image_idx = int(rng.randint(0, max(1, num_images)))
             noise_seed = int(rng.randint(0, 2**31 - 1))
             table.append({
@@ -1013,20 +1121,28 @@ class RenewChannelDataset(Dataset):
 
     @property
     def name(self) -> str:
-        return 'RENEW_SC'
+        return 'AWGN_SC' if self.channel_type == 'awgn' else 'RENEW_SC'
 
     @property
     def image_shape(self) -> List[int]:
+        if self.channel_type == 'awgn':
+            if self.view_as_complex:
+                return [self.tcn // 2, self.h_out, self.w_out]
+            return [self.tcn, self.h_out, self.w_out]
         if self.view_as_complex:
             return [self.T, 48]
         return [2, self.T, 48]
 
     @property
     def num_channels(self) -> int:
+        if self.channel_type == 'awgn':
+            return (self.tcn // 2) if self.view_as_complex else self.tcn
         return 1 if self.view_as_complex else 2
 
     @property
     def resolution(self) -> Tuple[int, int]:
+        if self.channel_type == 'awgn':
+            return (self.h_out, self.w_out)
         return (self.T, 48)
 
     @property
@@ -1068,26 +1184,33 @@ class RenewChannelDataset(Dataset):
         image_idx = pair['image_idx']
         noise_seed = pair['noise_seed']
 
-        item_fname = self._renew_files[file_idx]
-        raw_csi, raw_noise = self.base_renew._load_and_normalize(item_fname)
-
-        f_start = time_chunk_idx * self.T
-        f_end = f_start + self.T
-        if f_end <= raw_csi.shape[0]:
-            h_slice = raw_csi[f_start:f_end, antenna_idx, :]
-            n_slice = raw_noise[f_start:f_end, antenna_idx, :]
+        if self.channel_type == 'awgn':
+            item_fname = 'awgn'
+            h_clean_48 = np.ones((self.tcn // 2, self.h_out, self.w_out), dtype=np.complex64)
+            noise_slice_48 = np.zeros((self.tcn // 2, self.h_out, self.w_out), dtype=np.float32)
         else:
-            h_sub = raw_csi[:, antenna_idx, :]
-            n_sub = raw_noise[:, antenna_idx, :]
-            pad_len = self.T - h_sub.shape[0]
-            h_slice = np.pad(h_sub, ((0, pad_len), (0, 0)), mode='edge')
-            n_slice = np.pad(n_sub, ((0, pad_len), (0, 0)), mode='edge')
+            item_fname = self._renew_files[file_idx]
+            raw_csi, raw_noise = self.base_renew._load_and_normalize(item_fname)
 
-        h_clean_48 = self._extract_48_subcarriers(h_slice)
-        noise_slice_48 = np.broadcast_to(n_slice, (self.T, 48)).copy()
+            f_start = time_chunk_idx * self.T
+            f_end = f_start + self.T
+            if f_end <= raw_csi.shape[0]:
+                h_slice = raw_csi[f_start:f_end, antenna_idx, :]
+                n_slice = raw_noise[f_start:f_end, antenna_idx, :]
+            else:
+                h_sub = raw_csi[:, antenna_idx, :]
+                n_sub = raw_noise[:, antenna_idx, :]
+                pad_len = self.T - h_sub.shape[0]
+                h_slice = np.pad(h_sub, ((0, pad_len), (0, 0)), mode='edge')
+                n_slice = np.pad(n_sub, ((0, pad_len), (0, 0)), mode='edge')
+
+            h_clean_48 = self._extract_48_subcarriers(h_slice)
+            noise_slice_48 = np.broadcast_to(n_slice, (self.T, 48)).copy()
 
         if self.view_as_complex:
             out_channel = h_clean_48.astype(np.complex64)
+        elif self.channel_type == 'awgn':
+            out_channel = np.concatenate([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
         else:
             out_channel = np.stack([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
 
@@ -1148,7 +1271,7 @@ class SCBatchSynthesizer(torch.nn.Module):
         super().__init__()
         self.device = torch.device(device)
         self.T = int(T)
-        self.channel_type = 'slow_fading_eq' if slow_fading_eq else (channel_type or 'slow_fading')
+        self.channel_type = 'slow_fading_eq' if slow_fading_eq else str(channel_type or 'slow_fading').lower().strip()
         self.slow_fading_eq = (self.channel_type == 'slow_fading_eq')
         self.matching_mode = matching_mode
         self.power_normalize_latent = power_normalize_latent
@@ -1257,20 +1380,23 @@ class SCBatchSynthesizer(torch.nn.Module):
                 snr_val = 0.0
             target_snr_list.append(snr_val)
 
-        is_corrupt = torch.tensor(is_corrupt_list, dtype=torch.bool, device=self.device).view(B, 1, 1)
-        target_snr_db = torch.tensor(target_snr_list, dtype=torch.float32, device=self.device).view(B, 1, 1)
+        bcast_shape = [B] + [1] * (h_complex.ndim - 1)
+        reduce_dims = tuple(range(1, h_complex.ndim))
+
+        is_corrupt = torch.tensor(is_corrupt_list, dtype=torch.bool, device=self.device).view(*bcast_shape)
+        target_snr_db = torch.tensor(target_snr_list, dtype=torch.float32, device=self.device).view(*bcast_shape)
 
         h_complex = h_complex.to(torch.complex64)
         noise_sigma_data = noise_sigma_data.float()
 
         # Vectorized GPU tensor computation (Zero CPU-GPU stalls, zero .item() calls)
-        sig_pow = torch.mean(torch.abs(h_complex) ** 2, dim=(-2, -1), keepdim=True)
+        sig_pow = torch.mean(torch.abs(h_complex) ** 2, dim=reduce_dims, keepdim=True)
 
         if self.snr_range is not None:
             ratio_snr = 10.0 ** (target_snr_db / 10.0)
             target_sigma_rms = torch.sqrt(sig_pow / torch.clamp(ratio_snr, min=1e-12))
 
-            cur_sigma_rms = torch.sqrt(torch.mean(noise_sigma_data ** 2, dim=(-2, -1), keepdim=True))
+            cur_sigma_rms = torch.sqrt(torch.mean(noise_sigma_data ** 2, dim=reduce_dims, keepdim=True))
             safe_cur_rms = torch.clamp(cur_sigma_rms, min=1e-12)
             scaled_noise = (noise_sigma_data / safe_cur_rms) * target_sigma_rms
             target_noise_sigma = torch.where(cur_sigma_rms > 1e-12, scaled_noise, target_sigma_rms.expand_as(noise_sigma_data))
@@ -1289,8 +1415,8 @@ class SCBatchSynthesizer(torch.nn.Module):
         uncorrupt_sigma = torch.zeros_like(noise_sigma_data) if self.only_additive_noise else noise_sigma_data
         eff_noise_sigma = torch.where(is_corrupt, corrupt_sigma, uncorrupt_sigma).float()
 
-        noise_pow = torch.mean(eff_noise_sigma ** 2, dim=(-2, -1), keepdim=True)
-        snr_db_tensor = (10.0 * torch.log10(sig_pow / torch.clamp(noise_pow, min=1e-12)).squeeze(-1)).float()
+        noise_pow = torch.mean(eff_noise_sigma ** 2, dim=reduce_dims, keepdim=True)
+        snr_db_tensor = (10.0 * torch.log10(sig_pow / torch.clamp(noise_pow, min=1e-12)).view(B, 1)).float()
 
         return eff_noise_sigma, snr_db_tensor
 
@@ -1343,12 +1469,18 @@ class SCBatchSynthesizer(torch.nn.Module):
         if torch.is_tensor(noise_seeds):
             noise_seeds = noise_seeds.tolist()
 
-        if raw_h.ndim == 4: # (B, 2, T, 48)
+        if torch.is_complex(raw_h):
+            h_complex = raw_h.to(torch.complex64)
+        elif self.channel_type == 'awgn':
+            half_c = raw_h.shape[1] // 2
+            h_complex = torch.complex(raw_h[:, :half_c].float(), raw_h[:, half_c:].float())
+        elif raw_h.ndim == 4:  # (B, 2, T, 48)
             h_complex = torch.complex(raw_h[:, 0].float(), raw_h[:, 1].float())
         else:
             h_complex = raw_h.to(torch.complex64)
 
-        B, T, C = h_complex.shape
+        B = h_complex.shape[0]
+        reduce_dims = tuple(range(1, h_complex.ndim))
 
         # 1) Deterministic Effective Noise & SNR
         eff_noise_sigma, snr_batch = self._compute_deterministic_noise_sigma(h_complex, raw_noise, idx_list)
@@ -1370,6 +1502,7 @@ class SCBatchSynthesizer(torch.nn.Module):
             features = self.encoder(img_batch, encoder_snr_batch)
 
         # 4) Latent Complex Conversion & Power Normalization & Shape Matching
+        _, tcn_feat, h_feat, w_feat = features.shape
         f = features.reshape(B, -1)
         dim_z = f.shape[1] // 2
         z_in = torch.complex(f[:, :dim_z], f[:, dim_z:])
@@ -1379,34 +1512,43 @@ class SCBatchSynthesizer(torch.nn.Module):
             scale = torch.sqrt(dim_z / torch.clamp(norm_factor, min=1e-8))
             z_in = z_in * scale
 
-        target_numel = T * C
-        if dim_z == target_numel:
-            z_matched = z_in.reshape(B, T, C)
-        elif self.matching_mode == 'interpolate':
-            real_1d = z_in.real.unsqueeze(1)
-            imag_1d = z_in.imag.unsqueeze(1)
-            real_interp = F.interpolate(real_1d, size=target_numel, mode='linear', align_corners=False).squeeze(1)
-            imag_interp = F.interpolate(imag_1d, size=target_numel, mode='linear', align_corners=False).squeeze(1)
-            z_matched = torch.complex(real_interp, imag_interp).reshape(B, T, C)
-        elif self.matching_mode == 'pad_or_slice':
-            if dim_z < target_numel:
-                padding = torch.zeros((B, target_numel - dim_z), dtype=z_in.dtype, device=z_in.device)
-                z_res = torch.cat([z_in, padding], dim=1)
-            else:
-                z_res = z_in[:, :target_numel]
-            z_matched = z_res.reshape(B, T, C)
-        elif self.matching_mode == 'repeat':
-            repeat_factor = int(np.ceil(target_numel / dim_z))
-            z_rep = z_in.repeat(1, repeat_factor)[:, :target_numel]
-            z_matched = z_rep.reshape(B, T, C)
+        if self.channel_type == 'awgn':
+            # AWGN 모드: (T, 48) 그리드 매칭 없이 인코더 출력 형태 (B, tcn//2, H_out, W_out) 유지
+            z_matched = z_in.reshape(B, tcn_feat // 2, h_feat, w_feat)
+            if h_complex.shape != z_matched.shape:
+                h_complex = torch.ones_like(z_matched)
+                eff_noise_sigma = eff_noise_sigma.reshape(B, -1)[:, :1].view(B, 1, 1, 1).expand_as(z_matched.real)
+                reduce_dims = tuple(range(1, z_matched.ndim))
         else:
-            raise ValueError(f"Unknown matching_mode: {self.matching_mode}")
+            T, C = h_complex.shape[1], h_complex.shape[2]
+            target_numel = T * C
+            if dim_z == target_numel:
+                z_matched = z_in.reshape(B, T, C)
+            elif self.matching_mode == 'interpolate':
+                real_1d = z_in.real.unsqueeze(1)
+                imag_1d = z_in.imag.unsqueeze(1)
+                real_interp = F.interpolate(real_1d, size=target_numel, mode='linear', align_corners=False).squeeze(1)
+                imag_interp = F.interpolate(imag_1d, size=target_numel, mode='linear', align_corners=False).squeeze(1)
+                z_matched = torch.complex(real_interp, imag_interp).reshape(B, T, C)
+            elif self.matching_mode == 'pad_or_slice':
+                if dim_z < target_numel:
+                    padding = torch.zeros((B, target_numel - dim_z), dtype=z_in.dtype, device=z_in.device)
+                    z_res = torch.cat([z_in, padding], dim=1)
+                else:
+                    z_res = z_in[:, :target_numel]
+                z_matched = z_res.reshape(B, T, C)
+            elif self.matching_mode == 'repeat':
+                repeat_factor = int(np.ceil(target_numel / dim_z))
+                z_rep = z_in.repeat(1, repeat_factor)[:, :target_numel]
+                z_matched = z_rep.reshape(B, T, C)
+            else:
+                raise ValueError(f"Unknown matching_mode: {self.matching_mode}")
 
-        power_z = torch.mean(torch.abs(z_matched) ** 2, dim=(-2, -1), keepdim=True)
+        power_z = torch.mean(torch.abs(z_matched) ** 2, dim=reduce_dims, keepdim=True)
         z_matched = z_matched / torch.sqrt(torch.clamp(power_z, min=1e-12))
 
         # 5) Deterministic Gaussian Noise N & Channel Reception
-        rx_noise = self._generate_deterministic_noise((B, T, C), noise_seeds, eff_noise_sigma)
+        rx_noise = self._generate_deterministic_noise(tuple(z_matched.shape), noise_seeds, eff_noise_sigma)
 
         if self.channel_type == 'slow_fading_eq':
             h_mag = torch.abs(h_complex)
@@ -1415,6 +1557,10 @@ class SCBatchSynthesizer(torch.nn.Module):
             eq_noise = rx_noise / h_safe
             rx_signal = z_matched + eq_noise
             raw_sigma = (eff_noise_sigma / torch.clamp(h_mag, min=eps)).float()
+            clean_target = z_matched
+        elif self.channel_type == 'awgn':
+            rx_signal = z_matched + rx_noise
+            raw_sigma = eff_noise_sigma.float()
             clean_target = z_matched
         else:
             rx_noiseless = h_complex * z_matched
@@ -1425,12 +1571,14 @@ class SCBatchSynthesizer(torch.nn.Module):
         # 6) Noise reduction
         if self.noise_mean_flag:
             if self.noise_mean_alter_way:
-                out_sigma = torch.sqrt(torch.mean(raw_sigma ** 2, dim=(-2, -1)))
+                out_sigma = torch.sqrt(torch.mean(raw_sigma ** 2, dim=reduce_dims))
             else:
-                out_sigma = torch.mean(raw_sigma, dim=(-2, -1))
+                out_sigma = torch.mean(raw_sigma, dim=reduce_dims)
         else:
             if self.view_as_complex:
                 out_sigma = raw_sigma
+            elif self.channel_type == 'awgn':
+                out_sigma = torch.cat([raw_sigma, raw_sigma], dim=1)
             else:
                 out_sigma = torch.stack([raw_sigma, raw_sigma], dim=1)
 
@@ -1440,6 +1588,11 @@ class SCBatchSynthesizer(torch.nn.Module):
             out_clean_channel = h_complex
             out_latent = z_matched
             out_label = clean_target if self.use_labels else torch.zeros((B, 0), device=self.device)
+        elif self.channel_type == 'awgn':
+            out_image = torch.cat([rx_signal.real, rx_signal.imag], dim=1).float()
+            out_clean_channel = torch.cat([h_complex.real, h_complex.imag], dim=1).float()
+            out_latent = torch.cat([z_matched.real, z_matched.imag], dim=1).float()
+            out_label = torch.cat([clean_target.real, clean_target.imag], dim=1).float() if self.use_labels else torch.zeros((B, 0), device=self.device)
         else:
             out_image = torch.stack([rx_signal.real, rx_signal.imag], dim=1).float()
             out_clean_channel = torch.stack([h_complex.real, h_complex.imag], dim=1).float()

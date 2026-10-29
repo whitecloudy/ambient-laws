@@ -49,7 +49,7 @@ def parse_int_list(s):
 # Main options.
 @click.option('--task',          help='Current task',         metavar='STR',                        type=str, default='RENEW_SC', show_default=True)
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
-@click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
+@click.option('--data',          help='Path to the dataset (not required when --sc_channel_type=awgn)', metavar='ZIP|DIR', type=str, required=False, default=None)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ddpmpp_256|ddpmpp_192|ddpmpp_64|rf_dit|rf_dit_large|rf_dit_small|rf_dit_real|rf_dit_real_large|rf_dit_real_deep|rf_dit_real_small',          type=str, default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler|edm_with_latent_z',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler', 'edm_with_latent_z']), default='edm', show_default=True)
@@ -125,7 +125,7 @@ def parse_int_list(s):
 @click.option('--sc_t', help='Number of time steps T for RENEW_SC (None to auto-calculate from adjscc_config image size and compression level).', type=int, default=None, show_default=True)
 @click.option('--sc_dataset_len', help='Fixed dataset length for RENEW_SC (None for default).', type=int, default=None, show_default=True)
 @click.option('--matching_mode', help='Latent to RF channel matching mode for RENEW_SC.', type=click.Choice(['interpolate', 'pad_or_slice', 'repeat']), default='interpolate', show_default=True)
-@click.option('--sc_channel_type', help='Channel type for RENEW_SC: "slow_fading" (standard Y = H*Z + N) or "slow_fading_eq" (Zero-Forcing equalization Y/H = Z + N/H with dimensional noise).', type=click.Choice(['slow_fading', 'slow_fading_eq']), default='slow_fading', show_default=True)
+@click.option('--sc_channel_type', help='Channel type for SC: "slow_fading" (Y = H*Z + N), "slow_fading_eq" (Y/H = Z + N/H), or "awgn" (Y = Z + N without RENEW channel).', type=click.Choice(['slow_fading', 'slow_fading_eq', 'awgn']), default='slow_fading', show_default=True)
 @click.option('--slow_fading_eq', help='Shortcut flag to enable slow_fading_eq channel equalization for RENEW_SC.', is_flag=True, default=False)
 @click.option('--encoder_snr_range', help='Feed uniform random SNR to SC encoder in range (min,max) in dB (e.g. "-5,20"). If None, uses RENEW channel SNR.', type=str, default=None, show_default=True)
 
@@ -220,8 +220,10 @@ def main(**kwargs):
         wandb_id = wandb_run.id
         dist.print0(f"Wandb ID: {wandb_id}")
 
-    # Dataset kwargs for Semantic Communication (RENEW_SC)
+    # Dataset kwargs for Semantic Communication (RENEW_SC / AWGN_SC)
     sc_channel = 'slow_fading_eq' if opts.slow_fading_eq else opts.sc_channel_type
+    if sc_channel != 'awgn' and opts.data is None:
+        raise click.ClickException('--data is required unless --sc_channel_type=awgn is specified.')
     c.dataset_kwargs = dnnlib.EasyDict(
         path=opts.data,
         renew_path=opts.data,

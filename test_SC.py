@@ -243,7 +243,7 @@ class PairedSCTestDataset(Dataset):
 @click.option('--config_json',              help='Network training options JSON filename', metavar='PATH', type=str, default=None)
 @click.option('--adjscc_config',            help='Path to ADJSCC config JSON/YAML file', type=str, default='misc/ADJSCC/config_example.json')
 @click.option('--adjscc_model_path',        help='Explicit path to ADJSCC checkpoint .pt', type=str, default=None)
-@click.option('--data',                     help='Path to RENEW RF CSI dataset npz directory', metavar='DIR', type=str, required=True)
+@click.option('--data',                     help='Path to RENEW RF CSI dataset npz directory (not required when channel_type is awgn)', metavar='DIR', type=str, required=False, default=None)
 @click.option('--data_norm',                help='Data normalization value for the RF data (default: auto from config)', type=float, default=None)
 @click.option('--cifar_data',               help='Root path for CIFAR-10 test data', type=str, default='./data')
 @click.option('--using_train_image',        help='Use train image instead of test image', is_flag=True)
@@ -273,7 +273,7 @@ class PairedSCTestDataset(Dataset):
 @click.option('--force_no_nn_scheduler',   help='Force noise scheduling to operate in no_nn_scheduler mode', is_flag=True)
 @click.option('--scheduler_mode',           help='Override scheduler mode for the network', type=str, default=None)
 @click.option('--padding_power2',          help='Pad channel dimensions to power of 2 for U-Net', is_flag=True)
-@click.option('--channel_type',            help='Override channel type (slow_fading_eq or slow_fading)', type=str, default=None)
+@click.option('--channel_type',            help='Override channel type (slow_fading_eq, slow_fading, or awgn)', type=click.Choice(['slow_fading', 'slow_fading_eq', 'awgn']), default=None)
 @click.option('--slow_fading_eq',          help='Explicitly set slow_fading_eq flag', type=bool, default=None)
 def main(**kwargs):
     # Enable line buffering so tqdm updates immediately in torchrun / multi-GPU pipes
@@ -330,10 +330,15 @@ def main(**kwargs):
     inferred_channel_type = ds_kwargs.get('channel_type', 'slow_fading_eq')
     inferred_slow_fading_eq = ds_kwargs.get('slow_fading_eq', (inferred_channel_type == 'slow_fading_eq'))
 
-    channel_type = opt.channel_type if opt.channel_type is not None else inferred_channel_type
+    channel_type = str(opt.channel_type if opt.channel_type is not None else inferred_channel_type).lower().strip()
     slow_fading_eq = opt.slow_fading_eq if opt.slow_fading_eq is not None else (
-        opt.channel_type == 'slow_fading_eq' if opt.channel_type is not None else inferred_slow_fading_eq
+        channel_type == 'slow_fading_eq' if opt.channel_type is not None else inferred_slow_fading_eq
     )
+    if slow_fading_eq and opt.channel_type is None:
+        channel_type = 'slow_fading_eq'
+    is_awgn = (channel_type == 'awgn')
+    if not is_awgn and opt.data is None:
+        raise click.ClickException('--data is required unless channel_type is "awgn".')
 
     # Data normalization value
     inferred_data_norm = float(ds_kwargs.get('normalize_value', 1.0))
@@ -383,7 +388,10 @@ def main(**kwargs):
     dist.print0('Initializing CIFAR-10 test dataset...')
     cifar_test_ds = get_cifar10_test_dataset(opt.cifar_data)
 
-    dist.print0(f'Initializing RENEW RF Channel dataset from "{opt.data}" (normalize_value={data_norm})...')
+    if is_awgn:
+        dist.print0('Initializing AWGN Channel dataset (H = 1 + 0j, no RENEW data)...')
+    else:
+        dist.print0(f'Initializing RENEW RF Channel dataset from "{opt.data}" (normalize_value={data_norm})...')
     renew_channel_ds = RenewChannelDataset(
         renew_path=opt.data,
         adjscc_config=adjscc_cfg,
@@ -394,6 +402,8 @@ def main(**kwargs):
         dataset_keep_percentage=opt.data_keep_ratio,
         flip_keep_dataset=opt.flip_dataset,
         normalize_value=data_norm,
+        channel_type=channel_type,
+        slow_fading_eq=slow_fading_eq,
     )
 
     paired_test_ds = PairedSCTestDataset(
@@ -516,24 +526,29 @@ def main(**kwargs):
                 B = x_clean.shape[0]
 
                 # Convert H to complex
-                if raw_h.ndim == 4:
+                if torch.is_complex(raw_h):
+                    h_complex = raw_h.to(torch.complex64)
+                elif is_awgn:
+                    half_c = raw_h.shape[1] // 2
+                    h_complex = torch.complex(raw_h[:, :half_c].float(), raw_h[:, half_c:].float())
+                elif raw_h.ndim == 4:
                     h_complex = torch.complex(raw_h[:, 0].float(), raw_h[:, 1].float())
                 else:
                     h_complex = raw_h.to(torch.complex64)
-                B, T, C = h_complex.shape
 
                 # Codec SNR Tensor
                 snr_tensor = torch.full((B, 1), codec_snr_val, device=device, dtype=torch.float32)
 
                 # 1) ADJSCC Encoder Forward
                 if is_h_module:
-                    h_mean_real = torch.mean(h_complex.real, dim=(-2, -1), keepdim=True).view(B, 1)
-                    h_mean_imag = torch.mean(h_complex.imag, dim=(-2, -1), keepdim=True).view(B, 1)
+                    h_mean_real = torch.mean(h_complex.real.reshape(B, -1), dim=-1, keepdim=True)
+                    h_mean_imag = torch.mean(h_complex.imag.reshape(B, -1), dim=-1, keepdim=True)
                     features = encoder(x_clean, snr_tensor, h_mean_real, h_mean_imag)
                 else:
                     features = encoder(x_clean, snr_tensor)
 
                 # 2) Complex Conversion & Power Normalization
+                _, tcn_feat, h_feat, w_feat = features.shape
                 f = features.reshape(B, -1)
                 dim_z = f.shape[1] // 2
                 z_in = torch.complex(f[:, :dim_z], f[:, dim_z:])
@@ -543,36 +558,45 @@ def main(**kwargs):
                 scale = torch.sqrt(dim_z / torch.clamp(norm_factor, min=1e-8))
                 z_in = z_in * scale
 
-                # 3) Latent Shape Matching to (B, T, C)
-                target_numel = T * C
-                if dim_z == target_numel:
-                    z_matched = z_in.reshape(B, T, C)
+                # 3) Latent Shape Matching (AWGN mode skips (T, 48) grid matching)
+                if is_awgn:
+                    z_matched = z_in.reshape(B, tcn_feat // 2, h_feat, w_feat)
+                    target_numel = dim_z
+                    if h_complex.shape != z_matched.shape:
+                        h_complex = torch.ones_like(z_matched)
                 else:
-                    real_1d = z_in.real.unsqueeze(1)
-                    imag_1d = z_in.imag.unsqueeze(1)
-                    real_interp = F.interpolate(real_1d, size=target_numel, mode='linear', align_corners=False).squeeze(1)
-                    imag_interp = F.interpolate(imag_1d, size=target_numel, mode='linear', align_corners=False).squeeze(1)
-                    z_matched = torch.complex(real_interp, imag_interp).reshape(B, T, C)
+                    T, C = h_complex.shape[1], h_complex.shape[2]
+                    target_numel = T * C
+                    if dim_z == target_numel:
+                        z_matched = z_in.reshape(B, T, C)
+                    else:
+                        real_1d = z_in.real.unsqueeze(1)
+                        imag_1d = z_in.imag.unsqueeze(1)
+                        real_interp = F.interpolate(real_1d, size=target_numel, mode='linear', align_corners=False).squeeze(1)
+                        imag_interp = F.interpolate(imag_1d, size=target_numel, mode='linear', align_corners=False).squeeze(1)
+                        z_matched = torch.complex(real_interp, imag_interp).reshape(B, T, C)
 
-                power_z = torch.mean(torch.abs(z_matched) ** 2, dim=(-2, -1), keepdim=True)
+                reduce_dims = tuple(range(1, z_matched.ndim))
+                power_z = torch.mean(torch.abs(z_matched) ** 2, dim=reduce_dims, keepdim=True)
                 z_matched = z_matched / torch.sqrt(torch.clamp(power_z, min=1e-12))
 
                 # 4) Wireless Channel Transmission & Noise Synthesis
                 ratio_snr = 10.0 ** (snr_db_val / 10.0)
+                bcast_shape = [B] + [1] * (z_matched.ndim - 1)
 
-                if slow_fading_eq:
+                if slow_fading_eq or is_awgn:
                     clean_target_signal = z_matched
-                    sig_pow = torch.ones((B, 1, 1), device=device, dtype=torch.float32)
+                    sig_pow = torch.ones(bcast_shape, device=device, dtype=torch.float32)
                 else:
                     rx_noiseless = h_complex * z_matched
                     clean_target_signal = rx_noiseless
-                    sig_pow = torch.mean(torch.abs(rx_noiseless) ** 2, dim=(-2, -1), keepdim=True)
+                    sig_pow = torch.mean(torch.abs(rx_noiseless) ** 2, dim=reduce_dims, keepdim=True)
 
                 # Complex Gaussian noise standard deviation per real/imag dimension
                 eff_sigma = torch.sqrt(sig_pow / (ratio_snr * 2.0)).float()
 
-                noise_r = torch.randn((B, T, C), device=device, dtype=torch.float32) * eff_sigma
-                noise_i = torch.randn((B, T, C), device=device, dtype=torch.float32) * eff_sigma
+                noise_r = torch.randn(z_matched.shape, device=device, dtype=torch.float32) * eff_sigma
+                noise_i = torch.randn(z_matched.shape, device=device, dtype=torch.float32) * eff_sigma
                 rx_noise = torch.complex(noise_r, noise_i)
 
                 eps = 1e-6
@@ -585,14 +609,18 @@ def main(**kwargs):
                     raw_sigma = (torch.sqrt(eff_sigma ** 2 * 2.0) / torch.clamp(h_mag, min=eps)).float()
                 else:
                     rx_signal = clean_target_signal + rx_noise
-                    raw_sigma = (torch.sqrt(eff_sigma ** 2 * 2.0)).expand(B, T, C).float()
+                    raw_sigma = (torch.sqrt(eff_sigma ** 2 * 2.0)).expand_as(z_matched.real).float()
 
-                # Sigma reduction (mean sigma across subcarriers & time)
-                input_sigma = torch.mean(raw_sigma, dim=(-2, -1)).float()
+                # Sigma reduction (mean sigma across spatial/channel dimensions)
+                input_sigma = torch.mean(raw_sigma, dim=reduce_dims).float()
 
                 # 5) Diffusion EDM Sampler Denoising
-                rx_input = torch.stack([rx_signal.real, rx_signal.imag], dim=1).float()
+                if is_awgn:
+                    rx_input = torch.cat([rx_signal.real, rx_signal.imag], dim=1).float()
+                else:
+                    rx_input = torch.stack([rx_signal.real, rx_signal.imag], dim=1).float()
 
+                orig_spatial_h, orig_spatial_w = rx_input.shape[-2], rx_input.shape[-1]
                 if opt.padding_power2:
                     padded_signal, _, orig_shape = pad_collate_fn(rx_input)
                     target_shape = (1,) + tuple(padded_signal.shape[1:])
@@ -613,14 +641,18 @@ def main(**kwargs):
                     )
 
                 if opt.padding_power2:
-                    denoised_signal = denoised_signal[:, :, :T, :C]
+                    denoised_signal = denoised_signal[:, :, :orig_spatial_h, :orig_spatial_w]
 
                 denoised_signal = denoised_signal.float()
-                denoised_target_signal = torch.complex(denoised_signal[:, 0], denoised_signal[:, 1])
+                if is_awgn:
+                    half_ch = denoised_signal.shape[1] // 2
+                    denoised_target_signal = torch.complex(denoised_signal[:, :half_ch], denoised_signal[:, half_ch:])
+                else:
+                    denoised_target_signal = torch.complex(denoised_signal[:, 0], denoised_signal[:, 1])
                 z_hat_complex = denoised_target_signal
 
                 # Equalize if regular slow_fading (MMSE regularized to avoid deep fade explosion)
-                if not slow_fading_eq:
+                if not slow_fading_eq and not is_awgn:
                     h_mag2 = torch.abs(h_complex) ** 2
                     eps_eq = 1e-4
                     z_hat_complex = (z_hat_complex * torch.conj(h_complex)) / (h_mag2 + eps_eq)
@@ -628,7 +660,7 @@ def main(**kwargs):
                 # 6) Inverse Shape Matching to (B, tcn, 8, 8)
                 def _inverse_match_and_decode(z_tensor: torch.Tensor) -> torch.Tensor:
                     z_tensor = torch.nan_to_num(z_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
-                    if target_numel == dim_z:
+                    if is_awgn or target_numel == dim_z:
                         z_unmatch = z_tensor.reshape(B, dim_z)
                     else:
                         r_flat = z_tensor.real.reshape(B, -1).unsqueeze(1)
@@ -637,7 +669,7 @@ def main(**kwargs):
                         i_inv = F.interpolate(i_flat, size=dim_z, mode='linear', align_corners=False).squeeze(1)
                         z_unmatch = torch.complex(r_inv, i_inv)
 
-                    f_dec = torch.cat([z_unmatch.real, z_unmatch.imag], dim=1).reshape(B, tcn, 8, 8)
+                    f_dec = torch.cat([z_unmatch.real, z_unmatch.imag], dim=1).reshape(B, tcn_feat, h_feat, w_feat)
                     # Clamp latent symbols before GDN to prevent exponential overflow in decoder
                     f_dec = torch.clamp(f_dec, min=-10.0, max=10.0)
                     if is_h_module:
@@ -662,7 +694,7 @@ def main(**kwargs):
                 # 7) Baselines Evaluation
                 if eval_baselines:
                     # No Diffusion: for slow_fading, use MMSE equalization to avoid deep fade noise amplification
-                    if slow_fading_eq:
+                    if slow_fading_eq or is_awgn:
                         z_nodiff = rx_signal
                     else:
                         h_mag2 = torch.abs(h_complex) ** 2

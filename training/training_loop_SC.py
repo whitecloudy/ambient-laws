@@ -301,7 +301,7 @@ def training_loop(
         if validation_kwargs.validation_data is not None:
             validation_dataset_kwargs['renew_path'] = validation_kwargs.validation_data
             validation_dataset_kwargs['dataset_keep_percentage'] = 1.0
-        else:
+        if validation_kwargs.validation_data is None or dataset_kwargs.get('channel_type') == 'awgn':
             validation_dataset_kwargs['seed'] = (seed + 9999) if seed is not None else 9999
         
         validation_dataset_obj = RenewChannelDataset(**validation_dataset_kwargs)
