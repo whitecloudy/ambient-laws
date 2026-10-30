@@ -574,6 +574,12 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
                 nn.SiLU(),
                 Linear(noise_channels * 2, noise_channels * 2, **init),
             )
+        elif label_dim != 0 and label_type == 'snr':
+            self.map_label = nn.Sequential(
+                Linear(label_dim, emb_channels, **init),
+                nn.SiLU(),
+                Linear(emb_channels, emb_channels, **init),
+            )
         else:
             self.map_label = None
 
@@ -713,12 +719,15 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
         if self.map_augment is not None and augment_labels is not None:
             emb = emb + self.map_augment(augment_labels.to(torch.float32))
 
+        snr_emb = None
         if self.map_label is not None:
             tmp = class_labels
             if (tmp is None or (isinstance(tmp, torch.Tensor) and tmp.ndim >= 2 and tmp.shape[-1] == 0)) and z is not None:
                 tmp = z
             if tmp is not None:
                 tmp = tmp.to(torch.float32)
+                if tmp.ndim == 1:
+                    tmp = tmp.unsqueeze(-1)
                 if self.training and self.label_dropout and self.label_type != 'no_label':
                     dropout_mask = (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
                     while dropout_mask.ndim < tmp.ndim:
@@ -730,9 +739,13 @@ class RF_DiT_Real(nn.Module, PyTorchModelHubMixin):
                 elif self.label_type == 'downlink':
                     label_emb = self.map_label(tmp)
                     emb = torch.cat([emb, label_emb], dim=1)
+                elif self.label_type == 'snr':
+                    snr_emb = self.map_label(tmp)
 
         emb = F.silu(self.map_layer0(emb))
         emb = F.silu(self.map_layer1(emb))
+        if snr_emb is not None:
+            emb = emb + snr_emb
 
         # 1. Stem
         x = self.stem(x)

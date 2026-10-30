@@ -301,7 +301,7 @@ def training_loop(
         if validation_kwargs.validation_data is not None:
             validation_dataset_kwargs['renew_path'] = validation_kwargs.validation_data
             validation_dataset_kwargs['dataset_keep_percentage'] = 1.0
-        if validation_kwargs.validation_data is None or dataset_kwargs.get('channel_type') == 'awgn':
+        if validation_kwargs.validation_data is None or dataset_kwargs.get('channel_type') in ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq'):
             validation_dataset_kwargs['seed'] = (seed + 9999) if seed is not None else 9999
         
         validation_dataset_obj = RenewChannelDataset(**validation_dataset_kwargs)
@@ -348,7 +348,7 @@ def training_loop(
         if hasattr(net, "generate_latent_z"):
             z, _ = net.generate_latent_z(images, sigma)
             labels = z
-        elif getattr(getattr(net, 'model', None), 'label_type', None) != 'no_label' and "label" in dataset_item and dataset_item["label"] is not None:
+        elif getattr(getattr(net, 'model', None), 'label_type', None) != 'no_label' and "label" in dataset_item and dataset_item["label"] is not None and dataset_item["label"].numel() > 0:
             labels = torch.zeros_like(dataset_item["label"]).to(device)
         else:
             labels = None

@@ -50,7 +50,7 @@ def parse_int_list(s):
 @click.option('--task',          help='Current task',         metavar='STR',                        type=str, default='RENEW_SC', show_default=True)
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset (not required when --sc_channel_type=awgn)', metavar='ZIP|DIR', type=str, required=False, default=None)
-@click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
+@click.option('--cond',          help='Condition diffusion model on SNR (label_type=snr)', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ddpmpp_256|ddpmpp_192|ddpmpp_64|rf_dit|rf_dit_large|rf_dit_small|rf_dit_real|rf_dit_real_large|rf_dit_real_deep|rf_dit_real_small',          type=str, default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|edm_dynamic|edm_boosted_sigma|edm_loss_scaling_test|edm_with_scheduler|edm_with_latent_z',       type=click.Choice(['vp', 've', 'edm', 'edm_dynamic', 'edm_boosted_sigma', 'edm_loss_scaling_test', 'edm_with_scheduler', 'edm_with_latent_z']), default='edm', show_default=True)
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
@@ -125,7 +125,7 @@ def parse_int_list(s):
 @click.option('--sc_t', help='Number of time steps T for RENEW_SC (None to auto-calculate from adjscc_config image size and compression level).', type=int, default=None, show_default=True)
 @click.option('--sc_dataset_len', help='Fixed dataset length for RENEW_SC (None for default).', type=int, default=None, show_default=True)
 @click.option('--matching_mode', help='Latent to RF channel matching mode for RENEW_SC.', type=click.Choice(['interpolate', 'pad_or_slice', 'repeat']), default='interpolate', show_default=True)
-@click.option('--sc_channel_type', help='Channel type for SC: "slow_fading" (Y = H*Z + N), "slow_fading_eq" (Y/H = Z + N/H), or "awgn" (Y = Z + N without RENEW channel).', type=click.Choice(['slow_fading', 'slow_fading_eq', 'awgn']), default='slow_fading', show_default=True)
+@click.option('--sc_channel_type', help='Channel type for SC: "slow_fading" (Y = H*Z + N), "slow_fading_eq" (Y/H = Z + N/H), "awgn" (Y = Z + N), "rayleigh_fading" (Y = H*Z + N with H ~ CN(0,1)), or "rayleigh_fading_eq" (Y/H = Z + N/H with H ~ CN(0,1)).', type=click.Choice(['slow_fading', 'slow_fading_eq', 'awgn', 'rayleigh_fading', 'rayleigh_fading_eq']), default='slow_fading', show_default=True)
 @click.option('--slow_fading_eq', help='Shortcut flag to enable slow_fading_eq channel equalization for RENEW_SC.', is_flag=True, default=False)
 @click.option('--encoder_snr_range', help='Feed uniform random SNR to SC encoder in range (min,max) in dB (e.g. "-5,20"). If None, uses RENEW channel SNR.', type=str, default=None, show_default=True)
 
@@ -220,10 +220,10 @@ def main(**kwargs):
         wandb_id = wandb_run.id
         dist.print0(f"Wandb ID: {wandb_id}")
 
-    # Dataset kwargs for Semantic Communication (RENEW_SC / AWGN_SC)
+    # Dataset kwargs for Semantic Communication (RENEW_SC / AWGN_SC / RAYLEIGH_SC)
     sc_channel = 'slow_fading_eq' if opts.slow_fading_eq else opts.sc_channel_type
-    if sc_channel != 'awgn' and opts.data is None:
-        raise click.ClickException('--data is required unless --sc_channel_type=awgn is specified.')
+    if sc_channel not in ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq') and opts.data is None:
+        raise click.ClickException('--data is required unless --sc_channel_type is awgn, rayleigh_fading, or rayleigh_fading_eq.')
     c.dataset_kwargs = dnnlib.EasyDict(
         path=opts.data,
         renew_path=opts.data,
@@ -296,7 +296,7 @@ def main(**kwargs):
     try:
         dataset_obj = RenewChannelDataset(**c.dataset_kwargs)
         dist.print0(f"[RENEW_SC] Time steps T = {dataset_obj.T} (auto-calculated: {opts.sc_t is None})")
-        dist.print0(f"[RENEW_SC] Channel type: {dataset_obj.channel_type} (equalization: {dataset_obj.channel_type == 'slow_fading_eq'})")
+        dist.print0(f"[RENEW_SC] Channel type: {dataset_obj.channel_type} (equalization: {dataset_obj.channel_type in ('slow_fading_eq', 'rayleigh_fading_eq')})")
         dataset_name = copy.copy(dataset_obj.name)
         c.dataset_kwargs.dataset_keep_percentage = opts.dataset_keep_percentage
         c.dataset_kwargs.max_size = int(len(dataset_obj) * opts.dataset_keep_percentage)
@@ -311,19 +311,19 @@ def main(**kwargs):
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label')
     elif opts.arch == 'ddpmpp_64_deep':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,4,4], label_type='downlink' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,4,4], label_type='snr' if opts.cond else 'no_label')
     elif opts.arch == 'ddpmpp_256':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label')
     elif opts.arch == 'ddpmpp_192':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label')
     elif opts.arch == 'ddpmpp_64':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label')
     elif opts.arch == 'rf_dit':
         c.network_kwargs.update(
             model_type='RF_DiT',
@@ -337,7 +337,7 @@ def main(**kwargs):
             causal_conv=True,
             pos_embed_type='learnable_2d',
             resample_filter=[1, 1],
-            label_type='downlink' if opts.cond else 'no_label',
+            label_type='snr' if opts.cond else 'no_label',
         )
     elif opts.arch == 'rf_dit_large':
         c.network_kwargs.update(
@@ -352,7 +352,7 @@ def main(**kwargs):
             causal_conv=True,
             pos_embed_type='learnable_2d',
             resample_filter=[1, 1],
-            label_type='downlink' if opts.cond else 'no_label',
+            label_type='snr' if opts.cond else 'no_label',
         )
     elif opts.arch == 'rf_dit_small':
         c.network_kwargs.update(
@@ -367,7 +367,7 @@ def main(**kwargs):
             causal_conv=True,
             pos_embed_type='learnable_2d',
             resample_filter=[1, 1],
-            label_type='downlink' if opts.cond else 'no_label',
+            label_type='snr' if opts.cond else 'no_label',
         )
     elif opts.arch == 'rf_dit_real':
         c.network_kwargs.update(
@@ -382,7 +382,7 @@ def main(**kwargs):
             causal_conv=True,
             pos_embed_type='learnable_2d',
             resample_filter=[1, 1],
-            label_type='downlink' if opts.cond else 'no_label',
+            label_type='snr' if opts.cond else 'no_label',
         )
     elif opts.arch == 'rf_dit_real_large':
         c.network_kwargs.update(
@@ -397,7 +397,7 @@ def main(**kwargs):
             causal_conv=True,
             pos_embed_type='learnable_2d',
             resample_filter=[1, 1],
-            label_type='downlink' if opts.cond else 'no_label',
+            label_type='snr' if opts.cond else 'no_label',
         )
     elif opts.arch == 'rf_dit_real_deep':
         c.network_kwargs.update(
@@ -412,7 +412,7 @@ def main(**kwargs):
             causal_conv=True,
             pos_embed_type='learnable_2d',
             resample_filter=[1, 1],
-            label_type='downlink' if opts.cond else 'no_label',
+            label_type='snr' if opts.cond else 'no_label',
         )
     elif opts.arch == 'rf_dit_real_small':
         c.network_kwargs.update(
@@ -427,7 +427,7 @@ def main(**kwargs):
             causal_conv=True,
             pos_embed_type='learnable_2d',
             resample_filter=[1, 1],
-            label_type='downlink' if opts.cond else 'no_label',
+            label_type='snr' if opts.cond else 'no_label',
         )
     else:
         raise ValueError(f'Unsupported architecture for Semantic Communication: {opts.arch}')
@@ -611,7 +611,7 @@ def main(**kwargs):
         dist.print0()
         dist.print0(f'Output directory:        {c.run_dir}')
         dist.print0(f'Dataset path:            {c.dataset_kwargs.path}')
-        dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
+        dist.print0(f'SNR-conditional:         {c.dataset_kwargs.use_labels}')
         dist.print0(f'Network architecture:    {opts.arch}')
         if opts.arch.startswith('rf_dit'):
             dist.print0(f'  Model channels:        {c.network_kwargs.get("model_channels", 64)}')

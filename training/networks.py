@@ -658,7 +658,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
         assert decoder_type in ['standard', 'skip']
-        assert label_type in ['downlink', 'classes', 'no_label']
+        assert label_type in ['downlink', 'classes', 'no_label', 'snr']
 
         super().__init__()
         self.label_dropout = label_dropout
@@ -721,6 +721,14 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 )
             elif self.label_type == 'classes':
                 self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init)
+            elif self.label_type == 'snr':
+                self.map_label = torch.nn.Sequential(
+                    OrderedDict([
+                        ("snr_linear0", Linear(in_features=label_dim, out_features=emb_channels, **init)),
+                        ("snr_silu", torch.nn.SiLU()),
+                        ("snr_linear1", Linear(in_features=emb_channels, out_features=emb_channels, **init)),
+                    ])
+                )
             elif self.label_type == 'no_label':
                 self.map_label = None
             else:  
@@ -852,8 +860,11 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             if self.dynamic_noise:
                 augment_emb = augment_emb.unsqueeze(-1).unsqueeze(-1)
             emb = emb + augment_emb
-        if self.map_label is not None:
+        snr_emb = None
+        if self.map_label is not None and class_labels is not None:
             tmp = class_labels
+            if tmp.ndim == 1:
+                tmp = tmp.unsqueeze(-1)
             # tmp shape: [B, K]
             if self.training and self.label_dropout and self.label_type != 'no_label':
                 dropout_mask = (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
@@ -881,6 +892,11 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 emb = emb + label_emb
                 # emb shape (dynamic_noise=True): [B, noise_channels, H, W]
                 # emb shape (dynamic_noise=False): [B, noise_channels]
+            elif self.label_type == 'snr':
+                # SNR conditioning: u = W_4 * SiLU(W_3 * zeta + b_3) + b_4 (Eq. 28)
+                snr_emb = self.map_label(tmp)
+                if self.dynamic_noise:
+                    snr_emb = snr_emb.unsqueeze(-1).unsqueeze(-1)
             elif self.label_type == 'no_label':
                 pass
             else:
@@ -893,6 +909,9 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         emb = silu(self.map_layer1(emb))
         # emb 최종 shape (dynamic_noise=True): [B, emb_channels, H, W]
         # emb 최종 shape (dynamic_noise=False): [B, emb_channels]
+        if snr_emb is not None:
+            # c = v + u (Eq. 29)
+            emb = emb + snr_emb
 
         # Encoder.
         skips = []
@@ -1585,6 +1604,8 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         **model_kwargs,                     # Keyword arguments for the underlying model.
     ):
         super().__init__()
+        if model_kwargs.get('label_type') == 'snr' and label_dim == 0:
+            label_dim = 1
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.label_dim = label_dim
@@ -1621,7 +1642,9 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         
         while sigma.ndim < x.ndim:
             sigma = sigma.unsqueeze(-1)
-        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32)
+        if class_labels is not None and isinstance(class_labels, torch.Tensor) and class_labels.ndim == 1 and self.label_dim == 1:
+            class_labels = class_labels.unsqueeze(-1)
+        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if (class_labels is None or (isinstance(class_labels, torch.Tensor) and class_labels.shape[-1] != self.label_dim)) else class_labels.to(torch.float32)
         dtype = torch.bfloat16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)

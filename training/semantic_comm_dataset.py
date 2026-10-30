@@ -412,7 +412,7 @@ class RenewSemanticCommunicationDataset(Dataset):
         self.in_channels = int(self.adjscc_config.get('in_channels', 3))
         self.load_model_path = adjscc_model_path or self.adjscc_config.get('load_model_path', None)
 
-        # 채널 유형 결정 ('slow_fading' vs 'slow_fading_eq' vs 'awgn')
+        # 채널 유형 결정 ('slow_fading' vs 'slow_fading_eq' vs 'awgn' vs 'rayleigh_fading' vs 'rayleigh_fading_eq')
         if slow_fading_eq:
             self.channel_type = 'slow_fading_eq'
         elif channel_type is not None:
@@ -422,23 +422,26 @@ class RenewSemanticCommunicationDataset(Dataset):
         else:
             self.channel_type = 'slow_fading'
 
+        self.is_synthetic_channel = self.channel_type in ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq')
+        self.is_rayleigh = self.channel_type in ('rayleigh_fading', 'rayleigh_fading_eq')
+        self.is_equalized = self.channel_type in ('slow_fading_eq', 'rayleigh_fading_eq')
         self.eq_epsilon = float(eq_epsilon)
 
         # dynamic_noise_sigma 및 noise_mean_flag 처리
-        # slow_fading_eq는 차원별 다양한 노이즈(varying dimensional noise)를 사용하므로
+        # slow_fading_eq / rayleigh_fading_eq는 차원별 다양한 노이즈(varying dimensional noise)를 사용하므로
         # 명시적으로 지정되지 않은 경우 기본적으로 dynamic_noise_sigma=True (noise_mean_flag=False)로 설정
         if dynamic_noise_sigma is not None:
             self.noise_mean_flag = not dynamic_noise_sigma
         elif noise_mean_flag is not None:
             self.noise_mean_flag = bool(noise_mean_flag)
-        elif self.channel_type == 'slow_fading_eq':
+        elif self.is_equalized:
             self.noise_mean_flag = False
         else:
             self.noise_mean_flag = True
         self.dynamic_noise_sigma = not self.noise_mean_flag
 
-        # 2. RENEW 기본 데이터셋 및 파일 초기화 (AWGN 모드가 아닐 때 기존 RENEW 클래스/함수 직접 활용)
-        if self.channel_type == 'awgn':
+        # 2. RENEW 기본 데이터셋 및 파일 초기화 (합성 채널 모드가 아닐 때 기존 RENEW 클래스/함수 직접 활용)
+        if self.is_synthetic_channel:
             self.base_renew = None
             self._renew_files = []
             if self.noise_mean_alter_way:
@@ -497,7 +500,7 @@ class RenewSemanticCommunicationDataset(Dataset):
                 )
                 self._renew_files = list(self.base_renew._fname)
             else:
-                raise ValueError("Either 'renew_dataset' or 'renew_path' (or 'path') must be provided when channel_type is not 'awgn'.")
+                raise ValueError("Either 'renew_dataset' or 'renew_path' (or 'path') must be provided when channel_type is not synthetic ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq').")
 
             self._renew_files = sorted(list(self._renew_files))
             if len(self._renew_files) == 0:
@@ -595,7 +598,7 @@ class RenewSemanticCommunicationDataset(Dataset):
         # 5. [image, RF channel, antenna, natural noise] 고유 조합 (Pairing Table) 생성
         if dataset_len is not None:
             self._dataset_len = int(dataset_len)
-        elif self.channel_type == 'awgn':
+        elif self.is_synthetic_channel:
             self._dataset_len = 160800
         else:
             # 기본적으로 (파일 수 * 시간 청크 수)를 데이터셋 길이로 설정
@@ -607,11 +610,15 @@ class RenewSemanticCommunicationDataset(Dataset):
 
     @property
     def name(self) -> str:
-        return 'AWGN_SC' if self.channel_type == 'awgn' else 'RENEW_SC'
+        if self.channel_type == 'awgn':
+            return 'AWGN_SC'
+        if self.is_rayleigh:
+            return 'RAYLEIGH_SC'
+        return 'RENEW_SC'
 
     @property
     def image_shape(self) -> List[int]:
-        if self.channel_type == 'awgn':
+        if self.is_synthetic_channel:
             if self.view_as_complex:
                 return [self.tcn // 2, self.h_out, self.w_out]
             return [self.tcn, self.h_out, self.w_out]
@@ -621,7 +628,7 @@ class RenewSemanticCommunicationDataset(Dataset):
 
     @property
     def num_channels(self) -> int:
-        if self.channel_type == 'awgn':
+        if self.is_synthetic_channel:
             return (self.tcn // 2) if self.view_as_complex else self.tcn
         if self.view_as_complex:
             return 1
@@ -629,20 +636,20 @@ class RenewSemanticCommunicationDataset(Dataset):
 
     @property
     def resolution(self) -> Tuple[int, int]:
-        if self.channel_type == 'awgn':
+        if self.is_synthetic_channel:
             return (self.h_out, self.w_out)
         return (self.T, 48)
 
     @property
     def label_shape(self) -> List[int]:
         if self.use_labels:
-            return self.image_shape
+            return [1,]
         return [0,]
 
     @property
     def label_dim(self) -> int:
         if self.use_labels:
-            return self.num_channels
+            return 1
         return 0
 
     @property
@@ -806,6 +813,14 @@ class RenewSemanticCommunicationDataset(Dataset):
             item_fname = 'awgn'
             h_clean_48 = np.ones((self.tcn // 2, self.h_out, self.w_out), dtype=np.complex64)
             noise_slice_48 = np.zeros((self.tcn // 2, self.h_out, self.w_out), dtype=np.float32)
+        elif self.is_rayleigh:
+            item_fname = self.channel_type
+            ch_shape = (self.tcn // 2, self.h_out, self.w_out)
+            h_gen = torch.Generator().manual_seed(int(noise_seed + 77777))
+            hr = torch.randn(ch_shape, generator=h_gen).numpy()
+            hi = torch.randn(ch_shape, generator=h_gen).numpy()
+            h_clean_48 = ((hr + 1j * hi) / np.sqrt(2.0)).astype(np.complex64)
+            noise_slice_48 = np.zeros(ch_shape, dtype=np.float32)
         else:
             item_fname = self._renew_files[file_idx]
 
@@ -840,8 +855,11 @@ class RenewSemanticCommunicationDataset(Dataset):
         # -------------------------------------------------------------
         # 2) RENEW corruption_collate_fn을 통한 노이즈 계산 및 SNR 산출
         # -------------------------------------------------------------
+        # Rayleigh fading에서는 E[|H|^2]=1, E[|Z|^2]=1 기준 평균 SNR로 노이즈 분산을 정의하므로
+        # 단위 전력 참조 배열을 넘겨 N_0 = 10^(-SNR_dB/10)이 정확히 산출되도록 함
+        corr_ref_image = np.ones_like(h_clean_48) if self.is_rayleigh else h_clean_48.copy()
         corr_item = {
-            'image': h_clean_48.copy(),
+            'image': corr_ref_image,
             'sigma': noise_slice_48.copy(),
             'idx': noise_seed,
         }
@@ -850,7 +868,7 @@ class RenewSemanticCommunicationDataset(Dataset):
         corruption_label = corr_res.get('corruption_label', 0)
 
         # ADJSCC 인코더 입력용 SNR 계산
-        sig_pow = float(np.mean(np.abs(h_clean_48) ** 2))
+        sig_pow = 1.0 if self.is_synthetic_channel else float(np.mean(np.abs(h_clean_48) ** 2))
         noise_pow = float(np.mean(eff_noise_sigma ** 2))
         snr_db = float(10.0 * np.log10(sig_pow / max(noise_pow, 1e-12)))
 
@@ -885,7 +903,7 @@ class RenewSemanticCommunicationDataset(Dataset):
             features = self.encoder(img_batch, encoder_snr_batch)
 
         # -------------------------------------------------------------
-        # 4) Latent 복소수 변환, 단위 전력 정규화, reshape (AWGN은 그리드 매칭 생략)
+        # 4) Latent 복소수 변환, 단위 전력 정규화, reshape (합성 채널은 그리드 매칭 생략)
         # -------------------------------------------------------------
         _, tcn_feat, h_feat, w_feat = features.shape
         f = features.reshape(1, -1)
@@ -898,8 +916,8 @@ class RenewSemanticCommunicationDataset(Dataset):
             z_in = z_in * torch.complex(scale, torch.zeros_like(scale))
 
         z_complex_1d = z_in.squeeze(0)
-        if self.channel_type == 'awgn':
-            # AWGN 모드: (T, 48) 그리드 매칭 없이 인코더 출력 형태 (tcn//2, H_out, W_out) 유지
+        if self.is_synthetic_channel:
+            # 합성 채널 모드(AWGN, Rayleigh): (T, 48) 그리드 매칭 없이 인코더 출력 형태 (tcn//2, H_out, W_out) 유지
             z_matched = z_complex_1d.reshape(tcn_feat // 2, h_feat, w_feat).cpu().numpy()
             power_z = np.mean(np.abs(z_matched) ** 2)
             if power_z > 1e-12:
@@ -912,10 +930,10 @@ class RenewSemanticCommunicationDataset(Dataset):
         # 5) 무선 채널 전송 및 RENEW NoiseMeanCollateFn 적용
         # -------------------------------------------------------------
         # corruption_collate_fn에서 기생성된 노이즈를 재사용하여 중복 난수 생성 방지
-        rx_noise = self._extract_rx_noise(corr_res, h_clean_48, noise_slice_48, noise_seed)
+        rx_noise = self._extract_rx_noise(corr_res, corr_ref_image, noise_slice_48, noise_seed)
 
-        if self.channel_type == 'slow_fading_eq':
-            # Zero-Forcing 채널 등화 (ADJSCC slow_fading_eq 모사):
+        if self.is_equalized:
+            # Zero-Forcing 채널 등화 (slow_fading_eq / rayleigh_fading_eq):
             # 수신된 신호에 미리 알고 있는 정확한 H를 나누어 신호 자체(Z)에서 채널 영향을 제거:
             # Y_eq = (H * Z + N) / H = Z + N / H
             h_mag = np.abs(h_clean_48)
@@ -930,10 +948,14 @@ class RenewSemanticCommunicationDataset(Dataset):
             rx_signal = z_matched + rx_noise
             raw_sigma = eff_noise_sigma.astype(np.float32)
         else:
-            # 기본 slow_fading: Y = H * Z + N
-            rx_noiseless = h_clean_48 * z_matched  # (T, 48) complex
+            # 기본 slow_fading / rayleigh_fading: Y = H * Z + N
+            rx_noiseless = h_clean_48 * z_matched
             rx_signal = rx_noiseless + rx_noise
             raw_sigma = eff_noise_sigma.astype(np.float32)
+
+        # 실수/허수 채널 분리 텐서(view_as_complex=False)에서는 각 실수 원소당 노이즈 표준편차가 sigma_C / sqrt(2)
+        if not self.view_as_complex:
+            raw_sigma = (raw_sigma / np.sqrt(2.0)).astype(np.float32)
 
         # RENEW의 NoiseMeanCollateFn 적용 (noise_mean_flag 및 noise_mean_alter_way 반영)
         mean_res = self.noise_mean_collate_fn([{'sigma': raw_sigma}])[0]['sigma']
@@ -945,21 +967,21 @@ class RenewSemanticCommunicationDataset(Dataset):
             # dynamic_noise_sigma=True: 차원별 노이즈 세기 유지
             if self.view_as_complex:
                 out_sigma = mean_res.astype(np.float32)
-            elif self.channel_type == 'awgn':
+            elif self.is_synthetic_channel:
                 out_sigma = np.concatenate([mean_res, mean_res], axis=0).astype(np.float32)
             else:
                 out_sigma = np.stack([mean_res, mean_res], axis=0).astype(np.float32)
 
         # -------------------------------------------------------------
         # 6) 출력 형태:
-        #    - AWGN 모드: [tcn, H_out, W_out] (예: [16, 8, 8], 그리드 매칭 없음)
+        #    - 합성 채널(AWGN, Rayleigh) 모드: [tcn, H_out, W_out] (예: [16, 8, 8], 그리드 매칭 없음)
         #    - RENEW 모드: [img/real, T, C] = [2, T, 48] (0: 실수부 Real, 1: 허수부 Imag)
         # -------------------------------------------------------------
         if self.view_as_complex:
             out_image = rx_signal.astype(np.complex64)
             out_clean_channel = h_clean_48.astype(np.complex64)
             out_latent = z_matched.astype(np.complex64)
-        elif self.channel_type == 'awgn':
+        elif self.is_synthetic_channel:
             out_image = np.concatenate([rx_signal.real, rx_signal.imag], axis=0).astype(np.float32)
             out_clean_channel = np.concatenate([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
             out_latent = np.concatenate([z_matched.real, z_matched.imag], axis=0).astype(np.float32)
@@ -969,10 +991,7 @@ class RenewSemanticCommunicationDataset(Dataset):
             out_latent = np.stack([z_matched.real, z_matched.imag], axis=0).astype(np.float32)
 
         if self.use_labels:
-            if self.channel_type in ('slow_fading_eq', 'awgn'):
-                out_label = out_latent
-            else:
-                out_label = out_clean_channel
+            out_label = np.array([float(encoder_snr_batch.item())], dtype=np.float32)
         else:
             out_label = np.zeros([0,], dtype=np.float32)
 
@@ -984,6 +1003,7 @@ class RenewSemanticCommunicationDataset(Dataset):
             'label': out_label,
             'sigma': out_sigma,
             'snr_db': np.float32(snr_db),
+            'encoder_snr_db': np.float32(encoder_snr_batch.item()),
             'source_image': img_tensor,
             'source_label': label,
             'antenna_idx': antenna_idx,
@@ -1041,9 +1061,11 @@ class RenewChannelDataset(Dataset):
         self.must_not_contain = must_not_contain
         self.flip_keep_dataset = bool(flip_keep_dataset)
         self.channel_type = 'slow_fading_eq' if slow_fading_eq else str(channel_type or 'slow_fading').lower().strip()
+        self.is_synthetic_channel = self.channel_type in ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq')
+        self.is_rayleigh = self.channel_type in ('rayleigh_fading', 'rayleigh_fading_eq')
 
-        # 1. Base RENEW dataset helper for file discovery & reading (skipped in AWGN mode)
-        if self.channel_type == 'awgn':
+        # 1. Base RENEW dataset helper for file discovery & reading (skipped in synthetic channel mode)
+        if self.is_synthetic_channel:
             self.base_renew = None
             self._renew_files = []
             self.n_frames = 0
@@ -1051,7 +1073,7 @@ class RenewChannelDataset(Dataset):
             self.raw_subcarriers = 48
         else:
             if self.path is None:
-                raise ValueError("RENEW dataset path ('renew_path' or 'path') is required when channel_type is not 'awgn'.")
+                raise ValueError("RENEW dataset path ('renew_path' or 'path') is required when channel_type is not synthetic ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq').")
             self.base_renew = renewRfProcessedDataset(
                 path=self.path,
                 normalize_value=self.normalize_value,
@@ -1090,7 +1112,7 @@ class RenewChannelDataset(Dataset):
         # 4. Build Pairing Table
         if dataset_len is not None:
             self._dataset_len = int(dataset_len)
-        elif self.channel_type == 'awgn':
+        elif self.is_synthetic_channel:
             self._dataset_len = 160800
         else:
             self._dataset_len = len(self._renew_files) * self.n_time_chunks
@@ -1121,11 +1143,15 @@ class RenewChannelDataset(Dataset):
 
     @property
     def name(self) -> str:
-        return 'AWGN_SC' if self.channel_type == 'awgn' else 'RENEW_SC'
+        if self.channel_type == 'awgn':
+            return 'AWGN_SC'
+        if self.is_rayleigh:
+            return 'RAYLEIGH_SC'
+        return 'RENEW_SC'
 
     @property
     def image_shape(self) -> List[int]:
-        if self.channel_type == 'awgn':
+        if self.is_synthetic_channel:
             if self.view_as_complex:
                 return [self.tcn // 2, self.h_out, self.w_out]
             return [self.tcn, self.h_out, self.w_out]
@@ -1135,25 +1161,25 @@ class RenewChannelDataset(Dataset):
 
     @property
     def num_channels(self) -> int:
-        if self.channel_type == 'awgn':
+        if self.is_synthetic_channel:
             return (self.tcn // 2) if self.view_as_complex else self.tcn
         return 1 if self.view_as_complex else 2
 
     @property
     def resolution(self) -> Tuple[int, int]:
-        if self.channel_type == 'awgn':
+        if self.is_synthetic_channel:
             return (self.h_out, self.w_out)
         return (self.T, 48)
 
     @property
     def label_shape(self) -> List[int]:
         if self.use_labels:
-            return self.image_shape
+            return [1,]
         return [0,]
 
     @property
     def label_dim(self) -> int:
-        return self.num_channels if self.use_labels else 0
+        return 1 if self.use_labels else 0
 
     @property
     def has_labels(self) -> bool:
@@ -1188,6 +1214,14 @@ class RenewChannelDataset(Dataset):
             item_fname = 'awgn'
             h_clean_48 = np.ones((self.tcn // 2, self.h_out, self.w_out), dtype=np.complex64)
             noise_slice_48 = np.zeros((self.tcn // 2, self.h_out, self.w_out), dtype=np.float32)
+        elif self.is_rayleigh:
+            item_fname = self.channel_type
+            ch_shape = (self.tcn // 2, self.h_out, self.w_out)
+            h_gen = torch.Generator().manual_seed(int(noise_seed + 77777))
+            hr = torch.randn(ch_shape, generator=h_gen).numpy()
+            hi = torch.randn(ch_shape, generator=h_gen).numpy()
+            h_clean_48 = ((hr + 1j * hi) / np.sqrt(2.0)).astype(np.complex64)
+            noise_slice_48 = np.zeros(ch_shape, dtype=np.float32)
         else:
             item_fname = self._renew_files[file_idx]
             raw_csi, raw_noise = self.base_renew._load_and_normalize(item_fname)
@@ -1209,7 +1243,7 @@ class RenewChannelDataset(Dataset):
 
         if self.view_as_complex:
             out_channel = h_clean_48.astype(np.complex64)
-        elif self.channel_type == 'awgn':
+        elif self.is_synthetic_channel:
             out_channel = np.concatenate([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
         else:
             out_channel = np.stack([h_clean_48.real, h_clean_48.imag], axis=0).astype(np.float32)
@@ -1272,7 +1306,10 @@ class SCBatchSynthesizer(torch.nn.Module):
         self.device = torch.device(device)
         self.T = int(T)
         self.channel_type = 'slow_fading_eq' if slow_fading_eq else str(channel_type or 'slow_fading').lower().strip()
-        self.slow_fading_eq = (self.channel_type == 'slow_fading_eq')
+        self.is_synthetic_channel = self.channel_type in ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq')
+        self.is_rayleigh = self.channel_type in ('rayleigh_fading', 'rayleigh_fading_eq')
+        self.is_equalized = self.channel_type in ('slow_fading_eq', 'rayleigh_fading_eq')
+        self.slow_fading_eq = self.is_equalized
         self.matching_mode = matching_mode
         self.power_normalize_latent = power_normalize_latent
         self.view_as_complex = view_as_complex
@@ -1281,7 +1318,7 @@ class SCBatchSynthesizer(torch.nn.Module):
         self.snr_range = parse_snr_range(snr_range)
         self.additive_noise_sigma = float(additive_noise_sigma)
         self.multiply_noise_sigma = float(multiply_noise_sigma)
-        self.only_additive_noise = bool(only_additive_noise)
+        self.only_additive_noise = True if self.is_synthetic_channel else bool(only_additive_noise)
         self.corruption_probability_per_image = float(corruption_probability_per_image)
         self.noise_mean_flag = bool(noise_mean_flag)
         self.noise_mean_alter_way = bool(noise_mean_alter_way)
@@ -1390,7 +1427,11 @@ class SCBatchSynthesizer(torch.nn.Module):
         noise_sigma_data = noise_sigma_data.float()
 
         # Vectorized GPU tensor computation (Zero CPU-GPU stalls, zero .item() calls)
-        sig_pow = torch.mean(torch.abs(h_complex) ** 2, dim=reduce_dims, keepdim=True)
+        # 합성 채널(AWGN, Rayleigh fading)은 E[|H|^2]=1, E[|Z|^2]=1 기준 평균 SNR로 노이즈 분산을 산출
+        if self.is_synthetic_channel:
+            sig_pow = torch.ones(bcast_shape, device=self.device, dtype=torch.float32)
+        else:
+            sig_pow = torch.mean(torch.abs(h_complex) ** 2, dim=reduce_dims, keepdim=True)
 
         if self.snr_range is not None:
             ratio_snr = 10.0 ** (target_snr_db / 10.0)
@@ -1471,7 +1512,7 @@ class SCBatchSynthesizer(torch.nn.Module):
 
         if torch.is_complex(raw_h):
             h_complex = raw_h.to(torch.complex64)
-        elif self.channel_type == 'awgn':
+        elif self.is_synthetic_channel:
             half_c = raw_h.shape[1] // 2
             h_complex = torch.complex(raw_h[:, :half_c].float(), raw_h[:, half_c:].float())
         elif raw_h.ndim == 4:  # (B, 2, T, 48)
@@ -1512,11 +1553,20 @@ class SCBatchSynthesizer(torch.nn.Module):
             scale = torch.sqrt(dim_z / torch.clamp(norm_factor, min=1e-8))
             z_in = z_in * scale
 
-        if self.channel_type == 'awgn':
-            # AWGN 모드: (T, 48) 그리드 매칭 없이 인코더 출력 형태 (B, tcn//2, H_out, W_out) 유지
+        if self.is_synthetic_channel:
+            # 합성 채널(AWGN, Rayleigh) 모드: (T, 48) 그리드 매칭 없이 인코더 출력 형태 (B, tcn//2, H_out, W_out) 유지
             z_matched = z_in.reshape(B, tcn_feat // 2, h_feat, w_feat)
             if h_complex.shape != z_matched.shape:
-                h_complex = torch.ones_like(z_matched)
+                if self.is_rayleigh:
+                    h_list = []
+                    for b in range(B):
+                        h_gen = torch.Generator().manual_seed(int(noise_seeds[b] + 77777))
+                        hr = torch.randn(z_matched.shape[1:], generator=h_gen)
+                        hi = torch.randn(z_matched.shape[1:], generator=h_gen)
+                        h_list.append((hr + 1j * hi) / np.sqrt(2.0))
+                    h_complex = torch.stack(h_list, dim=0).to(self.device).cfloat()
+                else:
+                    h_complex = torch.ones_like(z_matched)
                 eff_noise_sigma = eff_noise_sigma.reshape(B, -1)[:, :1].view(B, 1, 1, 1).expand_as(z_matched.real)
                 reduce_dims = tuple(range(1, z_matched.ndim))
         else:
@@ -1550,7 +1600,7 @@ class SCBatchSynthesizer(torch.nn.Module):
         # 5) Deterministic Gaussian Noise N & Channel Reception
         rx_noise = self._generate_deterministic_noise(tuple(z_matched.shape), noise_seeds, eff_noise_sigma)
 
-        if self.channel_type == 'slow_fading_eq':
+        if self.is_equalized:
             h_mag = torch.abs(h_complex)
             eps = self.eq_epsilon
             h_safe = torch.where(h_mag < eps, eps * torch.exp(1j * torch.angle(h_complex)), h_complex)
@@ -1568,6 +1618,9 @@ class SCBatchSynthesizer(torch.nn.Module):
             raw_sigma = eff_noise_sigma.float()
             clean_target = h_complex
 
+        if not self.view_as_complex:
+            raw_sigma = (raw_sigma / np.sqrt(2.0)).float()
+
         # 6) Noise reduction
         if self.noise_mean_flag:
             if self.noise_mean_alter_way:
@@ -1577,27 +1630,25 @@ class SCBatchSynthesizer(torch.nn.Module):
         else:
             if self.view_as_complex:
                 out_sigma = raw_sigma
-            elif self.channel_type == 'awgn':
+            elif self.is_synthetic_channel:
                 out_sigma = torch.cat([raw_sigma, raw_sigma], dim=1)
             else:
                 out_sigma = torch.stack([raw_sigma, raw_sigma], dim=1)
 
         # 7) Output format
+        out_label = encoder_snr_batch.float() if self.use_labels else torch.zeros((B, 0), device=self.device)
         if self.view_as_complex:
             out_image = rx_signal
             out_clean_channel = h_complex
             out_latent = z_matched
-            out_label = clean_target if self.use_labels else torch.zeros((B, 0), device=self.device)
-        elif self.channel_type == 'awgn':
+        elif self.is_synthetic_channel:
             out_image = torch.cat([rx_signal.real, rx_signal.imag], dim=1).float()
             out_clean_channel = torch.cat([h_complex.real, h_complex.imag], dim=1).float()
             out_latent = torch.cat([z_matched.real, z_matched.imag], dim=1).float()
-            out_label = torch.cat([clean_target.real, clean_target.imag], dim=1).float() if self.use_labels else torch.zeros((B, 0), device=self.device)
         else:
             out_image = torch.stack([rx_signal.real, rx_signal.imag], dim=1).float()
             out_clean_channel = torch.stack([h_complex.real, h_complex.imag], dim=1).float()
             out_latent = torch.stack([z_matched.real, z_matched.imag], dim=1).float()
-            out_label = torch.stack([clean_target.real, clean_target.imag], dim=1).float() if self.use_labels else torch.zeros((B, 0), device=self.device)
 
         return {
             'image': out_image,
@@ -1606,4 +1657,5 @@ class SCBatchSynthesizer(torch.nn.Module):
             'clean_channel': out_clean_channel,
             'latent': out_latent,
             'snr_db': snr_batch.squeeze(1),
+            'encoder_snr_db': encoder_snr_batch.squeeze(1),
         }
