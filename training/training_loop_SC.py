@@ -289,6 +289,7 @@ def training_loop(
         image_corruption_seed=dataset_kwargs.get('image_corruption_seed', 112154),
         image_noise_seed=dataset_kwargs.get('image_noise_seed', 445481),
         seed=seed if seed is not None else 42,
+        normalize_value=dataset_kwargs.get('normalize_value', 1.0),
         encoder_snr_range=dataset_kwargs.get('encoder_snr_range', None),
     )
     if sc_synthesizer.encoder_uniform_snr:

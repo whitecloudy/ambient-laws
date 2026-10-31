@@ -23,6 +23,7 @@ import wandb
 import string
 import random
 import copy
+import numpy as np
 
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
 
@@ -102,7 +103,7 @@ def parse_int_list(s):
 
 # RF dataset related
 @click.option('--view_as_complex', help='Whether to view the data as complex numbers.', type=bool, default=False, show_default=True)
-@click.option('--data_norm', help='Data normalization value for the RF data.', type=float, default=1.0, show_default=True)
+@click.option('--data_norm', help='Data normalization value for the RF data (default: √2 for synthetic channels, 1.0 for RENEW).', type=float, default=None)
 @click.option('--flip_aug_ratio', help='Ratio of flip augmentation.', type=float, default=0.0, show_default=True)
 @click.option('--phase_shift_aug_ratio', help='Ratio of phase shift augmentation.', type=float, default=0.0, show_default=True)
 
@@ -222,8 +223,18 @@ def main(**kwargs):
 
     # Dataset kwargs for Semantic Communication (RENEW_SC / AWGN_SC / RAYLEIGH_SC)
     sc_channel = 'slow_fading_eq' if opts.slow_fading_eq else opts.sc_channel_type
-    if sc_channel not in ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq') and opts.data is None:
+    is_synthetic_channel = sc_channel in ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq')
+    if not is_synthetic_channel and opts.data is None:
         raise click.ClickException('--data is required unless --sc_channel_type is awgn, rayleigh_fading, or rayleigh_fading_eq.')
+
+    if opts.data_norm is not None:
+        data_norm = float(opts.data_norm)
+    elif is_synthetic_channel:
+        data_norm = float(np.sqrt(2.0))
+        dist.print0(f"[SC] Auto-setting data_norm = {data_norm:.6f} (sqrt(2)) for synthetic channel '{sc_channel}' to target EDM sigma_data=0.5")
+    else:
+        data_norm = 1.0
+
     c.dataset_kwargs = dnnlib.EasyDict(
         path=opts.data,
         renew_path=opts.data,
@@ -249,7 +260,7 @@ def main(**kwargs):
         must_contain=opts.must_contain,
         must_not_contain=opts.must_not_contain,
         snr_range=opts.snr_range,
-        normalize_value=opts.data_norm,
+        normalize_value=data_norm,
         use_labels=opts.cond,
         dataset_keep_percentage=opts.dataset_keep_percentage,
         encoder_snr_range=opts.encoder_snr_range,

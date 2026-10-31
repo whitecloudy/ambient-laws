@@ -344,8 +344,14 @@ def main(**kwargs):
         raise click.ClickException('--data is required unless channel_type is "awgn", "rayleigh_fading", or "rayleigh_fading_eq".')
 
     # Data normalization value
-    inferred_data_norm = float(ds_kwargs.get('normalize_value', 1.0))
-    data_norm = float(opt.data_norm) if opt.data_norm is not None else inferred_data_norm
+    if opt.data_norm is not None:
+        data_norm = float(opt.data_norm)
+    elif 'normalize_value' in ds_kwargs:
+        data_norm = float(ds_kwargs['normalize_value'])
+    elif is_synthetic_channel:
+        data_norm = float(np.sqrt(2.0))
+    else:
+        data_norm = 1.0
     dist.print0(f'Channel mode: channel_type="{channel_type}", equalized={is_equalized}, data_norm={data_norm}')
 
     # Noise Scheduler Mode
@@ -634,6 +640,11 @@ def main(**kwargs):
                 else:
                     rx_input = torch.stack([rx_signal.real, rx_signal.imag], dim=1).float()
 
+                # Scale synthetic channel inputs to match diffusion model trained with data_norm
+                if is_synthetic_channel and data_norm != 1.0:
+                    rx_input = rx_input / data_norm
+                    input_sigma = input_sigma / data_norm
+
                 orig_spatial_h, orig_spatial_w = rx_input.shape[-2], rx_input.shape[-1]
                 if opt.padding_power2:
                     padded_signal, _, orig_shape = pad_collate_fn(rx_input)
@@ -659,6 +670,11 @@ def main(**kwargs):
                     denoised_signal = denoised_signal[:, :, :orig_spatial_h, :orig_spatial_w]
 
                 denoised_signal = denoised_signal.float()
+
+                # De-normalize synthetic channel denoised output back to unit power for ADJSCC Decoder
+                if is_synthetic_channel and data_norm != 1.0:
+                    denoised_signal = denoised_signal * data_norm
+
                 if is_synthetic_channel:
                     half_ch = denoised_signal.shape[1] // 2
                     denoised_target_signal = torch.complex(denoised_signal[:, :half_ch], denoised_signal[:, half_ch:])

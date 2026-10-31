@@ -957,6 +957,13 @@ class RenewSemanticCommunicationDataset(Dataset):
         if not self.view_as_complex:
             raw_sigma = (raw_sigma / np.sqrt(2.0)).astype(np.float32)
 
+        # 합성 채널(AWGN, Rayleigh) 모드에서 EDM sigma_data(0.5) 목표 스케일링 적용
+        if self.is_synthetic_channel and self.normalize_value != 1.0:
+            rx_signal = (rx_signal / self.normalize_value).astype(np.complex64)
+            h_clean_48 = (h_clean_48 / self.normalize_value).astype(np.complex64)
+            z_matched = (z_matched / self.normalize_value).astype(np.complex64)
+            raw_sigma = (raw_sigma / self.normalize_value).astype(np.float32)
+
         # RENEW의 NoiseMeanCollateFn 적용 (noise_mean_flag 및 noise_mean_alter_way 반영)
         mean_res = self.noise_mean_collate_fn([{'sigma': raw_sigma}])[0]['sigma']
 
@@ -1241,6 +1248,10 @@ class RenewChannelDataset(Dataset):
             h_clean_48 = self._extract_48_subcarriers(h_slice)
             noise_slice_48 = np.broadcast_to(n_slice, (self.T, 48)).copy()
 
+        # 합성 채널(AWGN, Rayleigh) 모드에서 EDM sigma_data(0.5) 목표 스케일링 적용
+        if self.is_synthetic_channel and self.normalize_value != 1.0:
+            h_clean_48 = (h_clean_48 / self.normalize_value).astype(np.complex64)
+
         if self.view_as_complex:
             out_channel = h_clean_48.astype(np.complex64)
         elif self.is_synthetic_channel:
@@ -1299,11 +1310,13 @@ class SCBatchSynthesizer(torch.nn.Module):
         image_corruption_seed: int = 112154,
         image_noise_seed: int = 445481,
         seed: int = 42,
+        normalize_value: float = 1.0,
         encoder_snr_range: Optional[Union[str, Tuple[float, float], List[float]]] = None,
         **kwargs
     ):
         super().__init__()
         self.device = torch.device(device)
+        self.normalize_value = float(normalize_value)
         self.T = int(T)
         self.channel_type = 'slow_fading_eq' if slow_fading_eq else str(channel_type or 'slow_fading').lower().strip()
         self.is_synthetic_channel = self.channel_type in ('awgn', 'rayleigh_fading', 'rayleigh_fading_eq')
@@ -1620,6 +1633,14 @@ class SCBatchSynthesizer(torch.nn.Module):
 
         if not self.view_as_complex:
             raw_sigma = (raw_sigma / np.sqrt(2.0)).float()
+
+        # 합성 채널(AWGN, Rayleigh) 모드에서 EDM sigma_data(0.5) 목표 스케일링 적용
+        if self.is_synthetic_channel and self.normalize_value != 1.0:
+            rx_signal = rx_signal / self.normalize_value
+            clean_target = clean_target / self.normalize_value
+            h_complex = h_complex / self.normalize_value
+            z_matched = z_matched / self.normalize_value
+            raw_sigma = raw_sigma / self.normalize_value
 
         # 6) Noise reduction
         if self.noise_mean_flag:
