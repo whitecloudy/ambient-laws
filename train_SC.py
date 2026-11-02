@@ -299,7 +299,7 @@ def main(**kwargs):
 
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
-    c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8, weight_decay=opts.weight_decay)
+    c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.AdamW', lr=opts.lr, betas=[0.9,0.999], eps=1e-8, weight_decay=opts.weight_decay)
     c.lr_rampup_kimg = opts.lr_rampup_kimg
 
     dist.synchronize()
@@ -322,19 +322,19 @@ def main(**kwargs):
     # Network architecture.
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label', attn_resolutions=[4])
     elif opts.arch == 'ddpmpp_64_deep':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,4,4], label_type='snr' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,4,4], label_type='snr' if opts.cond else 'no_label', attn_resolutions=[4])
     elif opts.arch == 'ddpmpp_256':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=256, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label', attn_resolutions=[4])
     elif opts.arch == 'ddpmpp_192':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=192, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label', attn_resolutions=[4])
     elif opts.arch == 'ddpmpp_64':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,2,2], label_type='snr' if opts.cond else 'no_label', attn_resolutions=[4])
     elif opts.arch == 'rf_dit':
         c.network_kwargs.update(
             model_type='RF_DiT',

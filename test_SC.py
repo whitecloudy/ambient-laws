@@ -395,7 +395,7 @@ def main(**kwargs):
 
     # 4. Load Datasets
     dist.print0('Initializing CIFAR-10 test dataset...')
-    cifar_test_ds = get_cifar10_test_dataset(opt.cifar_data)
+    cifar_test_ds = get_cifar10_test_dataset(opt.cifar_data, using_train_image=opt.using_train_image)
 
     if is_awgn:
         dist.print0('Initializing AWGN Channel dataset (H = 1 + 0j, no RENEW data)...')

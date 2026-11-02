@@ -174,3 +174,4 @@ spectrograms/
 *.npz
 *.npy
 debug_test/*
+results/*

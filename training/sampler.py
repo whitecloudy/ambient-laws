@@ -26,17 +26,19 @@ def edm_sampler(
     # Time step discretization.
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device).reshape(-1, *[1]*latents.ndim)
     # Adjust noise levels based on what's supported by the network.
+    net_sigma_max = _get_net_attr(net, 'sigma_max', float('inf'))
+    net_sigma_min = _get_net_attr(net, 'sigma_min', 0.0)
     if isinstance(sigma_max, torch.Tensor):
         sigma_max = sigma_max.unsqueeze(0)
         sigma_max = sigma_max.expand([num_steps, ]+([-1, ]*(len(sigma_max.shape)-1)))
     else:
-        sigma_max = min(sigma_max, net.sigma_max)
+        sigma_max = min(sigma_max, net_sigma_max)
         
     if isinstance(sigma_min, torch.Tensor):
         sigma_min = sigma_min.unsqueeze(0)
         sigma_min = sigma_min.expand([num_steps, ]+([-1, ]*(len(sigma_min.shape)-1)))
     else:
-        sigma_min = max(sigma_min, net.sigma_min)
+        sigma_min = max(sigma_min, net_sigma_min)
         
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     step_indices = fit_shape(step_indices, sigma_max)
@@ -54,12 +56,12 @@ def edm_sampler(
     return x_next
 
 
-def _get_net_attr(n, name):
+def _get_net_attr(n, name, default=None):
     if hasattr(n, name):
         return getattr(n, name)
     elif hasattr(n, 'module') and hasattr(n.module, name):
         return getattr(n.module, name)
-    return None
+    return default
 
 def edm_sampler_with_scheduler(
     net, latents, class_labels=None,
@@ -99,12 +101,12 @@ def edm_sampler_with_scheduler(
             if isinstance(sigma_max, torch.Tensor):
                 sigma_max_t = sigma_max.unsqueeze(0).expand([num_steps, ]+([-1, ]*(len(sigma_max.shape)-1)))
             else:
-                sigma_max_t = min(sigma_max, getattr(net, 'sigma_max', 80))
+                sigma_max_t = min(sigma_max, _get_net_attr(net, 'sigma_max', 80))
                 
             if isinstance(sigma_min, torch.Tensor):
                 sigma_min_t = sigma_min.unsqueeze(0).expand([num_steps] + [-1] * len(sigma_min.shape))
             else:
-                sigma_min_t = max(sigma_min, getattr(net, 'sigma_min', 0.002))
+                sigma_min_t = max(sigma_min, _get_net_attr(net, 'sigma_min', 0.002))
                 
             step_indices = fit_shape(step_indices, sigma_max_t)
             step_indices = fit_shape(step_indices, sigma_min_t)
@@ -115,12 +117,12 @@ def edm_sampler_with_scheduler(
         if isinstance(sigma_max, torch.Tensor):
             sigma_max_t = sigma_max.unsqueeze(0).expand([num_steps] + [-1] * len(sigma_max.shape))
         else:
-            sigma_max_t = min(sigma_max, getattr(net, 'sigma_max', 80))
+            sigma_max_t = min(sigma_max, _get_net_attr(net, 'sigma_max', 80))
             
         if isinstance(sigma_min, torch.Tensor):
             sigma_min_t = sigma_min.unsqueeze(0).expand([num_steps] + [-1] * len(sigma_min.shape))
         else:
-            sigma_min_t = max(sigma_min, getattr(net, 'sigma_min', 0.002))
+            sigma_min_t = max(sigma_min, _get_net_attr(net, 'sigma_min', 0.002))
             
         step_indices = fit_shape(step_indices, sigma_max_t)
         step_indices = fit_shape(step_indices, sigma_min_t)
@@ -166,8 +168,8 @@ def inference_edm_sampler_with_scheduler(
     generate_latent_z_fn = _get_net_attr(net, "generate_latent_z")
 
     # Adjust noise levels based on what's supported by the network.
-    net_sigma_max = getattr(net, 'sigma_max', 80)
-    net_sigma_min = getattr(net, 'sigma_min', 0.002)
+    net_sigma_max = _get_net_attr(net, 'sigma_max', 80)
+    net_sigma_min = _get_net_attr(net, 'sigma_min', 0.002)
 
     raw_sigma_max = torch.clamp(sigma_max, max=net_sigma_max) if isinstance(sigma_max, torch.Tensor) else min(sigma_max, net_sigma_max)
     raw_sigma_min = torch.clamp(sigma_min, min=net_sigma_min) if isinstance(sigma_min, torch.Tensor) else max(sigma_min, net_sigma_min)
@@ -389,17 +391,21 @@ def inference_edm_sampler(
     padding_mask = torch.tensor(padding_mask, device=device)
 
     # Adjust noise levels based on what's supported by the network.
+    net_sigma_max = _get_net_attr(net, 'sigma_max', float('inf'))
+    net_sigma_min = _get_net_attr(net, 'sigma_min', 0.0)
+    round_sigma_fn = _get_net_attr(net, 'round_sigma', lambda s: torch.as_tensor(s))
+
     if isinstance(sigma_max, torch.Tensor):
-        sigma_max = torch.clamp(sigma_max, max=net.sigma_max).unsqueeze(0).to(device)
+        sigma_max = torch.clamp(sigma_max, max=net_sigma_max).unsqueeze(0).to(device)
         sigma_max = sigma_max.expand([num_steps, ]+([-1, ]*(len(sigma_max.shape)-1)))
     else:
-        sigma_max = min(sigma_max, net.sigma_max)
+        sigma_max = min(sigma_max, net_sigma_max)
         
     if isinstance(sigma_min, torch.Tensor):
-        sigma_min = torch.clamp(sigma_min, min=net.sigma_min).unsqueeze(0).to(device)
+        sigma_min = torch.clamp(sigma_min, min=net_sigma_min).unsqueeze(0).to(device)
         sigma_min = sigma_min.expand([num_steps, ]+([-1, ]*(len(sigma_min.shape)-1)))
     else:
-        sigma_min = max(sigma_min, net.sigma_min)
+        sigma_min = max(sigma_min, net_sigma_min)
 
     x_list = []
 
@@ -409,7 +415,7 @@ def inference_edm_sampler(
     step_indices = fit_shape(step_indices, sigma_min)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     
-    t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])], dim=0) # t_N = 0
+    t_steps = torch.cat([round_sigma_fn(t_steps), torch.zeros_like(t_steps[:1])], dim=0) # t_N = 0
     
     # Main sampling loop.
     t_next_0 = t_steps[0]
@@ -435,7 +441,7 @@ def inference_edm_sampler(
             gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
 
         t_cur_dynamic = t_cur
-        t_hat_dynamic = net.round_sigma(t_cur_dynamic + gamma * t_cur_dynamic)
+        t_hat_dynamic = round_sigma_fn(t_cur_dynamic + gamma * t_cur_dynamic)
         t_next_dynamic = t_next
         step_noise_scale = (t_hat_dynamic ** 2 - t_cur_dynamic ** 2).clamp(min=0).sqrt()
         step_noise_scale = fit_shape(step_noise_scale, x_cur)
