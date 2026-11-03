@@ -894,7 +894,7 @@ class RenewSemanticCommunicationDataset(Dataset):
 
         img_batch = img_tensor.unsqueeze(0).to(self.device)
         if self.encoder_uniform_snr:
-            enc_snr_val = float(np.random.uniform(self.encoder_snr_low, self.encoder_snr_high))
+            enc_snr_val = float(np.random.randint(int(self.encoder_snr_low), int(self.encoder_snr_high) + 1))
             encoder_snr_batch = torch.tensor([[enc_snr_val]], dtype=torch.float32, device=self.device)
         else:
             encoder_snr_batch = torch.tensor([[snr_db]], dtype=torch.float32, device=self.device)
@@ -1425,7 +1425,7 @@ class SCBatchSynthesizer(torch.nn.Module):
             corrupt = bool(np_gen.random() < self.corruption_probability_per_image)
             is_corrupt_list.append(corrupt)
             if self.snr_range is not None:
-                snr_val = float(np_gen.uniform(self.snr_range[0], self.snr_range[1]))
+                snr_val = float(np_gen.integers(int(self.snr_range[0]), int(self.snr_range[1]), endpoint=True))
             else:
                 snr_val = 0.0
             target_snr_list.append(snr_val)
@@ -1542,8 +1542,8 @@ class SCBatchSynthesizer(torch.nn.Module):
 
         # Determine SNR fed into SC Encoder
         if self.encoder_uniform_snr:
-            encoder_snr_batch = torch.empty((B, 1), device=self.device, dtype=torch.float32).uniform_(
-                self.encoder_snr_low, self.encoder_snr_high
+            encoder_snr_batch = torch.randint(
+                int(self.encoder_snr_low), int(self.encoder_snr_high) + 1, (B, 1), device=self.device, dtype=torch.float32
             )
         else:
             encoder_snr_batch = snr_batch

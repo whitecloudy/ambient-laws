@@ -764,7 +764,7 @@ class CorruptionCollateFn(object):
                     noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
 
                 if self.snr_range is not None:
-                    target_snr_db = np_gen.uniform(self.snr_range[0], self.snr_range[1])
+                    target_snr_db = float(np_gen.integers(int(self.snr_range[0]), int(self.snr_range[1]), endpoint=True))
                     ratio_snr = 10.0 ** (target_snr_db / 10.0)
 
                     signal_power = np.mean(np.abs(csi_data) ** 2)
@@ -863,7 +863,7 @@ class AlternativeCorruptionCollateFn(object):
                     noise_image = torch.randn(csi_data.shape, generator=torch_gen).numpy()
 
                 if self.snr_range is not None:
-                    target_snr_db = np_gen.uniform(self.snr_range[0], self.snr_range[1])
+                    target_snr_db = float(np_gen.integers(int(self.snr_range[0]), int(self.snr_range[1]), endpoint=True))
                     ratio_snr = 10.0 ** (target_snr_db / 10.0)
 
                     signal_power = np.mean(np.abs(csi_data) ** 2)

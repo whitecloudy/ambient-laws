@@ -522,7 +522,7 @@ def forward_stage3_pipeline(
 # Channel & SNR Settings
 @click.option('--channel_type',      help='Wireless channel type (awgn, rayleigh_fading, rayleigh_fading_eq, slow_fading, slow_fading_eq)', type=click.Choice(['slow_fading', 'slow_fading_eq', 'awgn', 'rayleigh_fading', 'rayleigh_fading_eq']), default=None)
 @click.option('--slow_fading_eq',    help='Explicit flag for slow_fading_eq', type=bool, default=None)
-@click.option('--snr_range',         help='SNR range (min,max) in dB for continuous uniform random sampling (e.g. "-2,10" or "0,20")', type=str, default=None)
+@click.option('--snr_range',         help='SNR range (min,max) in dB for discrete integer uniform random sampling (e.g. "-2,10" or "0,20")', type=str, default=None)
 @click.option('--fixed_codec_snr',   help='Fixed SNR (dB) conditioned to Encoder/Decoder during training/testing', type=float, default=None)
 @click.option('--data',              help='Path to RENEW RF CSI dataset npz directory (required for slow_fading channels)', metavar='DIR', type=str, default=None)
 @click.option('--data_norm',         help='Data normalization value for RF data', type=float, default=None)
@@ -905,11 +905,11 @@ def main(**kwargs):
             raw_h = batch['channel'].to(device)
             B = x_clean.shape[0]
 
-            # Uniform random continuous SNR sampling: zeta ~ U(snr_min, snr_max)
+            # Uniform random discrete integer SNR sampling: zeta ~ U(snr_min, snr_max)
             if opts.fixed_codec_snr is not None:
                 snr_tensor = torch.full((B, 1), float(opts.fixed_codec_snr), device=device, dtype=torch.float32)
             else:
-                rand_snr = torch.empty((B, 1), device=device, dtype=torch.float32).uniform_(snr_min, snr_max)
+                rand_snr = torch.randint(int(snr_min), int(snr_max) + 1, (B, 1), device=device, dtype=torch.float32)
                 snr_tensor = rand_snr
 
             optimizer.zero_grad(set_to_none=True)
@@ -1002,7 +1002,7 @@ def main(**kwargs):
                     if opts.fixed_codec_snr is not None:
                         snr_tensor = torch.full((B, 1), float(opts.fixed_codec_snr), device=device, dtype=torch.float32)
                     else:
-                        rand_snr = torch.empty((B, 1), device=device, dtype=torch.float32).uniform_(snr_min, snr_max)
+                        rand_snr = torch.randint(int(snr_min), int(snr_max) + 1, (B, 1), device=device, dtype=torch.float32)
                         snr_tensor = rand_snr
 
                     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opts.bf16):
