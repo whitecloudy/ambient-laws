@@ -547,6 +547,7 @@ def forward_stage3_pipeline(
 @click.option('--image_data',        help='Path to custom image dataset directory (overrides CIFAR-10)', type=str, default=None)
 @click.option('--dataset_keep_percentage', help='Percentage of dataset samples to use', type=float, default=1.0, show_default=True)
 @click.option('--val_interval',      help='Validation frequency in epochs', type=click.IntRange(min=1), default=1, show_default=True)
+@click.option('--val_rounds',        help='Number of evaluation rounds with different SNR and noise realizations (default: 4)', type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--max_val_samples',   help='Maximum validation samples to evaluate', type=int, default=None)
 @click.option('--skip_initial_val',  help='Skip initial pre-training validation (epoch 0)', is_flag=True)
 @click.option('--no_normalize_power', help='Disable symbol power normalization before decoder (enabled by default)', is_flag=True)
@@ -605,6 +606,7 @@ def main(**kwargs):
     dist.print0('SC-CAD2M Stage 3 Joint Fine-tuning')
     dist.print0(f'Update Targets: Encoder={opts.update_encoder}, Diffusion={opts.update_diffusion}, Decoder={opts.update_decoder}')
     dist.print0(f'Epochs={opts.epochs}, Batch Size={opts.batch_size}, Train Steps K={opts.train_steps}')
+    dist.print0(f'Validation: Interval={opts.val_interval} epoch(s), Rounds={opts.val_rounds}, Batch Size={opts.val_batch_size}')
     dist.print0(f'Normalize Power before decoder: {opts.normalize_power}')
     dist.print0('=' * 80)
 
@@ -930,62 +932,99 @@ def main(**kwargs):
         val_loss_sum = 0.0
         val_samples = 0
 
-        desc = f'Epoch [{epoch_idx:03d}/{opts.epochs:03d}] Valid' if epoch_idx > 0 else 'Initial Baseline Valid [Epoch 000]'
-        val_pbar = tqdm.tqdm(
-            val_loader,
-            desc=desc,
-            disable=(dist.get_rank() != 0),
-            file=sys.stdout,
-            dynamic_ncols=True,
-            mininterval=0.5
-        )
+        # Preserve training RNG states and set deterministic base seed for repeatable validation across epochs
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state(device)
+        base_val_seed = opts.seed + 10000 + dist.get_rank()
+
+        val_rounds = max(1, int(opts.val_rounds))
+        round_psnr_list = []
 
         with torch.inference_mode():
-            for batch in val_pbar:
-                x_clean = batch['image'].to(device)
-                raw_h = batch['channel'].to(device)
-                B = x_clean.shape[0]
+            for round_idx in range(val_rounds):
+                # Set deterministic per-round seed: each round uses independent SNR and noise realizations,
+                # but every epoch tests the exact same sequence of rounds for completely fair comparison
+                round_seed = base_val_seed + round_idx * 1337
+                torch.manual_seed(round_seed)
+                torch.cuda.manual_seed(round_seed)
 
-                if opts.fixed_codec_snr is not None:
-                    snr_tensor = torch.full((B, 1), float(opts.fixed_codec_snr), device=device, dtype=torch.float32)
+                round_psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+
+                if val_rounds > 1:
+                    round_desc = (
+                        f'Epoch [{epoch_idx:03d}/{opts.epochs:03d}] Valid (Round {round_idx + 1}/{val_rounds})'
+                        if epoch_idx > 0 else
+                        f'Initial Baseline Valid [Epoch 000] (Round {round_idx + 1}/{val_rounds})'
+                    )
                 else:
-                    rand_snr = torch.randint(int(snr_min), int(snr_max) + 1, (B, 1), device=device, dtype=torch.float32)
-                    snr_tensor = rand_snr
-
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opts.bf16):
-                    x_hat, target_clean, _ = forward_stage3_pipeline(
-                        x_clean=x_clean,
-                        raw_h=raw_h,
-                        snr_tensor=snr_tensor,
-                        encoder=encoder,
-                        net=eval_net,
-                        decoder=decoder,
-                        is_h_module=is_h_module,
-                        is_synthetic_channel=is_synthetic_channel,
-                        is_rayleigh=is_rayleigh,
-                        is_equalized=is_equalized,
-                        is_awgn=is_awgn,
-                        target_numel=target_numel,
-                        dim_z=dim_z,
-                        tcn_feat=tcn_feat,
-                        h_feat=h_feat,
-                        w_feat=w_feat,
-                        denoise_steps=opts.val_steps,
-                        data_norm=data_norm,
-                        padding_power2=opts.padding_power2,
-                        normalize_power=opts.normalize_power,
-                        update_encoder=False,
-                        update_diffusion=False,
-                        update_decoder=False,
-                        sampler_kwargs=sampler_kwargs,
+                    round_desc = (
+                        f'Epoch [{epoch_idx:03d}/{opts.epochs:03d}] Valid'
+                        if epoch_idx > 0 else
+                        'Initial Baseline Valid [Epoch 000]'
                     )
 
-                    batch_loss = F.mse_loss(x_hat, target_clean).item()
+                val_pbar = tqdm.tqdm(
+                    val_loader,
+                    desc=round_desc,
+                    disable=(dist.get_rank() != 0),
+                    file=sys.stdout,
+                    dynamic_ncols=True,
+                    mininterval=0.5
+                )
 
-                val_loss_sum += batch_loss * B
-                val_samples += B
-                psnr_metric.update(x_hat, target_clean)
-                msssim_metric.update(x_hat, target_clean)
+                for batch in val_pbar:
+                    x_clean = batch['image'].to(device)
+                    raw_h = batch['channel'].to(device)
+                    B = x_clean.shape[0]
+
+                    if opts.fixed_codec_snr is not None:
+                        snr_tensor = torch.full((B, 1), float(opts.fixed_codec_snr), device=device, dtype=torch.float32)
+                    else:
+                        rand_snr = torch.randint(int(snr_min), int(snr_max) + 1, (B, 1), device=device, dtype=torch.float32)
+                        snr_tensor = rand_snr
+
+                    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opts.bf16):
+                        x_hat, target_clean, _ = forward_stage3_pipeline(
+                            x_clean=x_clean,
+                            raw_h=raw_h,
+                            snr_tensor=snr_tensor,
+                            encoder=encoder,
+                            net=eval_net,
+                            decoder=decoder,
+                            is_h_module=is_h_module,
+                            is_synthetic_channel=is_synthetic_channel,
+                            is_rayleigh=is_rayleigh,
+                            is_equalized=is_equalized,
+                            is_awgn=is_awgn,
+                            target_numel=target_numel,
+                            dim_z=dim_z,
+                            tcn_feat=tcn_feat,
+                            h_feat=h_feat,
+                            w_feat=w_feat,
+                            denoise_steps=opts.val_steps,
+                            data_norm=data_norm,
+                            padding_power2=opts.padding_power2,
+                            normalize_power=opts.normalize_power,
+                            update_encoder=False,
+                            update_diffusion=False,
+                            update_decoder=False,
+                            sampler_kwargs=sampler_kwargs,
+                        )
+
+                        batch_loss = F.mse_loss(x_hat, target_clean).item()
+
+                    val_loss_sum += batch_loss * B
+                    val_samples += B
+                    psnr_metric.update(x_hat, target_clean)
+                    round_psnr_metric.update(x_hat, target_clean)
+                    msssim_metric.update(x_hat, target_clean)
+
+                round_psnr_val = round_psnr_metric.compute().item()
+                round_psnr_list.append(round_psnr_val)
+
+        # Restore training RNG states
+        torch.set_rng_state(cpu_rng_state)
+        torch.cuda.set_rng_state(cuda_rng_state, device)
 
         val_psnr_val = psnr_metric.compute().item()
         val_msssim_val = msssim_metric.compute().item()
@@ -998,9 +1037,10 @@ def main(**kwargs):
             val_mse_val = val_loss_sum / max(val_samples, 1)
 
         prefix = f'Epoch [{epoch_idx:03d}/{opts.epochs:03d}] Valid Summary' if epoch_idx > 0 else 'Initial Baseline Valid Summary [Epoch 0]'
+        rounds_str = f" (Rounds: [{', '.join(f'{p:.2f}' for p in round_psnr_list)}])" if val_rounds > 1 else ""
         dist.print0(
             f'{prefix}: '
-            f'PSNR: {val_psnr_val:.3f} dB | MS-SSIM: {val_msssim_val:.4f} | MSE: {val_mse_val:.6f}'
+            f'Mean PSNR: {val_psnr_val:.3f} dB{rounds_str} | MS-SSIM: {val_msssim_val:.4f} | MSE: {val_mse_val:.6f}'
         )
 
         # Wandb Logging
