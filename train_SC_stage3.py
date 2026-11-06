@@ -533,6 +533,7 @@ def forward_stage3_pipeline(
 @click.option('--dataset_keep_percentage', help='Percentage of dataset samples to use', type=float, default=1.0, show_default=True)
 @click.option('--val_interval',      help='Validation frequency in epochs', type=click.IntRange(min=1), default=1, show_default=True)
 @click.option('--max_val_samples',   help='Maximum validation samples to evaluate', type=int, default=None)
+@click.option('--skip_initial_val',  help='Skip initial pre-training validation (epoch 0)', is_flag=True)
 @click.option('--normalize_power',   help='Normalize symbol power before decoder', type=bool, default=True, show_default=True)
 @click.option('--padding_power2',    help='Pad channel dimensions to power of 2 for U-Net', is_flag=True)
 
@@ -871,9 +872,169 @@ def main(**kwargs):
     }
 
     # -------------------------------------------------------------
-    # 8. Main Training & Validation Loop
+    # 8. Validation Routine & Baseline Evaluation
     # -------------------------------------------------------------
     best_val_psnr = -1.0
+
+    def run_validation(epoch_idx: int, train_metrics: Optional[Dict[str, Any]] = None) -> float:
+        nonlocal best_val_psnr
+        encoder.eval()
+        net.eval()
+        decoder.eval()
+        psnr_metric.reset()
+        msssim_metric.reset()
+
+        eval_net = ema if opts.update_diffusion else net
+        val_loss_sum = 0.0
+        val_samples = 0
+
+        desc = f'Epoch [{epoch_idx:03d}/{opts.epochs:03d}] Valid' if epoch_idx > 0 else 'Initial Baseline Valid [Epoch 000]'
+        val_pbar = tqdm.tqdm(
+            val_loader,
+            desc=desc,
+            disable=(dist.get_rank() != 0),
+            file=sys.stdout,
+            dynamic_ncols=True,
+            mininterval=0.5
+        )
+
+        with torch.inference_mode():
+            for batch in val_pbar:
+                x_clean = batch['image'].to(device)
+                raw_h = batch['channel'].to(device)
+                B = x_clean.shape[0]
+
+                if opts.fixed_codec_snr is not None:
+                    snr_tensor = torch.full((B, 1), float(opts.fixed_codec_snr), device=device, dtype=torch.float32)
+                else:
+                    rand_snr = torch.randint(int(snr_min), int(snr_max) + 1, (B, 1), device=device, dtype=torch.float32)
+                    snr_tensor = rand_snr
+
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opts.bf16):
+                    x_hat, target_clean, _ = forward_stage3_pipeline(
+                        x_clean=x_clean,
+                        raw_h=raw_h,
+                        snr_tensor=snr_tensor,
+                        encoder=encoder,
+                        net=eval_net,
+                        decoder=decoder,
+                        is_h_module=is_h_module,
+                        is_synthetic_channel=is_synthetic_channel,
+                        is_rayleigh=is_rayleigh,
+                        is_equalized=is_equalized,
+                        is_awgn=is_awgn,
+                        target_numel=target_numel,
+                        dim_z=dim_z,
+                        tcn_feat=tcn_feat,
+                        h_feat=h_feat,
+                        w_feat=w_feat,
+                        denoise_steps=opts.val_steps,
+                        padding_power2=opts.padding_power2,
+                        normalize_power=opts.normalize_power,
+                        update_encoder=False,
+                        update_diffusion=False,
+                        update_decoder=False,
+                        sampler_kwargs=sampler_kwargs,
+                    )
+
+                    batch_loss = F.mse_loss(x_hat, target_clean).item()
+
+                val_loss_sum += batch_loss * B
+                val_samples += B
+                psnr_metric.update(x_hat, target_clean)
+                msssim_metric.update(x_hat, target_clean)
+
+        val_psnr_val = psnr_metric.compute().item()
+        val_msssim_val = msssim_metric.compute().item()
+
+        if dist.get_world_size() > 1:
+            loss_tensor = torch.tensor([val_loss_sum, float(val_samples)], device=device, dtype=torch.float64)
+            torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.SUM)
+            val_mse_val = (loss_tensor[0] / torch.clamp(loss_tensor[1], min=1.0)).item()
+        else:
+            val_mse_val = val_loss_sum / max(val_samples, 1)
+
+        prefix = f'Epoch [{epoch_idx:03d}/{opts.epochs:03d}] Valid Summary' if epoch_idx > 0 else 'Initial Baseline Valid Summary [Epoch 0]'
+        dist.print0(
+            f'{prefix}: '
+            f'PSNR: {val_psnr_val:.3f} dB | MS-SSIM: {val_msssim_val:.4f} | MSE: {val_mse_val:.6f}'
+        )
+
+        # Wandb Logging
+        if dist.get_rank() == 0 and opts.use_wandb:
+            import wandb
+            log_dict = {
+                'epoch': epoch_idx,
+                'val/mse': val_mse_val,
+                'val/psnr': val_psnr_val,
+                'val/msssim': val_msssim_val,
+            }
+            if train_metrics is not None:
+                log_dict.update(train_metrics)
+            wandb.log(log_dict)
+
+        # Baseline saving (Epoch 0)
+        if epoch_idx == 0:
+            best_val_psnr = val_psnr_val
+            if dist.get_rank() == 0:
+                dist.print0(f'>>> Initial Baseline Validation PSNR established: {best_val_psnr:.3f} dB. Saving baseline checkpoints...')
+                best_adjscc_path = os.path.join(out_dir, 'adjscc_best.pt')
+                torch.save({'encoder': unwrap_module(encoder).state_dict(), 'decoder': unwrap_module(decoder).state_dict()}, best_adjscc_path)
+
+                best_diff_path = os.path.join(out_dir, 'network-snapshot-best.pkl')
+                diff_save_dict = {
+                    'ema': copy.deepcopy(unwrap_module(ema)).cpu(),
+                    'net': copy.deepcopy(unwrap_module(net)).cpu(),
+                    'dataset_kwargs': dict(ds_kwargs),
+                    'best_val_psnr': best_val_psnr,
+                    'epoch': 0,
+                }
+                save_utils.save_pkl(diff_save_dict, best_diff_path)
+                dist.print0(f'Saved baseline checkpoints: {best_adjscc_path} & {best_diff_path}')
+        else:
+            # During training epochs: check if improvement over best_val_psnr
+            if val_psnr_val > best_val_psnr:
+                if dist.get_rank() == 0:
+                    dist.print0(
+                        f'>>> New Best Validation PSNR: {val_psnr_val:.3f} dB '
+                        f'(improved from {best_val_psnr:.3f} dB by +{val_psnr_val - best_val_psnr:.3f} dB)! Saving best checkpoints...'
+                    )
+                    best_adjscc_path = os.path.join(out_dir, 'adjscc_best.pt')
+                    torch.save({'encoder': unwrap_module(encoder).state_dict(), 'decoder': unwrap_module(decoder).state_dict()}, best_adjscc_path)
+
+                    best_diff_path = os.path.join(out_dir, 'network-snapshot-best.pkl')
+                    diff_save_dict = {
+                        'ema': copy.deepcopy(unwrap_module(ema)).cpu(),
+                        'net': copy.deepcopy(unwrap_module(net)).cpu(),
+                        'dataset_kwargs': dict(ds_kwargs),
+                        'best_val_psnr': val_psnr_val,
+                        'epoch': epoch_idx,
+                    }
+                    save_utils.save_pkl(diff_save_dict, best_diff_path)
+                    dist.print0(f'Saved best checkpoints: {best_adjscc_path} & {best_diff_path}')
+                best_val_psnr = val_psnr_val
+            else:
+                if dist.get_rank() == 0:
+                    dist.print0(f'Current best validation PSNR remains: {best_val_psnr:.3f} dB (current: {val_psnr_val:.3f} dB)')
+
+        if dist.get_world_size() > 1:
+            torch.distributed.barrier()
+
+        return val_psnr_val
+
+    # Initial Baseline Validation before training starts
+    if not opts.skip_initial_val:
+        dist.print0('=' * 80)
+        dist.print0('Running Initial Baseline Validation (Epoch 0) before training starts...')
+        run_validation(0)
+        dist.print0(f'Initial Baseline Established: PSNR = {best_val_psnr:.3f} dB')
+        dist.print0('=' * 80)
+    else:
+        dist.print0('Skipping initial baseline validation (--skip_initial_val).')
+
+    # -------------------------------------------------------------
+    # 9. Main Training Loop
+    # -------------------------------------------------------------
     start_time = time.time()
 
     for epoch in range(1, opts.epochs + 1):
@@ -974,112 +1135,15 @@ def main(**kwargs):
         # Validation Step
         # -------------------------------------------------------------
         if epoch % opts.val_interval == 0:
-            encoder.eval()
-            net.eval()
-            decoder.eval()
-            psnr_metric.reset()
-            msssim_metric.reset()
-
-            eval_net = ema if opts.update_diffusion else net
-            val_loss_sum = 0.0
-            val_samples = 0
-
-            val_pbar = tqdm.tqdm(
-                val_loader,
-                desc=f'Epoch [{epoch:03d}/{opts.epochs:03d}] Valid',
-                disable=(dist.get_rank() != 0),
-                file=sys.stdout,
-                dynamic_ncols=True,
-                mininterval=0.5
-            )
-
-            with torch.inference_mode():
-                for batch in val_pbar:
-                    x_clean = batch['image'].to(device)
-                    raw_h = batch['channel'].to(device)
-                    B = x_clean.shape[0]
-
-                    if opts.fixed_codec_snr is not None:
-                        snr_tensor = torch.full((B, 1), float(opts.fixed_codec_snr), device=device, dtype=torch.float32)
-                    else:
-                        rand_snr = torch.randint(int(snr_min), int(snr_max) + 1, (B, 1), device=device, dtype=torch.float32)
-                        snr_tensor = rand_snr
-
-                    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=opts.bf16):
-                        x_hat, target_clean, _ = forward_stage3_pipeline(
-                            x_clean=x_clean,
-                            raw_h=raw_h,
-                            snr_tensor=snr_tensor,
-                            encoder=encoder,
-                            net=eval_net,
-                            decoder=decoder,
-                            is_h_module=is_h_module,
-                            is_synthetic_channel=is_synthetic_channel,
-                            is_rayleigh=is_rayleigh,
-                            is_equalized=is_equalized,
-                            is_awgn=is_awgn,
-                            target_numel=target_numel,
-                            dim_z=dim_z,
-                            tcn_feat=tcn_feat,
-                            h_feat=h_feat,
-                            w_feat=w_feat,
-                            denoise_steps=opts.val_steps,
-                            padding_power2=opts.padding_power2,
-                            normalize_power=opts.normalize_power,
-                            update_encoder=False,
-                            update_diffusion=False,
-                            update_decoder=False,
-                            sampler_kwargs=sampler_kwargs,
-                        )
-
-                        batch_loss = F.mse_loss(x_hat, target_clean).item()
-
-                    val_loss_sum += batch_loss * B
-                    val_samples += B
-                    psnr_metric.update(x_hat, target_clean)
-                    msssim_metric.update(x_hat, target_clean)
-
-            val_psnr_val = psnr_metric.compute().item()
-            val_msssim_val = msssim_metric.compute().item()
-            val_mse_val = val_loss_sum / max(val_samples, 1)
-
-            dist.print0(
-                f'Epoch [{epoch:03d}/{opts.epochs:03d}] Valid Summary: '
-                f'PSNR: {val_psnr_val:.3f} dB | MS-SSIM: {val_msssim_val:.4f} | MSE: {val_mse_val:.6f}'
-            )
-
-            # Wandb Logging
+            run_validation(epoch, train_metrics={'train/mse': epoch_train_mse, 'train/psnr': epoch_train_psnr})
+        else:
             if dist.get_rank() == 0 and opts.use_wandb:
                 import wandb
                 wandb.log({
                     'epoch': epoch,
                     'train/mse': epoch_train_mse,
                     'train/psnr': epoch_train_psnr,
-                    'val/mse': val_mse_val,
-                    'val/psnr': val_psnr_val,
-                    'val/msssim': val_msssim_val,
                 })
-
-            # Save Best Model
-            if dist.get_rank() == 0 and val_psnr_val > best_val_psnr:
-                best_val_psnr = val_psnr_val
-                dist.print0(f'>>> New Best Validation PSNR: {best_val_psnr:.3f} dB! Saving best checkpoints...')
-
-                # 1) Save test_SC compatible ADJSCC checkpoint (.pt)
-                best_adjscc_path = os.path.join(out_dir, 'adjscc_best.pt')
-                torch.save({'encoder': unwrap_module(encoder).state_dict(), 'decoder': unwrap_module(decoder).state_dict()}, best_adjscc_path)
-
-                # 2) Save test_SC compatible Diffusion pickle (.pkl)
-                best_diff_path = os.path.join(out_dir, 'network-snapshot-best.pkl')
-                diff_save_dict = {
-                    'ema': copy.deepcopy(unwrap_module(ema)).cpu(),
-                    'net': copy.deepcopy(unwrap_module(net)).cpu(),
-                    'dataset_kwargs': dict(ds_kwargs),
-                    'best_val_psnr': best_val_psnr,
-                    'epoch': epoch,
-                }
-                save_utils.save_pkl(diff_save_dict, best_diff_path)
-                dist.print0(f'Saved: {best_adjscc_path} & {best_diff_path}')
 
         # Snapshot saving
         if dist.get_rank() == 0 and (epoch % opts.snap_epoch == 0 or epoch == opts.epochs):
