@@ -275,6 +275,7 @@ class PairedSCTestDataset(Dataset):
 @click.option('--padding_power2',          help='Pad channel dimensions to power of 2 for U-Net', is_flag=True)
 @click.option('--channel_type',            help='Override channel type (slow_fading_eq, slow_fading, awgn, rayleigh_fading, or rayleigh_fading_eq)', type=click.Choice(['slow_fading', 'slow_fading_eq', 'awgn', 'rayleigh_fading', 'rayleigh_fading_eq']), default=None)
 @click.option('--slow_fading_eq',          help='Explicitly set slow_fading_eq flag', type=bool, default=None)
+@click.option('--no_normalize_power',      help='Disable symbol power normalization before decoder (enabled by default)', is_flag=True)
 def main(**kwargs):
     # Enable line buffering so tqdm updates immediately in torchrun / multi-GPU pipes
     try:
@@ -353,6 +354,13 @@ def main(**kwargs):
     else:
         data_norm = 1.0
     dist.print0(f'Channel mode: channel_type="{channel_type}", equalized={is_equalized}, data_norm={data_norm}')
+
+    # Normalize power setting (disabled if --no_normalize_power flag is passed; otherwise inherits from stage3_opts or defaults to True)
+    if opt.no_normalize_power:
+        opt.normalize_power = False
+    else:
+        opt.normalize_power = bool(train_opts.get('stage3_opts', {}).get('normalize_power', True))
+    dist.print0(f'Normalize power before decoder: {opt.normalize_power}')
 
     # Noise Scheduler Mode
     target_mode = (
@@ -693,18 +701,10 @@ def main(**kwargs):
                 snr_diff_ratio_sum += torch.sum(diff_snr_ratio).to(torch.float64)
                 total_eval_samples += B
 
-                # Post-denoising effective SNR for ADJSCC Decoder conditioning
-                if opt.fixed_codec_snr is not None:
-                    diff_dec_snr_tensor = snr_tensor
-                else:
-                    post_snr_db = 10.0 * torch.log10(diff_snr_ratio.clamp(min=1e-12)).unsqueeze(1).float()
-                    diff_dec_snr_tensor = torch.clamp(post_snr_db, min=codec_snr_val, max=20.0)
-
                 # 6) Inverse Shape Matching to (B, tcn, 8, 8)
                 def _inverse_match_and_decode(
                     z_tensor: torch.Tensor,
                     dec_snr: torch.Tensor = snr_tensor,
-                    normalize_power: bool = False,
                 ) -> torch.Tensor:
                     z_tensor = torch.nan_to_num(z_tensor, nan=0.0, posinf=10.0, neginf=-10.0)
                     if is_synthetic_channel or target_numel == dim_z:
@@ -716,12 +716,17 @@ def main(**kwargs):
                         i_inv = F.interpolate(i_flat, size=dim_z, mode='linear', align_corners=False).squeeze(1)
                         z_unmatch = torch.complex(r_inv, i_inv)
 
-                    if normalize_power:
-                        cur_pow = torch.mean(z_unmatch.real ** 2 + z_unmatch.imag ** 2, dim=1, keepdim=True)
-                        expected_pow = 1.0 + 10.0 ** (-dec_snr / 10.0)
-                        z_unmatch = z_unmatch * torch.sqrt(expected_pow / torch.clamp(cur_pow, min=1e-8))
-
                     f_dec = torch.cat([z_unmatch.real, z_unmatch.imag], dim=1).reshape(B, tcn_feat, h_feat, w_feat)
+                    if opt.normalize_power:
+                        if not isinstance(dec_snr, torch.Tensor):
+                            snr_val_tensor = torch.full((B, 1), float(dec_snr), device=device, dtype=torch.float32)
+                        else:
+                            snr_val_tensor = dec_snr
+                        cur_pow = torch.mean(z_unmatch.real ** 2 + z_unmatch.imag ** 2, dim=1, keepdim=True)
+                        expected_pow = 1.0 + 10.0 ** (-snr_val_tensor / 10.0)
+                        z_unmatch = z_unmatch * torch.sqrt(expected_pow / torch.clamp(cur_pow, min=1e-8))
+                        f_dec = torch.cat([z_unmatch.real, z_unmatch.imag], dim=1).reshape(B, tcn_feat, h_feat, w_feat)
+
                     # Clamp latent symbols before GDN to prevent exponential overflow in decoder
                     f_dec = torch.clamp(f_dec, min=-10.0, max=10.0)
                     if is_h_module:
@@ -731,12 +736,8 @@ def main(**kwargs):
                     out_img = torch.nan_to_num(out_img, nan=0.0, posinf=1.0, neginf=0.0)
                     return torch.clamp(out_img, 0.0, 1.0)
 
-                # Decode Diffusion Reconstructed Image (with post-denoising SNR & power normalization)
-                x_hat_diff = _inverse_match_and_decode(
-                    z_hat_complex,
-                    dec_snr=diff_dec_snr_tensor,
-                    normalize_power=True,
-                )
+                # Decode Diffusion Reconstructed Image
+                x_hat_diff = _inverse_match_and_decode(z_hat_complex, dec_snr=snr_tensor)
 
                 # Update Diffusion Metrics
                 psnr_diff_metric.update(x_hat_diff, x_clean)

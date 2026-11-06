@@ -43,7 +43,10 @@ def edm_sampler(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     step_indices = fit_shape(step_indices, sigma_max)
     step_indices = fit_shape(step_indices, sigma_min)
-    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    if num_steps <= 1:
+        t_steps = sigma_max + step_indices * 0.0
+    else:
+        t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     
     x_next = latents
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
@@ -227,7 +230,10 @@ def inference_edm_sampler_with_scheduler(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
     step_indices = fit_shape(step_indices, sigma_max)
     step_indices = fit_shape(step_indices, sigma_min)
-    t_ref_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    if num_steps <= 1:
+        t_ref_steps = sigma_max + step_indices * 0.0
+    else:
+        t_ref_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     
     round_sigma_fn = _get_net_attr(net, "round_sigma")
     if round_sigma_fn is not None:
@@ -413,7 +419,10 @@ def inference_edm_sampler(
     step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
     step_indices = fit_shape(step_indices, sigma_max)
     step_indices = fit_shape(step_indices, sigma_min)
-    t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    if num_steps <= 1:
+        t_steps = sigma_max + step_indices * 0.0
+    else:
+        t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     
     t_steps = torch.cat([round_sigma_fn(t_steps), torch.zeros_like(t_steps[:1])], dim=0) # t_N = 0
     

@@ -277,6 +277,7 @@ def forward_stage3_pipeline(
     h_feat: int,
     w_feat: int,
     denoise_steps: int = 1,
+    data_norm: float = 1.0,
     padding_power2: bool = False,
     normalize_power: bool = True,
     update_encoder: bool = True,
@@ -299,11 +300,20 @@ def forward_stage3_pipeline(
     B = x_clean.shape[0]
     device = x_clean.device
 
-    # 1. 채널 행렬 H 변환
+    # 1. 채널 행렬 H 변환 (Encoder 호출 전 생성하여 is_h_module에서도 정확한 채널 평균 전달)
     if torch.is_complex(raw_h):
         h_complex = raw_h.to(torch.complex64)
     elif is_synthetic_channel:
-        h_complex = torch.ones(1, device=device, dtype=torch.complex64)
+        if raw_h.ndim == 4 and raw_h.shape[1] == tcn_feat:
+            half_c = raw_h.shape[1] // 2
+            h_complex = torch.complex(raw_h[:, :half_c].float(), raw_h[:, half_c:].float())
+        elif is_rayleigh:
+            ch_shape = (B, tcn_feat // 2, h_feat, w_feat)
+            hr = torch.randn(ch_shape, device=device, dtype=torch.float32)
+            hi = torch.randn(ch_shape, device=device, dtype=torch.float32)
+            h_complex = torch.complex(hr, hi) / np.sqrt(2.0)
+        else:
+            h_complex = torch.ones((B, tcn_feat // 2, h_feat, w_feat), device=device, dtype=torch.complex64)
     elif raw_h.ndim == 4:
         h_complex = torch.complex(raw_h[:, 0].float(), raw_h[:, 1].float())
     else:
@@ -333,12 +343,13 @@ def forward_stage3_pipeline(
         # 형태 매칭 (합성 채널: tcn_feat//2, h_feat, w_feat)
         if is_synthetic_channel:
             z_matched = z_in.reshape(B, tcn_feat // 2, h_feat, w_feat)
-            if is_rayleigh:
-                hr = torch.randn(z_matched.shape, device=device, dtype=torch.float32)
-                hi = torch.randn(z_matched.shape, device=device, dtype=torch.float32)
-                h_complex = torch.complex(hr, hi) / np.sqrt(2.0)
-            else:
-                h_complex = torch.ones_like(z_matched)
+            if h_complex.shape != z_matched.shape:
+                if is_rayleigh:
+                    hr = torch.randn(z_matched.shape, device=device, dtype=torch.float32)
+                    hi = torch.randn(z_matched.shape, device=device, dtype=torch.float32)
+                    h_complex = torch.complex(hr, hi) / np.sqrt(2.0)
+                else:
+                    h_complex = torch.ones_like(z_matched)
         else:
             if dim_z == target_numel:
                 z_matched = z_in.reshape(B, h_complex.shape[1], h_complex.shape[2])
@@ -395,6 +406,11 @@ def forward_stage3_pipeline(
     else:
         rx_input = torch.stack([rx_signal.real, rx_signal.imag], dim=1).float()
 
+    # Scale synthetic channel inputs to match diffusion model trained with data_norm (EDM sigma_data=0.5)
+    if is_synthetic_channel and data_norm != 1.0:
+        rx_input = rx_input / data_norm
+        input_sigma = input_sigma / data_norm
+
     # -------------------------------------------------------------
     # Step 3) Channel-Adaptive Denoising Diffusion (CAD2M)
     # -------------------------------------------------------------
@@ -411,27 +427,26 @@ def forward_stage3_pipeline(
     # 디퓨전 업데이트 여부 및 역전파 흐름 제어
     grad_diffusion_enabled = update_diffusion or update_encoder
     with torch.set_grad_enabled(grad_diffusion_enabled):
-        if denoise_steps <= 1:
-            # 1-step 빠른 EDM 단일 스텝 역전파 (논문 Algorithm 1 Stage 3 및 D(x, sigma))
-            denoised_signal = net(padded_signal, input_sigma, snr_tensor)
-        else:
-            # Multi-step EDM Sampler
-            kw = sampler_kwargs or {}
-            denoised_signal, _ = edm_sampler(
-                net,
-                latents=padded_signal,
-                class_labels=snr_tensor,
-                sigma_max=input_sigma,
-                padding_mask=padding_mask,
-                latents_already_noisy=True,
-                num_steps=denoise_steps,
-                **kw
-            )
+        kw = sampler_kwargs or {}
+        denoised_signal, _ = edm_sampler(
+            net,
+            latents=padded_signal,
+            class_labels=snr_tensor,
+            sigma_max=input_sigma,
+            padding_mask=padding_mask,
+            latents_already_noisy=True,
+            num_steps=denoise_steps,
+            **kw
+        )
 
         if padding_power2:
             denoised_signal = denoised_signal[:, :, :orig_spatial_h, :orig_spatial_w]
 
         denoised_signal = denoised_signal.float()
+
+        # De-normalize synthetic channel denoised output back to unit power for ADJSCC Decoder
+        if is_synthetic_channel and data_norm != 1.0:
+            denoised_signal = denoised_signal * data_norm
 
         # 디퓨전과 인코더가 모두 업데이트되지 않을 경우 gradient detach
         if not update_diffusion and not update_encoder:
@@ -534,7 +549,7 @@ def forward_stage3_pipeline(
 @click.option('--val_interval',      help='Validation frequency in epochs', type=click.IntRange(min=1), default=1, show_default=True)
 @click.option('--max_val_samples',   help='Maximum validation samples to evaluate', type=int, default=None)
 @click.option('--skip_initial_val',  help='Skip initial pre-training validation (epoch 0)', is_flag=True)
-@click.option('--normalize_power',   help='Normalize symbol power before decoder', type=bool, default=True, show_default=True)
+@click.option('--no_normalize_power', help='Disable symbol power normalization before decoder (enabled by default)', is_flag=True)
 @click.option('--padding_power2',    help='Pad channel dimensions to power of 2 for U-Net', is_flag=True)
 
 # Sampling & Performance Options
@@ -574,6 +589,7 @@ def main(**kwargs):
         opts.update_encoder = False
     if opts.freeze_decoder:
         opts.update_decoder = False
+    opts.normalize_power = not opts.no_normalize_power
 
     if opts.allow_tf32:
         torch.backends.cudnn.allow_tf32 = True
@@ -589,6 +605,7 @@ def main(**kwargs):
     dist.print0('SC-CAD2M Stage 3 Joint Fine-tuning')
     dist.print0(f'Update Targets: Encoder={opts.update_encoder}, Diffusion={opts.update_diffusion}, Decoder={opts.update_decoder}')
     dist.print0(f'Epochs={opts.epochs}, Batch Size={opts.batch_size}, Train Steps K={opts.train_steps}')
+    dist.print0(f'Normalize Power before decoder: {opts.normalize_power}')
     dist.print0('=' * 80)
 
     # -------------------------------------------------------------
@@ -638,7 +655,7 @@ def main(**kwargs):
     else:
         data_norm = 1.0
 
-    dist.print0(f'Channel Mode: type="{channel_type}", equalized={is_equalized}, synthetic={is_synthetic_channel}')
+    dist.print0(f'Channel Mode: type="{channel_type}", equalized={is_equalized}, synthetic={is_synthetic_channel}, data_norm={data_norm}')
 
     # SNR Range determination
     snr_range_str = opts.snr_range
@@ -653,14 +670,25 @@ def main(**kwargs):
     # -------------------------------------------------------------
     dist.print0(f'Loading diffusion network from "{opts.network_pkl}"...')
     diff_data = save_utils.load_pkl(opts.network_pkl, verbose=(dist.get_rank() == 0))
-    raw_net = diff_data.get('net', diff_data.get('ema'))
+    raw_net = diff_data.get('ema', diff_data.get('net'))
     if raw_net is None:
-        raise ValueError(f"Pickle file '{opts.network_pkl}' does not contain 'net' or 'ema'.")
+        raise ValueError(f"Pickle file '{opts.network_pkl}' does not contain 'ema' or 'net'.")
 
     net = copy.deepcopy(raw_net).to(device)
     ema = copy.deepcopy(diff_data.get('ema', net)).to(device).eval()
     for p in ema.parameters():
         p.requires_grad = False
+
+    # Sync scheduler_mode with training_options.json (matching test_SC.py)
+    target_sched_mode = train_opts.get('network_kwargs', {}).get(
+        'scheduler_mode',
+        train_opts.get('scheduler_mode', getattr(net, 'scheduler_mode', 'using_sigma_t_n'))
+    )
+    for m_obj in (net, ema):
+        if hasattr(m_obj, 'scheduler_mode'):
+            m_obj.scheduler_mode = target_sched_mode
+        if hasattr(getattr(m_obj, 'noise_scheduler', None), 'scheduler_mode'):
+            m_obj.noise_scheduler.scheduler_mode = target_sched_mode
 
     if opts.bf16 and hasattr(net, 'use_fp16'):
         net.use_fp16 = True
@@ -788,17 +816,31 @@ def main(**kwargs):
             channel_type=channel_type,
             slow_fading_eq=slow_fading_eq,
         )
-        renew_val_ch_ds = RenewChannelDataset(
-            renew_path=rf_data_path,
-            adjscc_config=adjscc_cfg,
-            T=T_steps,
-            seed=opts.seed + 1,
-            dataset_keep_percentage=opts.dataset_keep_percentage,
-            flip_keep_dataset=True,
-            normalize_value=data_norm,
-            channel_type=channel_type,
-            slow_fading_eq=slow_fading_eq,
-        )
+        val_rf_data_path = train_opts.get('validation_kwargs', {}).get('validation_data', None)
+        if val_rf_data_path is not None and os.path.exists(val_rf_data_path):
+            renew_val_ch_ds = RenewChannelDataset(
+                renew_path=val_rf_data_path,
+                adjscc_config=adjscc_cfg,
+                T=T_steps,
+                seed=opts.seed + 1,
+                dataset_keep_percentage=1.0,
+                flip_keep_dataset=False,
+                normalize_value=data_norm,
+                channel_type=channel_type,
+                slow_fading_eq=slow_fading_eq,
+            )
+        else:
+            renew_val_ch_ds = RenewChannelDataset(
+                renew_path=rf_data_path,
+                adjscc_config=adjscc_cfg,
+                T=T_steps,
+                seed=opts.seed + 1,
+                dataset_keep_percentage=opts.dataset_keep_percentage,
+                flip_keep_dataset=(opts.dataset_keep_percentage < 1.0),
+                normalize_value=data_norm,
+                channel_type=channel_type,
+                slow_fading_eq=slow_fading_eq,
+            )
 
     paired_train_ds = PairedSCDataset(image_dataset=train_img_ds, renew_channel_dataset=renew_train_ch_ds)
     paired_val_ds = PairedSCDataset(image_dataset=val_img_ds, renew_channel_dataset=renew_val_ch_ds, max_samples=opts.max_val_samples)
@@ -929,6 +971,7 @@ def main(**kwargs):
                         h_feat=h_feat,
                         w_feat=w_feat,
                         denoise_steps=opts.val_steps,
+                        data_norm=data_norm,
                         padding_power2=opts.padding_power2,
                         normalize_power=opts.normalize_power,
                         update_encoder=False,
@@ -1094,6 +1137,7 @@ def main(**kwargs):
                     h_feat=h_feat,
                     w_feat=w_feat,
                     denoise_steps=opts.train_steps,
+                    data_norm=data_norm,
                     padding_power2=opts.padding_power2,
                     normalize_power=opts.normalize_power,
                     update_encoder=opts.update_encoder,
