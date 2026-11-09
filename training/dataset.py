@@ -545,14 +545,13 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         csi_data, noise_sigma_data, sampled_t_idx = self._sample_time_slice(csi_data, noise_sigma_data, t_idx=t_idx)
         csi_data, noise_sigma_data = self._apply_transpose(csi_data, noise_sigma_data)
         csi_data, noise_sigma_data = self._handle_complex_view(csi_data, noise_sigma_data)
+        csi_data, label_data = self._split_label(csi_data)
         csi_data, noise_sigma_data, corruption_label = self._apply_corruption(csi_data, noise_sigma_data, idx)
         
         if self._noise_mean_flag:
             item = {'sigma': noise_sigma_data}
             item = self.noise_mean_collate_fn([item])[0]
             noise_sigma_data = item['sigma']
-
-        csi_data, label_data = self._split_label(csi_data)
 
         return self._format_output(csi_data, label_data, noise_sigma_data, item_fname, corruption_label, t_idx=sampled_t_idx)
 
