@@ -381,6 +381,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
         if self._label_spliting_flag:
             tmp_shape = np.array(single_csi_shape)
+            tmp_shape[0] = 1
             tmp_shape[-1] = tmp_shape[-1] // 2
             single_csi_shape = tuple(tmp_shape.tolist())
 
@@ -495,6 +496,19 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         item = self.corruption_collate_fn([item])[0]
         return item['image'], item['sigma'], item['corruption_label']
 
+    def _sample_time_slice(self, csi_data, noise_sigma_data, t_idx=None):
+        if self._label_spliting_flag:
+            T = csi_data.shape[0]
+            if t_idx is None or int(t_idx) < 0 or int(t_idx) >= T:
+                t_idx = int(np.random.randint(0, T))
+            else:
+                t_idx = int(t_idx)
+            csi_data = csi_data[t_idx:t_idx + 1]
+            if noise_sigma_data.shape[0] == T:
+                noise_sigma_data = noise_sigma_data[t_idx:t_idx + 1]
+            return csi_data, noise_sigma_data, t_idx
+        return csi_data, noise_sigma_data, -1
+
     def _split_label(self, csi_data):
         if self._label_spliting_flag:
             csi_data, label_data = np.split(csi_data, 2, axis=2)
@@ -502,7 +516,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             label_data = np.zeros([self.image_shape[0], 0], dtype=np.float32)
         return csi_data, label_data
 
-    def _format_output(self, csi_data, label_data, noise_sigma_data, item_fname, corruption_label):
+    def _format_output(self, csi_data, label_data, noise_sigma_data, item_fname, corruption_label, t_idx=-1):
         if self._view_as_complex:
             dtype = np.complex64
         else:
@@ -523,10 +537,12 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             'additive_noise_sigma': self.additive_noise_sigma,
             'complex_merge_axis': return_complex_merge_axis,
             'axis_name': self._axis_name,
+            't_idx': int(t_idx),
         }
 
-    def __create_item__(self, item_fname, idx):
+    def __create_item__(self, item_fname, idx, t_idx=None):
         csi_data, noise_sigma_data = self._load_and_normalize(item_fname)
+        csi_data, noise_sigma_data, sampled_t_idx = self._sample_time_slice(csi_data, noise_sigma_data, t_idx=t_idx)
         csi_data, noise_sigma_data = self._apply_transpose(csi_data, noise_sigma_data)
         csi_data, noise_sigma_data = self._handle_complex_view(csi_data, noise_sigma_data)
         csi_data, noise_sigma_data, corruption_label = self._apply_corruption(csi_data, noise_sigma_data, idx)
@@ -538,7 +554,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
         csi_data, label_data = self._split_label(csi_data)
 
-        return self._format_output(csi_data, label_data, noise_sigma_data, item_fname, corruption_label)
+        return self._format_output(csi_data, label_data, noise_sigma_data, item_fname, corruption_label, t_idx=sampled_t_idx)
 
     def __getitem__(self, idx):
         item_fname = self._fname[idx]

@@ -249,7 +249,7 @@ class renew_with_average_image(renewRfProcessedDataset):
             warnings.warn(f"Filename {fname} does not contain 'pilot0' or 'pilot1'. Returning original item.")
             return item
 
-        image_pair = super().__create_item__(change_fname, idx)['image']
+        image_pair = super().__create_item__(change_fname, idx, t_idx=item.get('t_idx'))['image']
         item['image'] = (image_original + image_pair) / 2.0
         
         return item
@@ -259,8 +259,9 @@ class renew_with_clear_image(renewRfProcessedDataset):
         self.clear_label_dir = clear_label_dir
         super().__init__(**kwargs)
 
-    def __create_item_without_noise_additive(self, fname):
+    def __create_item_without_noise_additive(self, fname, t_idx=None):
         csi_data, noise_sigma_data = super()._load_and_normalize(fname)
+        csi_data, noise_sigma_data, _ = super()._sample_time_slice(csi_data, noise_sigma_data, t_idx=t_idx)
         csi_data, noise_sigma_data = super()._apply_transpose(csi_data, noise_sigma_data)
         csi_data, noise_sigma_data = super()._handle_complex_view(csi_data, noise_sigma_data)
 
@@ -277,7 +278,7 @@ class renew_with_clear_image(renewRfProcessedDataset):
         clear_fname = re.sub(r'pilot[01]', 'mean', fname)
         clear_fname = os.path.join(self.clear_label_dir, clear_fname)
 
-        csi_data, noise_sigma_data = self.__create_item_without_noise_additive(clear_fname)
+        csi_data, noise_sigma_data = self.__create_item_without_noise_additive(clear_fname, t_idx=item.get('t_idx'))
         csi_data, label_data = self._split_label(csi_data)
         item['image'] = csi_data
         

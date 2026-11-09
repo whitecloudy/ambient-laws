@@ -629,6 +629,59 @@ class SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 from collections import OrderedDict
 
 @persistence.persistent_class
+class CrossAttentionBlock(torch.nn.Module):
+    def __init__(self,
+        channels, cond_channels=None, num_heads=4, eps=1e-6, attention_scale=1.0,
+        init=dict(), init_zero=dict(init_weight=0), init_attn=None,
+    ):
+        super().__init__()
+        if cond_channels is None:
+            cond_channels = channels
+        self.channels = channels
+        self.cond_channels = cond_channels
+        self.num_heads = num_heads if (num_heads is not None and channels % num_heads == 0) else 1
+        self.attention_scale = float(attention_scale)
+
+        self.norm_q = GroupNorm(num_channels=channels, eps=eps)
+        self.norm_kv = GroupNorm(num_channels=cond_channels, eps=eps)
+        attn_init_kwargs = init_attn if init_attn is not None else init
+        self.q_proj = Conv2d(in_channels=channels, out_channels=channels, kernel=1, **attn_init_kwargs)
+        self.kv_proj = Conv2d(in_channels=cond_channels, out_channels=channels * 2, kernel=1, **attn_init_kwargs)
+        self.out_proj = Conv2d(in_channels=channels, out_channels=channels, kernel=1, **init_zero)
+
+    def forward(self, x, cond):
+        if cond.shape[2:] != x.shape[2:]:
+            cond = torch.nn.functional.interpolate(cond, size=x.shape[2:], mode='nearest')
+        b, c, h, w = x.shape
+        q = self.q_proj(self.norm_q(x)).reshape(b * self.num_heads, c // self.num_heads, h * w)
+        k, v = self.kv_proj(self.norm_kv(cond)).reshape(b * self.num_heads, c // self.num_heads, 2, -1).unbind(2)
+        attn_w = AttentionOp.apply(q, k, self.attention_scale)
+        a = torch.einsum('nqk,nck->ncq', attn_w, v).reshape(b, c, h, w)
+        return x + self.out_proj(a)
+
+
+@persistence.persistent_class
+class DownlinkCondStage(torch.nn.Module):
+    def __init__(self,
+        in_channels, out_channels, down=False, resample_filter=[1, 1], resample_stride=(2, 2),
+        eps=1e-6, init=dict(),
+    ):
+        super().__init__()
+        self.conv0 = Conv2d(
+            in_channels=in_channels, out_channels=out_channels, kernel=3,
+            down=down, resample_filter=resample_filter, resample_stride=resample_stride, **init
+        )
+        self.norm0 = GroupNorm(num_channels=out_channels, eps=eps)
+        self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init)
+        self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
+
+    def forward(self, c):
+        c = silu(self.norm0(self.conv0(c)))
+        c = silu(self.norm1(self.conv1(c)))
+        return c
+
+
+@persistence.persistent_class
 class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
     def __init__(self,
         img_resolution,                     # Image resolution at input/output.
@@ -654,6 +707,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         resample_filter     = [1,1],        # Resampling filter: [1,1] for DDPM++, [1,3,3,1] for NCSN++.
         dynamic_noise       = False,        # Whether to use dynamic noise labels.
         attention_scale     = 1.0,          # Attention temperature scaling factor.
+        cross_attn_heads    = 4,            # Number of heads for multi-scale downlink cross-attention.
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -663,6 +717,19 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         super().__init__()
         self.label_dropout = label_dropout
         self.label_type = label_type
+        self.out_channels = out_channels
+
+        if self.label_type == 'downlink':
+            if in_channels > out_channels:
+                self.cond_in_channels = in_channels - out_channels
+                eff_in_channels = in_channels
+            else:
+                self.cond_in_channels = label_dim if (label_dim is not None and label_dim > 0) else out_channels
+                eff_in_channels = in_channels + self.cond_in_channels
+        else:
+            self.cond_in_channels = 0
+            eff_in_channels = in_channels
+        self.in_channels = eff_in_channels
 
         # dynamic_noise일 경우 Spatial Tensor가 되어 VRAM 소모가 매우 커지므로 기본 embedding 차원을 줄입니다.
         if dynamic_noise and channel_mult_emb == 4:
@@ -674,10 +741,15 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
         init = dict(init_mode='xavier_uniform')
         init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
         init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
+        adaptive_scale = (self.label_type == 'downlink')
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
-            resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
+            resample_filter=resample_filter, resample_proj=True, adaptive_scale=adaptive_scale,
             init=init, init_zero=init_zero, init_attn=init_attn, attention_scale=attention_scale,
+        )
+        cross_attn_kwargs = dict(
+            num_heads=cross_attn_heads, eps=1e-6, attention_scale=attention_scale,
+            init=init, init_zero=init_zero, init_attn=init_attn,
         )
 
         # Mapping.
@@ -687,38 +759,8 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             self.map_noise = PositionalEmbedding(num_channels=noise_channels, endpoint=True) if embedding_type == 'positional' else FourierEmbedding(num_channels=noise_channels)
         if label_dim != 0:
             if self.label_type == 'downlink':
-                if label_resolution == None:
-                    label_resolution = img_resolution
-                # Apply padding size
-                label_H = label_resolution[0] if isinstance(label_resolution, (list, tuple)) else label_resolution
-                label_W = label_resolution[1] if isinstance(label_resolution, (list, tuple)) else label_resolution
-                padded_label_H = 1 << (label_H - 1).bit_length() if label_H > 0 else 0
-                padded_label_W = 1 << (label_W - 1).bit_length() if label_W > 0 else 0
-                
-                cur_l_H, cur_l_W = padded_label_H, padded_label_W
-                l_down1_stride = (2 if cur_l_H > 1 else 1, 2 if cur_l_W > 1 else 1)
-                cur_l_H = max(1, cur_l_H // l_down1_stride[0])
-                cur_l_W = max(1, cur_l_W // l_down1_stride[1])
-
-                l_down2_stride = (2 if cur_l_H > 1 else 1, 2 if cur_l_W > 1 else 1)
-                cur_l_H = max(1, cur_l_H // l_down2_stride[0])
-                cur_l_W = max(1, cur_l_W // l_down2_stride[1])
-
-                flatten_feature_size = cur_l_H * cur_l_W * model_channels
-                self.map_label = torch.nn.Sequential(
-                    (OrderedDict([
-                                ("Label encoder", Conv2d(in_channels=label_dim, out_channels=model_channels, kernel=3, **init)),    # RT : (model_channels, padded_label_H, padded_label_W)
-                                ("SiLU 1", torch.nn.SiLU()),
-                                ("GroupNorm 1", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 1", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, resample_stride=l_down1_stride, **init)),    # RT : (model_channels, padded_label_H//2, padded_label_W//2)
-                                ("SiLU 2", torch.nn.SiLU()),
-                                ("GroupNorm 2", GroupNorm(num_channels=model_channels, eps=1e-6)),
-                                ("Label UNet 2", Conv2d(in_channels=model_channels, out_channels=model_channels, kernel=3, down=True, resample_stride=l_down2_stride, **init)),    # RT : (model_channels, padded_label_H//4, padded_label_W//4)
-                                ("Flatten", torch.nn.Flatten()),    # RT : (model_channels*2 * padded_label_H//4 * padded_label_W//4)
-                                ("Linear embedding", Linear(in_features=flatten_feature_size, out_features=noise_channels*2, **init)),
-                                ("Final Layer Norm", torch.nn.LayerNorm(noise_channels*2)),
-                    ]))
-                )
+                # Downlink CSI conditioning uses 4-channel input concat + multi-scale Cross-Attention instead of temb addition.
+                self.map_label = None
             elif self.label_type == 'classes':
                 self.map_label = Linear(in_features=label_dim, out_features=noise_channels, **init)
             elif self.label_type == 'snr':
@@ -738,34 +780,39 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
 
         self.map_augment = Linear(in_features=augment_dim, out_features=noise_channels, bias=False, **init) if augment_dim else None
 
-        if self.map_label != None and self.label_type == 'downlink':
-            if self.dynamic_noise:
-                self.map_layer0 = Conv2d(in_channels=noise_channels*3, out_channels=emb_channels*2, kernel=1, **init)
-                self.map_layer1 = Conv2d(in_channels=emb_channels*2, out_channels=emb_channels, kernel=1, **init)
-            else:
-                self.map_layer0 = Linear(in_features=noise_channels*3, out_features=emb_channels*2, **init)
-                self.map_layer1 = Linear(in_features=emb_channels*2, out_features=emb_channels, **init)
+        if self.dynamic_noise:
+            self.map_layer0 = Conv2d(in_channels=noise_channels, out_channels=emb_channels, kernel=1, **init)
+            self.map_layer1 = Conv2d(in_channels=emb_channels, out_channels=emb_channels, kernel=1, **init)
         else:
-            if self.dynamic_noise:
-                self.map_layer0 = Conv2d(in_channels=noise_channels, out_channels=emb_channels, kernel=1, **init)
-                self.map_layer1 = Conv2d(in_channels=emb_channels, out_channels=emb_channels, kernel=1, **init)
-            else:
-                self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
-                self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
+            self.map_layer0 = Linear(in_features=noise_channels, out_features=emb_channels, **init)
+            self.map_layer1 = Linear(in_features=emb_channels, out_features=emb_channels, **init)
 
         # Encoder.
         self.enc = torch.nn.ModuleDict()
-        cout = in_channels
-        caux = in_channels
+        cout = eff_in_channels
+        caux = eff_in_channels
         unet_block_class = UNetBlock_AS if self.dynamic_noise else UNetBlock
 
         img_H = img_resolution[0] if isinstance(img_resolution, (list, tuple)) else img_resolution
         img_W = img_resolution[1] if isinstance(img_resolution, (list, tuple)) else img_resolution
-        cur_H = 1 << (img_H - 1).bit_length() if img_H > 0 else 1
-        cur_W = 1 << (img_W - 1).bit_length() if img_W > 0 else 1
+        padded_H = 1 << (img_H - 1).bit_length() if img_H > 0 else 1
+        padded_W = 1 << (img_W - 1).bit_length() if img_W > 0 else 1
+        cur_H = padded_H
+        cur_W = padded_W
 
         level_resolutions = []
         down_strides = {}
+
+        if self.label_type == 'downlink':
+            self.cond_enc = torch.nn.ModuleDict()
+            self.enc_cross_attn = torch.nn.ModuleDict()
+            self.dec_cross_attn = torch.nn.ModuleDict()
+            cond_cin = self.cond_in_channels
+        else:
+            self.cond_enc = None
+            self.enc_cross_attn = None
+            self.mid_cross_attn = None
+            self.dec_cross_attn = None
 
         for level, mult in enumerate(channel_mult):
             if level > 0:
@@ -777,7 +824,7 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             level_resolutions.append((cur_H, cur_W))
 
             H_res, W_res = cur_H, cur_W
-            emb_stride = (img_H // max(H_res, 1), img_W // max(W_res, 1))
+            emb_stride = (max(1, padded_H // max(H_res, 1)), max(1, padded_W // max(W_res, 1)))
             if level == 0:
                 cin = cout
                 cout = model_channels
@@ -796,15 +843,36 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 cout = model_channels * mult
                 attn = (W_res in attn_resolutions)
                 self.enc[f'{H_res}x{W_res}_block{idx}'] = unet_block_class(in_channels=cin, out_channels=cout, attention=attn, emb_stride=emb_stride, **block_kwargs)
+
+            if self.label_type == 'downlink':
+                cond_cout = model_channels * mult
+                self.cond_enc[f'{H_res}x{W_res}'] = DownlinkCondStage(
+                    in_channels=cond_cin,
+                    out_channels=cond_cout,
+                    down=(level > 0),
+                    resample_filter=resample_filter,
+                    resample_stride=down_strides[level] if level > 0 else (1, 1),
+                    eps=1e-6,
+                    init=init,
+                )
+                cond_cin = cond_cout
+                self.enc_cross_attn[f'{H_res}x{W_res}_block{num_blocks - 1}'] = CrossAttentionBlock(
+                    channels=cout, cond_channels=cond_cout, **cross_attn_kwargs
+                )
+
         skips = [block.out_channels for name, block in self.enc.items() if 'aux' not in name]
 
         # Decoder.
         self.dec = torch.nn.ModuleDict()
         for level, mult in reversed(list(enumerate(channel_mult))):
             H_res, W_res = level_resolutions[level]
-            emb_stride = (img_H // max(H_res, 1), img_W // max(W_res, 1))
+            emb_stride = (max(1, padded_H // max(H_res, 1)), max(1, padded_W // max(W_res, 1)))
             if level == len(channel_mult) - 1:
                 self.dec[f'{H_res}x{W_res}_in0'] = unet_block_class(in_channels=cout, out_channels=cout, attention=True, emb_stride=emb_stride, **block_kwargs)
+                if self.label_type == 'downlink':
+                    self.mid_cross_attn = CrossAttentionBlock(
+                        channels=cout, cond_channels=model_channels * mult, **cross_attn_kwargs
+                    )
                 self.dec[f'{H_res}x{W_res}_in1'] = unet_block_class(in_channels=cout, out_channels=cout, emb_stride=emb_stride, **block_kwargs)
             else:
                 u_stride = down_strides[level + 1]
@@ -814,6 +882,10 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 cout = model_channels * mult
                 attn = (idx == num_blocks and W_res in attn_resolutions)
                 self.dec[f'{H_res}x{W_res}_block{idx}'] = unet_block_class(in_channels=cin, out_channels=cout, attention=attn, emb_stride=emb_stride, **block_kwargs)
+            if self.label_type == 'downlink':
+                self.dec_cross_attn[f'{H_res}x{W_res}_block{num_blocks}'] = CrossAttentionBlock(
+                    channels=cout, cond_channels=model_channels * mult, **cross_attn_kwargs
+                )
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
                     u_stride = down_strides[level + 1]
@@ -822,16 +894,18 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 self.dec[f'{H_res}x{W_res}_aux_conv'] = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 
     def forward(self, x, noise_labels, class_labels=None, augment_labels=None, z=None):
-        # [Shape 가정] x: [B, C, H, W], noise_labels: [B, C, H, W], class_labels: [B, K]
+        # [Shape 가정] x: [B, C, H, W], noise_labels: [B, C, H, W] or [B], class_labels: [B, 2, H, W] or [B, K]
         if (class_labels is None or (isinstance(class_labels, torch.Tensor) and class_labels.ndim >= 2 and class_labels.shape[-1] == 0)) and z is not None:
             class_labels = z
         
         x, pad_h, pad_w, orig_H, orig_W = pad_to_power_of_two(x)
-        if self.label_type == 'downlink' and class_labels is not None:
-            class_labels, c_pad_h, c_pad_w, c_orig_H, c_orig_W = pad_to_power_of_two(class_labels)
-
-            if pad_h != c_pad_h or pad_w != c_pad_w:
-                print("WARNING, Input class and x have different shape")
+        if self.label_type == 'downlink':
+            if class_labels is not None and isinstance(class_labels, torch.Tensor) and class_labels.numel() > 0:
+                class_labels, c_pad_h, c_pad_w, c_orig_H, c_orig_W = pad_to_power_of_two(class_labels)
+                if pad_h != c_pad_h or pad_w != c_pad_w:
+                    print("WARNING, Input class and x have different shape")
+            else:
+                class_labels = torch.zeros([x.shape[0], self.cond_in_channels, x.shape[2], x.shape[3]], device=x.device, dtype=x.dtype)
         
         is_spatial_noise = (noise_labels.ndim >= 3 and noise_labels.shape[-2:] == (orig_H, orig_W))
         
@@ -868,30 +942,15 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             # tmp shape: [B, K]
             if self.training and self.label_dropout and self.label_type != 'no_label':
                 dropout_mask = (torch.rand([x.shape[0], 1], device=x.device) >= self.label_dropout).to(tmp.dtype)
-                # tmp 텐서의 차원 수에 맞게 dropout_mask를 확장합니다.
-                # 예: tmp가 [B, C, H, W]이면 mask는 [B, 1, 1, 1]이 됩니다.
                 while dropout_mask.ndim < tmp.ndim:
                     dropout_mask = dropout_mask.unsqueeze(-1)
                 tmp = tmp * dropout_mask
                 
-            if self.label_type == 'downlink':
-                label_emb = self.map_label(tmp)
-                # label_emb shape: [B, noise_channels * 2] (map_label 설계에 따름)
-                if self.dynamic_noise:
-                    label_emb = label_emb.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, emb.shape[2], emb.shape[3])
-                    # label_emb shape: [B, noise_channels * 2, H, W]
-                emb = torch.concatenate([emb, label_emb], dim=1)
-                # emb shape (dynamic_noise=True): [B, noise_channels * 3, H, W]
-                # emb shape (dynamic_noise=False): [B, noise_channels * 3]
-            elif self.label_type == 'classes':
+            if self.label_type == 'classes':
                 label_emb = self.map_label(tmp * np.sqrt(self.map_label.in_features))
-                # label_emb shape: [B, noise_channels]
                 if self.dynamic_noise:
                     label_emb = label_emb.unsqueeze(-1).unsqueeze(-1)
-                    # label_emb shape: [B, noise_channels, 1, 1]
                 emb = emb + label_emb
-                # emb shape (dynamic_noise=True): [B, noise_channels, H, W]
-                # emb shape (dynamic_noise=False): [B, noise_channels]
             elif self.label_type == 'snr':
                 # SNR conditioning: u = W_4 * SiLU(W_3 * zeta + b_3) + b_4 (Eq. 28)
                 snr_emb = self.map_label(tmp)
@@ -902,16 +961,24 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
             else:
                 assert False, "Unknown label type"
         emb = silu(self.map_layer0(emb))
-        # emb shape (label_type='downlink', dynamic_noise=True): [B, emb_channels * 2, H, W]
-        # emb shape (label_type='downlink', dynamic_noise=False): [B, emb_channels * 2]
-        # emb shape (label_type='classes', dynamic_noise=True): [B, emb_channels, H, W]
-        # emb shape (label_type='classes', dynamic_noise=False): [B, emb_channels]
         emb = silu(self.map_layer1(emb))
-        # emb 최종 shape (dynamic_noise=True): [B, emb_channels, H, W]
-        # emb 최종 shape (dynamic_noise=False): [B, emb_channels]
         if snr_emb is not None:
             # c = v + u (Eq. 29)
             emb = emb + snr_emb
+
+        # Downlink Condition Encoding & 4-channel Input Concatenation.
+        cond_feats = None
+        if self.label_type == 'downlink':
+            cond_input = class_labels.to(x.dtype)
+            if self.training and self.label_dropout:
+                dropout_mask = (torch.rand([x.shape[0], 1, 1, 1], device=x.device) >= self.label_dropout).to(cond_input.dtype)
+                cond_input = cond_input * dropout_mask
+            cond_feats = {}
+            c_cur = cond_input
+            for res_key, cond_stage in self.cond_enc.items():
+                c_cur = cond_stage(c_cur)
+                cond_feats[res_key] = c_cur
+            x = torch.cat([x, cond_input], dim=1)
 
         # Encoder.
         skips = []
@@ -925,6 +992,9 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                 x = skips[-1] = aux = (x + block(aux)) / np.sqrt(2)
             else:
                 x = block(x, emb) if (isinstance(block, UNetBlock) or isinstance(block, UNetBlock_AS)) else block(x)
+                if self.enc_cross_attn is not None and name in self.enc_cross_attn:
+                    res_key = name.split('_')[0]
+                    x = self.enc_cross_attn[name](x, cond_feats[res_key])
                 skips.append(x)
 
         # Decoder.
@@ -943,6 +1013,12 @@ class RF_SongUNet(torch.nn.Module, PyTorchModelHubMixin):
                     x = torch.cat([x, skips.pop()], dim=1)
                     
                 x = block(x, emb)
+                if self.mid_cross_attn is not None and name.endswith('_in0'):
+                    res_key = name.split('_')[0]
+                    x = self.mid_cross_attn(x, cond_feats[res_key])
+                elif self.dec_cross_attn is not None and name in self.dec_cross_attn:
+                    res_key = name.split('_')[0]
+                    x = self.dec_cross_attn[name](x, cond_feats[res_key])
 
         aux = unpad_from_power_of_two(aux, pad_h, pad_w, orig_H, orig_W)
 
@@ -1618,6 +1694,9 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         if model_in_channels is None:
             if model_type == 'RF_DiT' and img_channels % 2 == 0:
                 model_in_channels = img_channels // 2
+            elif model_type == 'RF_SongUNet' and model_kwargs.get('label_type', 'downlink') == 'downlink':
+                cond_ch = label_dim if (label_dim is not None and label_dim > 0) else img_channels
+                model_in_channels = img_channels + cond_ch
             else:
                 model_in_channels = img_channels
         if model_out_channels is None:
@@ -1642,9 +1721,16 @@ class EDMPrecond(torch.nn.Module, PyTorchModelHubMixin):
         
         while sigma.ndim < x.ndim:
             sigma = sigma.unsqueeze(-1)
-        if class_labels is not None and isinstance(class_labels, torch.Tensor) and class_labels.ndim == 1 and self.label_dim == 1:
-            class_labels = class_labels.unsqueeze(-1)
-        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if (class_labels is None or (isinstance(class_labels, torch.Tensor) and class_labels.shape[-1] != self.label_dim)) else class_labels.to(torch.float32)
+        if getattr(self.model, 'label_type', None) == 'downlink':
+            if class_labels is None or (isinstance(class_labels, torch.Tensor) and class_labels.numel() == 0):
+                cond_ch = getattr(self.model, 'cond_in_channels', self.img_channels)
+                class_labels = torch.zeros([x.shape[0], cond_ch, x.shape[2], x.shape[3]], device=x.device, dtype=torch.float32)
+            else:
+                class_labels = class_labels.to(torch.float32)
+        else:
+            if class_labels is not None and isinstance(class_labels, torch.Tensor) and class_labels.ndim == 1 and self.label_dim == 1:
+                class_labels = class_labels.unsqueeze(-1)
+            class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if (class_labels is None or (isinstance(class_labels, torch.Tensor) and class_labels.shape[-1] != self.label_dim)) else class_labels.to(torch.float32)
         dtype = torch.bfloat16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
