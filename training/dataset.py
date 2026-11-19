@@ -300,6 +300,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  flip_keep_dataset = False,
                  only_additive_noise = False,
                  snr_range = None,
+                 expand_all_frames = False,
                  **super_kwargs):
         self.minimum_sigma = sigma
         self.snr_range = parse_snr_range(snr_range)
@@ -378,12 +379,16 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         single_csi_shape = self.__load_single_file(self._fname[0])[0].shape
+        self._num_frames_per_file = int(single_csi_shape[0])
+        self._expand_all_frames = bool(expand_all_frames and self._label_spliting_flag)
 
         if self._label_spliting_flag:
             tmp_shape = np.array(single_csi_shape)
             tmp_shape[0] = 1
             tmp_shape[-1] = tmp_shape[-1] // 2
             single_csi_shape = tuple(tmp_shape.tolist())
+            if self._transpose == (1, 0):
+                self._transpose = (0, 1)
 
         if self._transpose is not None:
             actual_csi_shape = [single_csi_shape[ax] for ax in self._transpose] + [single_csi_shape[2]]
@@ -402,7 +407,8 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
             warnings.warn("complex_merge_axis is only applicable when view_as_complex is False")
 
         self.image_actual_shape = actual_csi_shape
-        raw_shape = [len(self._fname)] + actual_csi_shape
+        total_items = len(self._fname) * self._num_frames_per_file if self._expand_all_frames else len(self._fname)
+        raw_shape = [total_items] + actual_csi_shape
 
         self._resolution = raw_shape[-2:]
         super().__init__(name=name, raw_shape=raw_shape, use_labels=use_labels, **super_kwargs)
@@ -460,6 +466,8 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         return csi_data, noise_sigma_data
 
     def __len__(self):
+        if self._expand_all_frames:
+            return len(self._fname) * self._num_frames_per_file
         return len(self._fname)
     
     def _load_and_normalize(self, item_fname):
@@ -556,9 +564,14 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         return self._format_output(csi_data, label_data, noise_sigma_data, item_fname, corruption_label, t_idx=sampled_t_idx)
 
     def __getitem__(self, idx):
-        item_fname = self._fname[idx]
-
-        return_item = self.__create_item__(item_fname, idx)
+        if self._expand_all_frames:
+            file_idx = idx // self._num_frames_per_file
+            t_idx = idx % self._num_frames_per_file
+            item_fname = self._fname[file_idx]
+            return_item = self.__create_item__(item_fname, idx, t_idx=t_idx)
+        else:
+            item_fname = self._fname[idx]
+            return_item = self.__create_item__(item_fname, idx)
         return_item['idx'] = idx
         return return_item
 

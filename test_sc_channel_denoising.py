@@ -270,10 +270,12 @@ def slice_channel_resources(
 @click.option('--sigma_min',               help='Lowest noise level', type=float, default=None)
 @click.option('--sigma_max',               help='Highest noise level override', type=float, default=None)
 @click.option('--rho',                     help='Time step exponent', type=float, default=7.0, show_default=True)
+@click.option('--solver',                  help='ODE solver', metavar='heun|euler', type=click.Choice(['heun', 'euler']), default='heun', show_default=True)
 @click.option('--S_churn', 'S_churn',     help='Stochasticity strength', type=float, default=0.0, show_default=True)
 @click.option('--S_min', 'S_min',         help='Stochasticity min noise level', type=float, default=0.0, show_default=True)
 @click.option('--S_max', 'S_max',         help='Stochasticity max noise level', type=float, default=float('inf'), show_default=True)
 @click.option('--S_noise', 'S_noise',     help='Stochasticity noise inflation', type=float, default=1.0, show_default=True)
+@click.option('--stop_sigma',              help='Early stop generation at this variance', type=float, default=0.0, show_default=True)
 @click.option('--bf16',                    help='Enable bfloat16 precision for diffusion sampling', is_flag=True)
 @click.option('--allow_tf32',              help='Allow TF32 matmul and cudnn', is_flag=True)
 @click.option('--no_baselines',            help='Disable baseline evaluations (NoDiff, PerfectCSI, Clean)', is_flag=True)
@@ -482,10 +484,12 @@ def main(**kwargs):
         'num_steps': opt.num_steps,
         'sigma_min': opt.sigma_min,
         'rho': opt.rho,
+        'solver': opt.solver,
         'S_churn': opt.S_churn,
         'S_min': opt.S_min,
         'S_max': opt.S_max,
         'S_noise': opt.S_noise,
+        'stop_sigma': opt.stop_sigma,
     }
     sampler_kwargs = {k: v for k, v in sampler_kwargs.items() if v is not None}
 

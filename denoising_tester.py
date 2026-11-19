@@ -37,11 +37,12 @@ def pad_collate_fn(img, label=None):
     if pad_h > 0 or pad_w > 0:
         # torch.nn.functional.pad는 뒤에서부터 (left, right, top, bottom) 순서로 적용
         pad_width = (0, pad_w, 0, pad_h)
-        img = torch.nn.functional.pad(img, pad_width, mode='constant', value=0)
 
-        # image와 label의 shape이 같으면(예: segmentation) label도 동일하게 패딩
+        # image와 label의 shape이 같으면(예: segmentation / downlink condition) label도 동일하게 패딩
         if label is not None and img.shape == label.shape:
             label = torch.nn.functional.pad(label, pad_width, mode='constant', value=0)
+
+        img = torch.nn.functional.pad(img, pad_width, mode='constant', value=0)
 
     return img, label, original_shape
 
@@ -173,10 +174,12 @@ def parse_int_list(s):
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
 @click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
 @click.option('--rho',                     help='Time step exponent', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
+@click.option('--solver',                  help='ODE solver', metavar='heun|euler',                                 type=click.Choice(['heun', 'euler']), default='heun', show_default=True)
 @click.option('--S_churn', 'S_churn',      help='Stochasticity strength', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_min', 'S_min',          help='Stoch. min noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
+@click.option('--stop_sigma',              help='Early stop generation at this variance',                           type=float, default=0.0, show_default=True)
 @click.option('--data_norm',               help='Data normalization value for the RF data.',                        type=float, default=1.0, show_default=True)
 @click.option('--allow_tf32',              is_flag=True)
 @click.option('--bf16',                    help='Enable bfloat16 mixed precision for model computation', is_flag=True)
@@ -310,10 +313,12 @@ def main(**kwargs):
         'num_steps': opt.num_steps,
         'sigma_min': opt.sigma_min,
         'rho': opt.rho,
+        'solver': opt.solver,
         'S_churn': opt.S_churn,
         'S_min': opt.S_min,
         'S_max': opt.S_max,
         'S_noise': opt.S_noise,
+        'stop_sigma': opt.stop_sigma,
     }
     sampler_kwargs = {k: v for k, v in sampler_kwargs.items() if v is not None}
 

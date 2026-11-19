@@ -153,6 +153,7 @@ def edm_sampler_with_scheduler(
 def inference_edm_sampler_with_scheduler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    solver='heun',
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
     stop_sigma=0.0, latents_already_noisy=False, padding_mask=1,
     sigma_t_n=None, z=None,
@@ -341,7 +342,7 @@ def inference_edm_sampler_with_scheduler(
         x_pred = x_hat + step_noise_scale * d_cur * padding_mask
 
         # Apply 2nd order correction (Heun).
-        if i < num_steps - 1:
+        if solver == 'heun' and i < num_steps - 1:
             denoised_prime = net(x_pred, sigma_next, class_labels=class_labels_to_pass, z=z_input).to(torch.float64) * padding_mask
             x_list.append(denoised_prime.clone().detach())
             safe_sigma_next = torch.where(sigma_next == 0, torch.tensor(1e-8, device=sigma_next.device, dtype=sigma_next.dtype), sigma_next)
@@ -373,14 +374,17 @@ def inference_edm_sampler_with_scheduler(
 def inference_edm_sampler(
     net, latents, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
+    solver='heun',
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
     stop_sigma=0.0, latents_already_noisy=False, padding_mask=1,
     **kwargs
 ):
+    assert solver in ['euler', 'heun'], f"Unsupported solver: {solver}"
     if _get_net_attr(net, "get_noise_scheduling") is not None:
         return inference_edm_sampler_with_scheduler(
             net=net, latents=latents, class_labels=class_labels, randn_like=randn_like,
             num_steps=num_steps, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho,
+            solver=solver,
             S_churn=S_churn, S_min=S_min, S_max=S_max, S_noise=S_noise,
             stop_sigma=stop_sigma, latents_already_noisy=latents_already_noisy, padding_mask=padding_mask,
             **kwargs
@@ -504,7 +508,7 @@ def inference_edm_sampler(
         x_pred = x_hat + step_noise_scale * d_cur * padding_mask
 
         # Apply 2nd order correction.
-        if i < num_steps - 1:
+        if solver == 'heun' and i < num_steps - 1:
             t_next_net = t_next_dynamic
             if padding_exist:
                 t_next_net = torch.mean(t_next_dynamic, dim=list(range(1, t_next_dynamic.ndim)), keepdim=True)
