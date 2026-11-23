@@ -29,6 +29,20 @@ def _get_net_attr(n, name):
         return getattr(n.module, name)
     return None
 
+
+def _rms_mean_current_sigma(current_sigma, padding_mask=None):
+    """Replace current_sigma with its per-sample RMS across non-batch dimensions."""
+    if current_sigma.ndim <= 1:
+        return current_sigma
+    dims = tuple(range(1, current_sigma.ndim))
+    if isinstance(padding_mask, torch.Tensor):
+        mask = padding_mask.to(dtype=current_sigma.dtype, device=current_sigma.device)
+        valid_count = torch.sum(mask, dim=dims, keepdim=True).clamp(min=1.0)
+        rms = torch.sqrt(torch.sum((current_sigma ** 2) * mask, dim=dims, keepdim=True) / valid_count)
+        return (rms * mask).expand_as(current_sigma)
+    rms = torch.sqrt(torch.mean(current_sigma ** 2, dim=dims, keepdim=True))
+    return rms.expand_as(current_sigma)
+
 #----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
 # of Diffusion-Based Generative Models" (EDM).
@@ -37,13 +51,14 @@ def _get_net_attr(n, name):
 class EDMLoss:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
 
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
+        self.iso_asm_loss_only = iso_asm_loss_only
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -99,6 +114,8 @@ class EDMLoss:
         # Instead, we use sigma_t_n for noise level.
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
+        elif self.iso_asm_loss_only:
+            current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
@@ -164,13 +181,14 @@ class EDMLoss_with_scheduler:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
                  consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False,
-                 sigma_max=80, kl_coeff=1.0, **kwargs):
+                 iso_asm_loss_only=False, sigma_max=80, kl_coeff=1.0, **kwargs):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
 
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
+        self.iso_asm_loss_only = iso_asm_loss_only
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -264,6 +282,8 @@ class EDMLoss_with_scheduler:
         # Instead, we use sigma_t_n for noise level.
         if self.no_asm2:
             current_sigma_f64 = torch.zeros_like(current_sigma_f64)
+        elif self.iso_asm_loss_only:
+            current_sigma_f64 = _rms_mean_current_sigma(current_sigma_f64, padding_mask)
 
         D_yn_f64 = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input_f64, nonzero_sigma_f64, current_sigma_f64)
 
@@ -368,13 +388,14 @@ class EDMLoss_with_latent_z:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
                  consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False,
-                 kl_coeff=1.0, **kwargs):
+                 iso_asm_loss_only=False, kl_coeff=1.0, **kwargs):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
 
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
+        self.iso_asm_loss_only = iso_asm_loss_only
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -449,6 +470,8 @@ class EDMLoss_with_latent_z:
         # Instead, we use sigma_t_n for noise level.
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
+        elif self.iso_asm_loss_only:
+            current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
 
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
 
@@ -520,7 +543,7 @@ class EDMLoss_with_latent_z:
 class EDMLoss_loss_scaling_test:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, sigma_loss_scaling=0.5):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, sigma_loss_scaling=0.5):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -528,6 +551,7 @@ class EDMLoss_loss_scaling_test:
 
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
+        self.iso_asm_loss_only = iso_asm_loss_only
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -584,6 +608,8 @@ class EDMLoss_loss_scaling_test:
         # Instead, we use sigma_t_n for noise level.
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
+        elif self.iso_asm_loss_only:
+            current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
@@ -656,7 +682,7 @@ class EDMLoss_loss_scaling_test:
 class EDMLoss_dynamic_sigma:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False,
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False,
                  lognorm_dist_mean = 0.11322956881040724,
                  lognorm_dist_loc = -0.3077225803161989,
                  lognorm_dist_sigma = 0.3644639849662781):
@@ -672,6 +698,7 @@ class EDMLoss_dynamic_sigma:
         self.with_grad = with_grad
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
+        self.iso_asm_loss_only = iso_asm_loss_only
 
         self.lognorm_dist_mean = lognorm_dist_mean
         self.lognorm_dist_loc = lognorm_dist_loc
@@ -727,6 +754,8 @@ class EDMLoss_dynamic_sigma:
         # Instead, we use sigma_t_n for noise level.
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
+        elif self.iso_asm_loss_only:
+            current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
@@ -797,7 +826,7 @@ class EDMLoss_dynamic_sigma:
 class EDMLoss_boosted_sigma:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False):
                  
         self.P_mean = P_mean
         self.P_std = P_std
@@ -811,6 +840,7 @@ class EDMLoss_boosted_sigma:
         self.with_grad = with_grad
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
+        self.iso_asm_loss_only = iso_asm_loss_only
 
     def __call__(self, net, images, labels=None, current_sigma=0.0, augment_pipe=None, original_shape=None):
         current_sigma = torch.tensor(current_sigma)
@@ -861,6 +891,8 @@ class EDMLoss_boosted_sigma:
         # Instead, we use sigma_t_n for noise level.
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
+        elif self.iso_asm_loss_only:
+            current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
         D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)

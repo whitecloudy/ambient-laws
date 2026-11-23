@@ -28,6 +28,40 @@ import copy
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
 
 #----------------------------------------------------------------------------
+
+ABLATION_MODES = {
+    'a2sm': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False),
+    'no_asm': dict(dynamic_noise_sigma=True, no_asm=True, no_asm2=False, iso_asm_loss_only=False),
+    'no_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=True, iso_asm_loss_only=False),
+    'iso_asm': dict(dynamic_noise_sigma=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False),
+    'iso_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=True),
+}
+
+
+def resolve_ablation_options(opts, cli_sources=None):
+    """Apply --ablation preset overrides to opts and return conflict warnings."""
+    ablation = (opts.get('ablation') or 'default').lower()
+    if ablation != 'default' and ablation not in ABLATION_MODES:
+        raise ValueError(f'Unknown ablation mode: {ablation}')
+    opts.ablation = ablation
+    if ablation == 'default':
+        opts.iso_asm_loss_only = False
+        return []
+
+    target = ABLATION_MODES[ablation]
+    warnings_list = []
+    for key in ('dynamic_noise_sigma', 'no_asm', 'no_asm2'):
+        was_explicit = bool(cli_sources.get(key, False)) if cli_sources is not None else bool(opts.get(key, False))
+        cur_val = bool(opts.get(key, False))
+        if was_explicit and cur_val != target[key]:
+            warnings_list.append(
+                f"Warning: --ablation={ablation} overrides --{key}={cur_val} -> {target[key]}"
+            )
+        opts[key] = target[key]
+    opts.iso_asm_loss_only = target['iso_asm_loss_only']
+    return warnings_list
+
+#----------------------------------------------------------------------------
 # Parse a comma separated list of numbers or ranges and return a list of ints.
 # Example: '1,2,5-10' returns [1, 2, 5, 6, 7, 8, 9, 10]
 
@@ -57,6 +91,7 @@ def parse_int_list(s):
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--no_asm2',       help='Force not to use ASM Loss (use sigma_t_n for noise level)',  is_flag=True)
+@click.option('--ablation',      help='Ablation mode: default (use provided flags), a2sm, no_asm, no_asm_loss_only, iso_asm, iso_asm_loss_only', type=click.Choice(['default', 'a2sm', 'no_asm', 'no_asm_loss_only', 'iso_asm', 'iso_asm_loss_only'], case_sensitive=False), default='default', show_default=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',            type=str, default=None, show_default=True)
 
@@ -186,6 +221,13 @@ def main(**kwargs):
         --data=datasets/cifar10-32x32.zip --cond=1 --arch=ddpmpp
     """
     opts = dnnlib.EasyDict(kwargs)
+    ctx = click.get_current_context(silent=True)
+    cli_sources = {}
+    if ctx is not None:
+        for key in ('dynamic_noise_sigma', 'no_asm', 'no_asm2'):
+            cli_sources[key] = (ctx.get_parameter_source(key) == click.core.ParameterSource.COMMANDLINE)
+    ablation_warnings = resolve_ablation_options(opts, cli_sources=cli_sources)
+
     torch.multiprocessing.set_start_method('spawn')
 
     complex_merge_axis = opts.complex_merge_axis
@@ -194,6 +236,8 @@ def main(**kwargs):
     else:
         complex_merge_axis = int(complex_merge_axis)
     dist.init()
+    for warning_msg in ablation_warnings:
+        dist.print0(warning_msg)
     
     # Initialize config dict.
     c = dnnlib.EasyDict()
@@ -586,6 +630,7 @@ def main(**kwargs):
     c.loss_kwargs.update(consistency_coeff=opts.consistency_coeff)
     c.loss_kwargs.update(no_asm=opts.no_asm)
     c.loss_kwargs.update(no_asm2=opts.no_asm2)
+    c.loss_kwargs.update(iso_asm_loss_only=opts.iso_asm_loss_only)
     c.loss_kwargs.update(P_mean=opts.p_mean, P_std=opts.p_std, sigma_data=opts.sigma_data)
 
     # Network options.
@@ -688,6 +733,7 @@ def main(**kwargs):
         # Create a deep copy for JSON serialization
         c_json = copy.deepcopy(c)
         c_json.wandb_id = wandb_id if opts.wandb else None
+        c_json.ablation = opts.ablation
         # Convert function object to its name for serialization
         if 'collate_fn' in c_json.data_loader_kwargs and callable(c_json.data_loader_kwargs.collate_fn):
             c_json.data_loader_kwargs.collate_fn = c_json.data_loader_kwargs.collate_fn.__name__
@@ -707,6 +753,7 @@ def main(**kwargs):
             dist.print0(f'  Causal conv on T:      {c.network_kwargs.get("causal_conv", True)}')
             dist.print0(f'  Positional embed:      {c.network_kwargs.get("pos_embed_type", "learnable_2d")}')
         dist.print0(f'Preconditioning & loss:  {opts.precond}')
+        dist.print0(f'Ablation mode:           {opts.ablation}')
         dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
         dist.print0(f'Batch size:              {c.batch_size}')
         dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
