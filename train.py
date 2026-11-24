@@ -30,11 +30,12 @@ warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides
 #----------------------------------------------------------------------------
 
 ABLATION_MODES = {
-    'a2sm': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False),
-    'no_asm': dict(dynamic_noise_sigma=True, no_asm=True, no_asm2=False, iso_asm_loss_only=False),
-    'no_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=True, iso_asm_loss_only=False),
-    'iso_asm': dict(dynamic_noise_sigma=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False),
-    'iso_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=True),
+    'a2sm': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False),
+    'a2sm_maxclip': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=True),
+    'no_asm': dict(dynamic_noise_sigma=True, no_asm=True, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False),
+    'no_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=True, iso_asm_loss_only=False, max_sigma_clip=False),
+    'iso_asm': dict(dynamic_noise_sigma=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False),
+    'iso_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=True, max_sigma_clip=False),
 }
 
 
@@ -46,6 +47,7 @@ def resolve_ablation_options(opts, cli_sources=None):
     opts.ablation = ablation
     if ablation == 'default':
         opts.iso_asm_loss_only = False
+        opts.max_sigma_clip = False
         return []
 
     target = ABLATION_MODES[ablation]
@@ -59,6 +61,7 @@ def resolve_ablation_options(opts, cli_sources=None):
             )
         opts[key] = target[key]
     opts.iso_asm_loss_only = target['iso_asm_loss_only']
+    opts.max_sigma_clip = target['max_sigma_clip']
     return warnings_list
 
 #----------------------------------------------------------------------------
@@ -91,7 +94,7 @@ def parse_int_list(s):
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--no_asm2',       help='Force not to use ASM Loss (use sigma_t_n for noise level)',  is_flag=True)
-@click.option('--ablation',      help='Ablation mode: default (use provided flags), a2sm, no_asm, no_asm_loss_only, iso_asm, iso_asm_loss_only', type=click.Choice(['default', 'a2sm', 'no_asm', 'no_asm_loss_only', 'iso_asm', 'iso_asm_loss_only'], case_sensitive=False), default='default', show_default=True)
+@click.option('--ablation',      help='Ablation mode: default (use provided flags), a2sm, a2sm_maxclip, no_asm, no_asm_loss_only, iso_asm, iso_asm_loss_only', type=click.Choice(['default', 'a2sm', 'a2sm_maxclip', 'no_asm', 'no_asm_loss_only', 'iso_asm', 'iso_asm_loss_only'], case_sensitive=False), default='default', show_default=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',            type=str, default=None, show_default=True)
 
@@ -631,6 +634,7 @@ def main(**kwargs):
     c.loss_kwargs.update(no_asm=opts.no_asm)
     c.loss_kwargs.update(no_asm2=opts.no_asm2)
     c.loss_kwargs.update(iso_asm_loss_only=opts.iso_asm_loss_only)
+    c.loss_kwargs.update(max_sigma_clip=opts.max_sigma_clip)
     c.loss_kwargs.update(P_mean=opts.p_mean, P_std=opts.p_std, sigma_data=opts.sigma_data)
 
     # Network options.

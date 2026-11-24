@@ -43,6 +43,16 @@ def _rms_mean_current_sigma(current_sigma, padding_mask=None):
     rms = torch.sqrt(torch.mean(current_sigma ** 2, dim=dims, keepdim=True))
     return rms.expand_as(current_sigma)
 
+
+def _clamp_sigma_min(sigma, current_sigma, eps=1e-6, max_sigma_clip=False):
+    """Clamp sampled sigma from below using per-sample max or element-wise current_sigma."""
+    if max_sigma_clip and current_sigma.ndim > 1:
+        min_sigma_of_each_batch = torch.amax(
+            current_sigma, dim=tuple(range(1, current_sigma.ndim)), keepdim=True
+        )
+        return torch.clamp(sigma, min=min_sigma_of_each_batch + eps)
+    return torch.clamp(sigma, min=current_sigma + eps)
+
 #----------------------------------------------------------------------------
 # Improved loss function proposed in the paper "Elucidating the Design Space
 # of Diffusion-Based Generative Models" (EDM).
@@ -51,7 +61,7 @@ def _rms_mean_current_sigma(current_sigma, padding_mask=None):
 class EDMLoss:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -59,6 +69,7 @@ class EDMLoss:
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
         self.iso_asm_loss_only = iso_asm_loss_only
+        self.max_sigma_clip = max_sigma_clip
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -90,9 +101,7 @@ class EDMLoss:
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        # min_sigma_of_each_batch = torch.amax(current_sigma, dim=tuple(range(1, current_sigma.ndim)), keepdim=True)
-        # sigma = torch.clamp(sigma, min=min_sigma_of_each_batch + 1e-6)
-        sigma = torch.clamp(sigma, min=current_sigma + 1e-6)
+        sigma = _clamp_sigma_min(sigma, current_sigma, eps=1e-6, max_sigma_clip=self.max_sigma_clip)
         y, augment_labels = (images, None)
         
         # add additional noise to reach the level sigma
@@ -181,7 +190,7 @@ class EDMLoss_with_scheduler:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
                  consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False,
-                 iso_asm_loss_only=False, sigma_max=80, kl_coeff=1.0, **kwargs):
+                 iso_asm_loss_only=False, max_sigma_clip=False, sigma_max=80, kl_coeff=1.0, **kwargs):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -189,6 +198,7 @@ class EDMLoss_with_scheduler:
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
         self.iso_asm_loss_only = iso_asm_loss_only
+        self.max_sigma_clip = max_sigma_clip
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -388,7 +398,7 @@ class EDMLoss_with_latent_z:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
                  consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False,
-                 iso_asm_loss_only=False, kl_coeff=1.0, **kwargs):
+                 iso_asm_loss_only=False, max_sigma_clip=False, kl_coeff=1.0, **kwargs):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -396,6 +406,7 @@ class EDMLoss_with_latent_z:
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
         self.iso_asm_loss_only = iso_asm_loss_only
+        self.max_sigma_clip = max_sigma_clip
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -427,7 +438,7 @@ class EDMLoss_with_latent_z:
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device, dtype=images.dtype)
         # sample a sigma in [current_sigma, sigma_T]
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        sigma = torch.clamp(sigma, min=current_sigma + 1e-6)
+        sigma = _clamp_sigma_min(sigma, current_sigma, eps=1e-6, max_sigma_clip=self.max_sigma_clip)
 
         generate_latent_z_fn = _get_net_attr(net, "generate_latent_z")
         assert generate_latent_z_fn is not None, "net must have generate_latent_z method in EDMLoss_with_latent_z"
@@ -543,7 +554,7 @@ class EDMLoss_with_latent_z:
 class EDMLoss_loss_scaling_test:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, sigma_loss_scaling=0.5):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False, sigma_loss_scaling=0.5):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -552,6 +563,7 @@ class EDMLoss_loss_scaling_test:
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
         self.iso_asm_loss_only = iso_asm_loss_only
+        self.max_sigma_clip = max_sigma_clip
 
         self.num_consistency_steps = num_consistency_steps
         self.num_primes = num_primes
@@ -583,10 +595,7 @@ class EDMLoss_loss_scaling_test:
         rnd_normal = torch.randn([images.shape[0], ] + ([1] * (images.ndim - 1)), device=images.device)
         # sample a sigma in [current_sigma, sigma_T]
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        # TEMP : temporary change for check the impact of sigma max clamp during varying ASM Loss
-        min_sigma_of_each_batch = torch.amax(current_sigma, dim=tuple(range(1, current_sigma.ndim)), keepdim=True)
-        sigma = torch.clamp(sigma, min=min_sigma_of_each_batch + 1e-6)
-        # sigma = torch.clamp(sigma, min=current_sigma + 1e-6)
+        sigma = _clamp_sigma_min(sigma, current_sigma, eps=1e-6, max_sigma_clip=self.max_sigma_clip)
         y, augment_labels = (images, None)
         
         # add additional noise to reach the level sigma
@@ -682,7 +691,7 @@ class EDMLoss_loss_scaling_test:
 class EDMLoss_dynamic_sigma:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False,
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False,
                  lognorm_dist_mean = 0.11322956881040724,
                  lognorm_dist_loc = -0.3077225803161989,
                  lognorm_dist_sigma = 0.3644639849662781):
@@ -699,6 +708,7 @@ class EDMLoss_dynamic_sigma:
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
         self.iso_asm_loss_only = iso_asm_loss_only
+        self.max_sigma_clip = max_sigma_clip
 
         self.lognorm_dist_mean = lognorm_dist_mean
         self.lognorm_dist_loc = lognorm_dist_loc
@@ -731,7 +741,7 @@ class EDMLoss_dynamic_sigma:
         # sample a sigma in [current_sigma, sigma_T]
         sigma_center = (rnd_normal * self.P_std + self.P_mean).exp()        
         sigma = torch.tensor(self.__get_lognormal_values(images.shape), device=images.device, dtype=torch.float32) * sigma_center
-        sigma = torch.clamp(sigma, min=current_sigma + 1e-5) * padding_mask
+        sigma = _clamp_sigma_min(sigma, current_sigma, eps=1e-5, max_sigma_clip=self.max_sigma_clip) * padding_mask
 
         y, augment_labels = (images, None)
 
@@ -826,7 +836,7 @@ class EDMLoss_dynamic_sigma:
 class EDMLoss_boosted_sigma:
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5, 
                  num_primes=4, num_consistency_steps=4, consistency_coeff=1.0, 
-                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False):
+                 consistency_batch_size_per_gpu=4, with_weight=True, with_grad=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False):
                  
         self.P_mean = P_mean
         self.P_std = P_std
@@ -841,6 +851,7 @@ class EDMLoss_boosted_sigma:
         self.no_asm = no_asm
         self.no_asm2 = no_asm2
         self.iso_asm_loss_only = iso_asm_loss_only
+        self.max_sigma_clip = max_sigma_clip
 
     def __call__(self, net, images, labels=None, current_sigma=0.0, augment_pipe=None, original_shape=None):
         current_sigma = torch.tensor(current_sigma)
@@ -868,7 +879,7 @@ class EDMLoss_boosted_sigma:
         # sample a sigma in [current_sigma, sigma_T]
         sigma_center = (rnd_normal * self.P_std + self.P_mean).exp()        
         sigma = normalized_current_sigma * sigma_center
-        sigma = torch.clamp(sigma, min=current_sigma + 1e-5) * padding_mask
+        sigma = _clamp_sigma_min(sigma, current_sigma, eps=1e-5, max_sigma_clip=self.max_sigma_clip) * padding_mask
 
         y, augment_labels = (images, None)
 
