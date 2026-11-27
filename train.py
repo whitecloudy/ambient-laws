@@ -16,7 +16,14 @@ import torch
 import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
-from training.dataset import renewRfProcessedDataset, pad_collate_fn, rf_augmentation_collate_fn, WiDARDataset, XRF55Dataset
+from training.dataset import (
+    DEFAULT_SIGMA_ERROR_SEED,
+    renewRfProcessedDataset,
+    pad_collate_fn,
+    rf_augmentation_collate_fn,
+    WiDARDataset,
+    XRF55Dataset,
+)
 from training.semantic_comm_dataset import RenewSemanticCommunicationDataset
 import ambient_utils
 import warnings
@@ -29,13 +36,17 @@ warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides
 
 #----------------------------------------------------------------------------
 
+DEFAULT_SIGMA_EST_SAMPLES = 52
+
 ABLATION_MODES = {
-    'a2sm': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False),
-    'a2sm_maxclip': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=True),
-    'no_asm': dict(dynamic_noise_sigma=True, no_asm=True, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False),
-    'no_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=True, iso_asm_loss_only=False, max_sigma_clip=False),
-    'iso_asm': dict(dynamic_noise_sigma=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False),
-    'iso_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=True, max_sigma_clip=False),
+    'a2sm': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False, sigma_est_samples=None),
+    'a2sm_maxclip': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=True, sigma_est_samples=None),
+    'a2sm_inaccurate_sigma': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False, sigma_est_samples=DEFAULT_SIGMA_EST_SAMPLES),
+    'no_asm': dict(dynamic_noise_sigma=True, no_asm=True, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False, sigma_est_samples=None),
+    'no_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=True, iso_asm_loss_only=False, max_sigma_clip=False, sigma_est_samples=None),
+    'iso_asm': dict(dynamic_noise_sigma=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False, sigma_est_samples=None),
+    'iso_asm_inaccurate_sigma': dict(dynamic_noise_sigma=False, no_asm=False, no_asm2=False, iso_asm_loss_only=False, max_sigma_clip=False, sigma_est_samples=DEFAULT_SIGMA_EST_SAMPLES),
+    'iso_asm_loss_only': dict(dynamic_noise_sigma=True, no_asm=False, no_asm2=False, iso_asm_loss_only=True, max_sigma_clip=False, sigma_est_samples=None),
 }
 
 
@@ -48,6 +59,7 @@ def resolve_ablation_options(opts, cli_sources=None):
     if ablation == 'default':
         opts.iso_asm_loss_only = False
         opts.max_sigma_clip = False
+        opts.sigma_est_samples = opts.get('sigma_est_samples', None)
         return []
 
     target = ABLATION_MODES[ablation]
@@ -62,6 +74,14 @@ def resolve_ablation_options(opts, cli_sources=None):
         opts[key] = target[key]
     opts.iso_asm_loss_only = target['iso_asm_loss_only']
     opts.max_sigma_clip = target['max_sigma_clip']
+
+    sigma_was_explicit = (
+        bool(cli_sources.get('sigma_est_samples', False))
+        if cli_sources is not None
+        else (opts.get('sigma_est_samples', None) is not None)
+    )
+    if not sigma_was_explicit:
+        opts.sigma_est_samples = target['sigma_est_samples']
     return warnings_list
 
 #----------------------------------------------------------------------------
@@ -94,7 +114,9 @@ def parse_int_list(s):
 @click.option('--real_precond',  help='Preconditioning & loss function', metavar='edm|edm_c_skip|edm_input_scaling_test|edm_with_scheduler',       type=click.Choice(['edm', 'edm_c_skip', 'edm_input_scaling_test', 'edm_with_scheduler']), default='edm', show_default=True)
 @click.option('--no_asm',        help='Force not to use ASM Loss',                                  is_flag=True)
 @click.option('--no_asm2',       help='Force not to use ASM Loss (use sigma_t_n for noise level)',  is_flag=True)
-@click.option('--ablation',      help='Ablation mode: default (use provided flags), a2sm, a2sm_maxclip, no_asm, no_asm_loss_only, iso_asm, iso_asm_loss_only', type=click.Choice(['default', 'a2sm', 'a2sm_maxclip', 'no_asm', 'no_asm_loss_only', 'iso_asm', 'iso_asm_loss_only'], case_sensitive=False), default='default', show_default=True)
+@click.option('--ablation',      help='Ablation mode: default (use provided flags), a2sm, a2sm_maxclip, a2sm_inaccurate_sigma, no_asm, no_asm_loss_only, iso_asm, iso_asm_inaccurate_sigma, iso_asm_loss_only', type=click.Choice(['default', 'a2sm', 'a2sm_maxclip', 'a2sm_inaccurate_sigma', 'no_asm', 'no_asm_loss_only', 'iso_asm', 'iso_asm_inaccurate_sigma', 'iso_asm_loss_only'], case_sensitive=False), default='default', show_default=True)
+@click.option('--sigma_est_samples', help='Number of complex samples N for Scaled Chi(df=2N) current_sigma estimation error (None=disabled; defaults to 52 in *_inaccurate_sigma ablations).', metavar='INT', type=click.IntRange(min=1), default=None, show_default=True)
+@click.option('--sigma_error_seed',  help='Fixed deterministic seed for Scaled Chi current_sigma estimation error.', metavar='INT', type=int, default=DEFAULT_SIGMA_ERROR_SEED, show_default=True)
 @click.option('--must_contain',  help='Dataset name should contain', metavar='STR',                 type=str, default=None, show_default=True)
 @click.option('--must_not_contain',help='Dataset name should not contain', metavar='STR',            type=str, default=None, show_default=True)
 
@@ -227,7 +249,7 @@ def main(**kwargs):
     ctx = click.get_current_context(silent=True)
     cli_sources = {}
     if ctx is not None:
-        for key in ('dynamic_noise_sigma', 'no_asm', 'no_asm2'):
+        for key in ('dynamic_noise_sigma', 'no_asm', 'no_asm2', 'sigma_est_samples'):
             cli_sources[key] = (ctx.get_parameter_source(key) == click.core.ParameterSource.COMMANDLINE)
     ablation_warnings = resolve_ablation_options(opts, cli_sources=cli_sources)
 
@@ -289,8 +311,12 @@ def main(**kwargs):
                                         multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, 
                                     noise_mean_alter_way=opts.noise_mean_alter_way,
                                     noise_mean_flag=not opts.dynamic_noise_sigma,
-                                    snr_range=opts.snr_range)
+                                    snr_range=opts.snr_range,
+                                    sigma_est_samples=opts.sigma_est_samples,
+                                    sigma_error_seed=opts.sigma_error_seed)
     elif opts.task == 'RENEW_SC':
+        if opts.sigma_est_samples is not None:
+            raise click.ClickException('--sigma_est_samples / *_inaccurate_sigma ablations are not supported for task RENEW_SC.')
         sc_channel = 'slow_fading_eq' if opts.slow_fading_eq else opts.sc_channel_type
         c.dataset_kwargs = dnnlib.EasyDict(
             path=opts.data,
@@ -330,7 +356,10 @@ def main(**kwargs):
                                     transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                     normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
                                     multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm,
-                                    snr_range=opts.snr_range)
+                                    noise_mean_flag=not opts.dynamic_noise_sigma,
+                                    snr_range=opts.snr_range,
+                                    sigma_est_samples=opts.sigma_est_samples,
+                                    sigma_error_seed=opts.sigma_error_seed)
         # c.dataset_kwargs = dnnlib.EasyDict(path=opts.data, use_labels=opts.cond, cache=opts.cache, sigma=opts.sigma, 
         #                                    corruption_probability_per_image=opts.corruption_probability, corruption_probability_per_pixel=1.0, 
         #                                    only_positive=False, view_as_complex=opts.view_as_complex, complex_merge_axis=opts.complex_merge_axis,
@@ -344,7 +373,10 @@ def main(**kwargs):
                                     transpose=parse_int_list(opts.transpose) if opts.transpose is not None else None,
                                     normalize_value=opts.data_norm, must_contain=opts.must_contain, must_not_contain=opts.must_not_contain,
                                     multiply_noise_sigma=opts.multiply_noise_sigma, additive_noise_sigma=opts.additive_noise_sigma, only_additive_noise=opts.only_additive_noise, sigma_norm=opts.sigma_norm,
-                                    snr_range=opts.snr_range)
+                                    noise_mean_flag=not opts.dynamic_noise_sigma,
+                                    snr_range=opts.snr_range,
+                                    sigma_est_samples=opts.sigma_est_samples,
+                                    sigma_error_seed=opts.sigma_error_seed)
 
 
     else:
@@ -440,6 +472,9 @@ def main(**kwargs):
     elif opts.arch == 'ddpmpp_64':
         c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=64, channel_mult=[1,2,4,4], label_type='downlink' if opts.cond else 'no_label')
+    elif opts.arch == 'ddpmpp_32':
+        c.network_kwargs.update(model_type='RF_SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
+        c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=32, channel_mult=[1,2,2,2], label_type='downlink' if opts.cond else 'no_label')
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
@@ -758,6 +793,8 @@ def main(**kwargs):
             dist.print0(f'  Positional embed:      {c.network_kwargs.get("pos_embed_type", "learnable_2d")}')
         dist.print0(f'Preconditioning & loss:  {opts.precond}')
         dist.print0(f'Ablation mode:           {opts.ablation}')
+        if opts.sigma_est_samples is not None:
+            dist.print0(f'Sigma est. error:        Scaled Chi (N={opts.sigma_est_samples} complex samples, df={2 * opts.sigma_est_samples}, seed={opts.sigma_error_seed})')
         dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
         dist.print0(f'Batch size:              {c.batch_size}')
         dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')

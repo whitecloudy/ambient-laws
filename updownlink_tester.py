@@ -158,6 +158,7 @@ def main(**kwargs):
     dataset_kwargs.only_additive_noise = False
     dataset_kwargs.noise_mean_flag = False
     dataset_kwargs.snr_range = None
+    dataset_kwargs.sigma_est_samples = None
 
     # Deterministically expand all T frames across all files (N_files * T) for full evaluation
     dataset_kwargs.expand_all_frames = True

@@ -8,6 +8,7 @@
 """Streaming images and labels from datasets created with dataset_tool.py."""
 
 import os
+import hashlib
 import numpy as np
 import zipfile
 import PIL.Image
@@ -276,6 +277,34 @@ def parse_snr_range(snr_range):
         return (float(min(snr_range)), float(max(snr_range)))
     raise ValueError(f"Unsupported type for snr_range: {type(snr_range)}")
 
+DEFAULT_SIGMA_ERROR_SEED = 778913
+
+
+def _canonical_item_key(item_fname, root_path=None):
+    if item_fname is None:
+        return None
+    fname_str = str(item_fname)
+    if root_path is not None:
+        if isinstance(root_path, (list, tuple)):
+            roots = [str(p) for p in root_path if p]
+            root = os.path.commonpath(roots) if roots else None
+        else:
+            root = str(root_path)
+        if root:
+            try:
+                rel = os.path.relpath(fname_str, start=root)
+                return rel.replace(os.sep, '/')
+            except ValueError:
+                pass
+    return os.path.basename(fname_str)
+
+
+def _deterministic_sigma_error_seed(base_seed: int, item_key: str, t_idx: int = -1) -> int:
+    payload = f"{int(base_seed)}:{item_key}:{int(t_idx)}".encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
+
+
 class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
     def __init__(self, 
                  path,                   # Path to files.
@@ -301,6 +330,8 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                  only_additive_noise = False,
                  snr_range = None,
                  expand_all_frames = False,
+                 sigma_est_samples = None,
+                 sigma_error_seed = DEFAULT_SIGMA_ERROR_SEED,
                  **super_kwargs):
         self.minimum_sigma = sigma
         self.snr_range = parse_snr_range(snr_range)
@@ -322,6 +353,8 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         self.corruption_probability_per_image = corruption_probability_per_image
         self.corruption_probability_per_pixel = corruption_probability_per_pixel
         self.only_additive_noise = only_additive_noise
+        self.sigma_est_samples = int(sigma_est_samples) if sigma_est_samples is not None else None
+        self.sigma_error_seed = int(sigma_error_seed)
 
         self._fname = []
         self._axis_name = ['frame', 'antenna', 'channel']   # Default axis names for indexing
@@ -440,6 +473,13 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
                 image_noise_seed=self._image_noise_seed,
                 snr_range=self.snr_range,
             )
+        self.sigma_estimation_error_collate_fn = SigmaEstimationErrorCollateFn(
+            sigma_est_samples=self.sigma_est_samples,
+            sigma_error_seed=self.sigma_error_seed,
+            view_as_complex=self._view_as_complex,
+            complex_merge_axis=self._complex_merge_axis,
+            root_path=self._path,
+        )
         self.noise_mean_collate_fn = NoiseMeanCollateFn(self._noise_mean_flag, self._noise_mean_alter_way)
 
     def __load_single_file(self, f_path):
@@ -504,6 +544,13 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         item = self.corruption_collate_fn([item])[0]
         return item['image'], item['sigma'], item['corruption_label']
 
+    def _apply_sigma_estimation_error(self, noise_sigma_data, item_fname, idx, t_idx=-1):
+        if self.sigma_est_samples is None:
+            return noise_sigma_data
+        item = {'sigma': noise_sigma_data, 'filename': item_fname, 'idx': idx, 't_idx': t_idx}
+        item = self.sigma_estimation_error_collate_fn([item])[0]
+        return item['sigma']
+
     def _sample_time_slice(self, csi_data, noise_sigma_data, t_idx=None):
         if self._label_spliting_flag:
             T = csi_data.shape[0]
@@ -555,6 +602,7 @@ class renewRfProcessedDataset(ambient_utils.dataset_utils.Dataset):
         csi_data, noise_sigma_data = self._handle_complex_view(csi_data, noise_sigma_data)
         csi_data, label_data = self._split_label(csi_data)
         csi_data, noise_sigma_data, corruption_label = self._apply_corruption(csi_data, noise_sigma_data, idx)
+        noise_sigma_data = self._apply_sigma_estimation_error(noise_sigma_data, item_fname, idx, t_idx=sampled_t_idx)
         
         if self._noise_mean_flag:
             item = {'sigma': noise_sigma_data}
@@ -945,6 +993,68 @@ class AlternativeCorruptionCollateFn(object):
 
 
 
+class SigmaEstimationErrorCollateFn(object):
+    """
+    복소수 표본 수 N(zero-mean RMS, df=2N)에 따른 Scaled Chi 분포 변동 오차를
+    각 (frame, antenna) 원소에 결정론적으로 적용하는 Collate Function.
+    sigma_hat = sigma * sqrt(chi2(df) / df), df = 2 * sigma_est_samples.
+    """
+    def __init__(self, sigma_est_samples=None, sigma_error_seed=DEFAULT_SIGMA_ERROR_SEED,
+                 view_as_complex=False, complex_merge_axis=0, root_path=None):
+        if sigma_est_samples is not None:
+            sigma_est_samples = int(sigma_est_samples)
+            if sigma_est_samples < 1:
+                raise ValueError(f"sigma_est_samples must be >= 1 or None, got {sigma_est_samples}")
+        self.sigma_est_samples = sigma_est_samples
+        self.sigma_error_seed = int(sigma_error_seed)
+        self.view_as_complex = bool(view_as_complex)
+        self.complex_merge_axis = complex_merge_axis
+        self.root_path = root_path
+        self.__name__ = "SigmaEstimationErrorCollateFn"
+
+    def __call__(self, batch):
+        if self.sigma_est_samples is None:
+            return batch
+
+        df = 2 * self.sigma_est_samples
+        for item in batch:
+            sigma = np.asarray(item['sigma'])
+            item_key = _canonical_item_key(item.get('filename', None), self.root_path)
+            if item_key is None:
+                item_key = f"idx:{item.get('idx', 0)}"
+            t_idx = int(item.get('t_idx', -1))
+
+            sample_seed = _deterministic_sigma_error_seed(self.sigma_error_seed, item_key, t_idx)
+            rng = np.random.default_rng(sample_seed)
+
+            if sigma.ndim == 0 or self.view_as_complex:
+                base_shape = sigma.shape
+                scale = np.sqrt(rng.chisquare(df=df, size=base_shape) / float(df))
+                full_scale = scale
+            elif self.complex_merge_axis is not None:
+                axis = self.complex_merge_axis % sigma.ndim
+                if sigma.shape[axis] % 2 != 0:
+                    raise ValueError(
+                        f"Expected even size on complex_merge_axis={axis} for sigma shape {sigma.shape}"
+                    )
+                base_shape = list(sigma.shape)
+                base_shape[axis] //= 2
+                scale = np.sqrt(rng.chisquare(df=df, size=tuple(base_shape)) / float(df))
+                full_scale = np.concatenate((scale, scale), axis=axis)
+            else:
+                if sigma.shape[-1] != 2:
+                    raise ValueError(
+                        f"Expected trailing axis of size 2 when complex_merge_axis is None, got sigma shape {sigma.shape}"
+                    )
+                base_shape = sigma.shape[:-1] + (1,)
+                scale = np.sqrt(rng.chisquare(df=df, size=base_shape) / float(df))
+                full_scale = np.concatenate((scale, scale), axis=-1)
+
+            item['sigma'] = (sigma.astype(np.float64) * full_scale).astype(np.float32)
+
+        return batch
+
+
 class NoiseMeanCollateFn(object):
     """
     noise_sigma_data를 평균 내어 단일 스칼라 값으로 만드는 Collate Function.
@@ -1241,6 +1351,8 @@ class WiDARDataset(Dataset):
                  resolution = (3, 256, 30),
                  max_size = None,
                  snr_range = None,
+                 sigma_est_samples = None,
+                 sigma_error_seed = DEFAULT_SIGMA_ERROR_SEED,
                  ):
         self.dir_path = path
         self.transform = transform
@@ -1262,6 +1374,8 @@ class WiDARDataset(Dataset):
         self.image_noise_seed = image_noise_seed
         self.noise_mean_flag = noise_mean_flag
         self.noise_mean_alter_way = noise_mean_alter_way
+        self.sigma_est_samples = int(sigma_est_samples) if sigma_est_samples is not None else None
+        self.sigma_error_seed = int(sigma_error_seed)
         self._use_labels = use_labels
         self.file_paths = []
 
@@ -1356,6 +1470,13 @@ class WiDARDataset(Dataset):
                 image_noise_seed=self.image_noise_seed,
                 snr_range=self.snr_range,
             )
+        self.sigma_estimation_error_collate_fn = SigmaEstimationErrorCollateFn(
+            sigma_est_samples=self.sigma_est_samples,
+            sigma_error_seed=self.sigma_error_seed,
+            view_as_complex=self.view_as_complex,
+            complex_merge_axis=self.complex_merge_axis,
+            root_path=self.dir_path,
+        )
         self.noise_mean_collate_fn = NoiseMeanCollateFn(self.noise_mean_flag, self.noise_mean_alter_way)
 
     def split_antenna_axis(self, csi_data, antenna_num=3):
@@ -1410,6 +1531,13 @@ class WiDARDataset(Dataset):
         item = {'image': csi_data, 'sigma': noise_sigma_data, 'idx': idx}
         item = self.corruption_collate_fn([item])[0]
         return item['image'], item['sigma'], item['corruption_label']
+
+    def _apply_sigma_estimation_error(self, noise_sigma_data, item_fname, idx, t_idx=-1):
+        if self.sigma_est_samples is None:
+            return noise_sigma_data
+        item = {'sigma': noise_sigma_data, 'filename': item_fname, 'idx': idx, 't_idx': t_idx}
+        item = self.sigma_estimation_error_collate_fn([item])[0]
+        return item['sigma']
 
     def flip_splits(self):
         tmp = self.live_idx
@@ -1468,6 +1596,9 @@ class WiDARDataset(Dataset):
 
         # 4. Apply corruption
         csi_data, noise_sigma_data, corruption_label = self._apply_corruption(csi_data, noise_sigma_data, idx)
+
+        # 4.5 Apply sigma estimation error
+        noise_sigma_data = self._apply_sigma_estimation_error(noise_sigma_data, file_path, idx)
 
         # 5. Noise mean
         if self.noise_mean_flag:
@@ -1601,6 +1732,8 @@ class XRF55Dataset(Dataset):
                  resolution = (3, 500, 90),
                  max_size = None,
                  snr_range = None,
+                 sigma_est_samples = None,
+                 sigma_error_seed = DEFAULT_SIGMA_ERROR_SEED,
                  ):
         self.dir_path = path
         self.transform = transform
@@ -1622,6 +1755,8 @@ class XRF55Dataset(Dataset):
         self.image_noise_seed = image_noise_seed
         self.noise_mean_flag = noise_mean_flag
         self.noise_mean_alter_way = noise_mean_alter_way
+        self.sigma_est_samples = int(sigma_est_samples) if sigma_est_samples is not None else None
+        self.sigma_error_seed = int(sigma_error_seed)
         self.use_labels = use_labels
         self.file_paths = []
 
@@ -1714,6 +1849,13 @@ class XRF55Dataset(Dataset):
                 image_noise_seed=self.image_noise_seed,
                 snr_range=self.snr_range,
             )
+        self.sigma_estimation_error_collate_fn = SigmaEstimationErrorCollateFn(
+            sigma_est_samples=self.sigma_est_samples,
+            sigma_error_seed=self.sigma_error_seed,
+            view_as_complex=self.view_as_complex,
+            complex_merge_axis=self.complex_merge_axis,
+            root_path=self.dir_path,
+        )
         self.noise_mean_collate_fn = NoiseMeanCollateFn(self.noise_mean_flag, self.noise_mean_alter_way)
 
     def split_antenna_axis(self, csi_data, antenna_num=3):
@@ -1768,6 +1910,13 @@ class XRF55Dataset(Dataset):
         item = {'image': csi_data, 'sigma': noise_sigma_data, 'idx': idx}
         item = self.corruption_collate_fn([item])[0]
         return item['image'], item['sigma'], item['corruption_label']
+
+    def _apply_sigma_estimation_error(self, noise_sigma_data, item_fname, idx, t_idx=-1):
+        if self.sigma_est_samples is None:
+            return noise_sigma_data
+        item = {'sigma': noise_sigma_data, 'filename': item_fname, 'idx': idx, 't_idx': t_idx}
+        item = self.sigma_estimation_error_collate_fn([item])[0]
+        return item['sigma']
 
     def flip_splits(self):
         tmp = self.live_idx
@@ -1828,6 +1977,9 @@ class XRF55Dataset(Dataset):
 
         # 4. Apply corruption
         csi_data, noise_sigma_data, corruption_label = self._apply_corruption(csi_data, noise_sigma_data, idx)
+
+        # 4.5 Apply sigma estimation error
+        noise_sigma_data = self._apply_sigma_estimation_error(noise_sigma_data, file_path, idx)
 
         # 5. Noise mean
         if self.noise_mean_flag:
