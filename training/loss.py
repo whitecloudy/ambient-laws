@@ -31,17 +31,27 @@ def _get_net_attr(n, name):
 
 
 def _rms_mean_current_sigma(current_sigma, padding_mask=None):
-    """Replace current_sigma with its per-sample RMS across non-batch dimensions."""
-    if current_sigma.ndim <= 1:
+    """Replace a tensor with its per-sample RMS across non-batch dimensions."""
+    if not isinstance(current_sigma, torch.Tensor) or current_sigma.ndim <= 1:
         return current_sigma
     dims = tuple(range(1, current_sigma.ndim))
     if isinstance(padding_mask, torch.Tensor):
         mask = padding_mask.to(dtype=current_sigma.dtype, device=current_sigma.device)
+        target_shape = torch.broadcast_shapes(current_sigma.shape, mask.shape)
         valid_count = torch.sum(mask, dim=dims, keepdim=True).clamp(min=1.0)
         rms = torch.sqrt(torch.sum((current_sigma ** 2) * mask, dim=dims, keepdim=True) / valid_count)
-        return (rms * mask).expand_as(current_sigma)
-    rms = torch.sqrt(torch.mean(current_sigma ** 2, dim=dims, keepdim=True))
-    return rms.expand_as(current_sigma)
+        return (rms * mask).expand(target_shape)
+    else:
+        rms = torch.sqrt(torch.mean(current_sigma ** 2, dim=dims, keepdim=True))
+        return rms.expand_as(current_sigma)
+
+
+def _safe_nonzero_sigma(sigma, eps=1e-8):
+    if isinstance(sigma, torch.Tensor):
+        return torch.where(sigma < eps, torch.tensor(eps, dtype=sigma.dtype, device=sigma.device), sigma)
+    if sigma < eps:
+        return eps
+    return sigma
 
 
 def _clamp_sigma_min(sigma, current_sigma, eps=1e-6, max_sigma_clip=False):
@@ -121,16 +131,18 @@ class EDMLoss:
         
         # no_asm2 do not use ASM Loss during training.
         # Instead, we use sigma_t_n for noise level.
+        loss_sigma = nonzero_sigma
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
         elif self.iso_asm_loss_only:
             current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
+            loss_sigma = _safe_nonzero_sigma(_rms_mean_current_sigma(sigma, padding_mask))
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
-        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, loss_sigma, current_sigma)
 
         # loss weight depends on sigma
-        weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
+        weight = (loss_sigma ** 2 + self.sigma_data ** 2) / (loss_sigma * self.sigma_data) ** 2
         loss = weight * ((D_yn - y) ** 2)
         return_sigma = sigma
     
@@ -290,15 +302,17 @@ class EDMLoss_with_scheduler:
         
         # no_asm2 do not use ASM Loss during training.
         # Instead, we use sigma_t_n for noise level.
+        loss_sigma_f64 = nonzero_sigma_f64
         if self.no_asm2:
             current_sigma_f64 = torch.zeros_like(current_sigma_f64)
         elif self.iso_asm_loss_only:
             current_sigma_f64 = _rms_mean_current_sigma(current_sigma_f64, padding_mask)
+            loss_sigma_f64 = _safe_nonzero_sigma(_rms_mean_current_sigma(sigma_f64, padding_mask))
 
-        D_yn_f64 = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input_f64, nonzero_sigma_f64, current_sigma_f64)
+        D_yn_f64 = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input_f64, loss_sigma_f64, current_sigma_f64)
 
         # loss weight depends on sigma (float64)
-        weight_f64 = (nonzero_sigma_f64 ** 2 + self.sigma_data ** 2) / (nonzero_sigma_f64 * self.sigma_data) ** 2
+        weight_f64 = (loss_sigma_f64 ** 2 + self.sigma_data ** 2) / (loss_sigma_f64 * self.sigma_data) ** 2
         kl_loss_f64 = kl_loss.to(torch.float64) if isinstance(kl_loss, torch.Tensor) else torch.tensor(kl_loss, dtype=torch.float64, device=y_f64.device)
         loss = weight_f64 * ((D_yn_f64 - y_f64) ** 2) + self.kl_coeff * kl_loss_f64
         return_sigma = sigma_f64
@@ -479,15 +493,17 @@ class EDMLoss_with_latent_z:
         
         # no_asm2 do not use ASM Loss during training.
         # Instead, we use sigma_t_n for noise level.
+        loss_sigma = nonzero_sigma
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
         elif self.iso_asm_loss_only:
             current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
+            loss_sigma = _safe_nonzero_sigma(_rms_mean_current_sigma(sigma, padding_mask))
 
-        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, loss_sigma, current_sigma)
 
         # loss weight depends on sigma
-        weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
+        weight = (loss_sigma ** 2 + self.sigma_data ** 2) / (loss_sigma * self.sigma_data) ** 2
         if kl_loss is not None:
             kl_loss_tensor = kl_loss.to(y.dtype) if isinstance(kl_loss, torch.Tensor) else torch.tensor(kl_loss, dtype=y.dtype, device=y.device)
             loss = weight * ((D_yn - y) ** 2) + self.kl_coeff * kl_loss_tensor
@@ -615,19 +631,22 @@ class EDMLoss_loss_scaling_test:
         
         # no_asm2 do not use ASM Loss during training.
         # Instead, we use sigma_t_n for noise level.
+        loss_sigma = nonzero_sigma
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
         elif self.iso_asm_loss_only:
             current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
+            loss_sigma = _safe_nonzero_sigma(_rms_mean_current_sigma(sigma, padding_mask))
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
-        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, loss_sigma, current_sigma)
 
         # loss weight depends on sigma
-        weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
+        weight = (loss_sigma ** 2 + self.sigma_data ** 2) / (loss_sigma * self.sigma_data) ** 2
 
         # TEST: loss scaling weight
-        loss_scaling_weight = (self.sigma_data**2 * sigma**2 + self.sigma_loss_scaling**4)/(self.sigma_loss_scaling**2 * (self.sigma_loss_scaling**2 + sigma**2))
+        loss_scaling_sigma = loss_sigma if self.iso_asm_loss_only else sigma
+        loss_scaling_weight = (self.sigma_data**2 * loss_scaling_sigma**2 + self.sigma_loss_scaling**4)/(self.sigma_loss_scaling**2 * (self.sigma_loss_scaling**2 + loss_scaling_sigma**2))
 
         loss = weight * loss_scaling_weight * ((D_yn - y) ** 2)
         return_sigma = sigma
@@ -762,15 +781,17 @@ class EDMLoss_dynamic_sigma:
         
         # no_asm2 do not use ASM Loss during training.
         # Instead, we use sigma_t_n for noise level.
+        loss_sigma = nonzero_sigma
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
         elif self.iso_asm_loss_only:
             current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
+            loss_sigma = _safe_nonzero_sigma(_rms_mean_current_sigma(sigma, padding_mask))
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
-        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, loss_sigma, current_sigma)
         # loss weight depends on sigma
-        weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
+        weight = (loss_sigma ** 2 + self.sigma_data ** 2) / (loss_sigma * self.sigma_data) ** 2
         loss = weight * ((D_yn - y) ** 2)
         return_sigma = sigma
     
@@ -900,15 +921,17 @@ class EDMLoss_boosted_sigma:
         
         # no_asm2 do not use ASM Loss during training.
         # Instead, we use sigma_t_n for noise level.
+        loss_sigma = nonzero_sigma
         if self.no_asm2:
             current_sigma = torch.zeros_like(current_sigma)
         elif self.iso_asm_loss_only:
             current_sigma = _rms_mean_current_sigma(current_sigma, padding_mask)
+            loss_sigma = _safe_nonzero_sigma(_rms_mean_current_sigma(sigma, padding_mask))
 
         # D_yn = ambient_utils.from_x0_pred_to_xnature_pred_ve_to_ve(x0_pred, noisy_input, sigma, current_sigma)
-        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, nonzero_sigma, current_sigma)
+        D_yn = from_x0_pred_to_xnature_pred_ve_to_ve_modify(x0_pred, noisy_input, loss_sigma, current_sigma)
         # loss weight depends on sigma
-        weight = (nonzero_sigma ** 2 + self.sigma_data ** 2) / (nonzero_sigma * self.sigma_data) ** 2
+        weight = (loss_sigma ** 2 + self.sigma_data ** 2) / (loss_sigma * self.sigma_data) ** 2
         loss = weight * ((D_yn - y) ** 2)
         return_sigma = sigma
     

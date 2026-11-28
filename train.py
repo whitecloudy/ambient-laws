@@ -598,7 +598,7 @@ def main(**kwargs):
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
 
     if not opts.not_dynamic_noise_sigma_model:
-        if (opts.arch in ['ddpmpp', 'ddpmpp_256', 'ddpmpp_192', 'ddpmpp_64']):
+        if (opts.arch in ['ddpmpp', 'ddpmpp_256', 'ddpmpp_192', 'ddpmpp_64', 'ddpmpp_32']):
             c.network_kwargs.update(dynamic_noise=True)
         elif opts.arch.startswith('rf_dit'):
             c.network_kwargs.update(dynamic_noise=False)
